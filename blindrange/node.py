@@ -397,7 +397,107 @@ def service_post(store, peers, hub, secret, path, data, quic=None):
     return 404, {"error": "unknown"}
 
 
-def service_get(store, peers, path, query, quic=None):
+STATUS_CACHE = {"at": 0.0, "rows": [], "total": 0}
+
+
+def _peer_stats(nid, e, secret, hub, self_id):
+    """Best-effort key count for one peer. Tenants are reached over the relay
+    connection they already hold with us (we are their relay)."""
+    try:
+        if is_via(e["addr"]):
+            _relay, tenant = parse_via(e["addr"])
+            out = hub.send(tenant, {"id": os.urandom(8).hex(), "method": "GET",
+                                    "path": "/stats", "body_b64": ""})
+            if not out or out.get("status") != 200:
+                return None
+            return json.loads(b64decode(out["body_b64"])).get("keys")
+        status, raw = POOL.request(e["addr"], "GET", "/stats", timeout=2)
+        return json.loads(raw).get("keys") if status == 200 else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def status_rows(store, peers, secret, hub):
+    """Roster for the public status page; cached briefly."""
+    now = time.time()
+    if now - STATUS_CACHE["at"] < 10:
+        return STATUS_CACHE["rows"], STATUS_CACHE["total"]
+    rows, total = [], 0
+    me = peers.ident.node_id
+    for nid, e in sorted(peers.live().items()):
+        keys = store.count() if nid == me else _peer_stats(nid, e, secret,
+                                                           hub, me)
+        if keys:
+            total += keys
+        rows.append({"id": nid, "mode": "relay tenant" if is_via(e["addr"])
+                     else "directly reachable", "keys": keys,
+                     "age": round(now - e["ts"] / 1000, 1)})
+    STATUS_CACHE.update({"at": now, "rows": rows, "total": total})
+    return rows, total
+
+
+STATUS_CSS = """
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--txt:#d7dce4;
+--dim:#8b93a1;--acc:#5cc8ff;--gold:#e0b060;--ok:#7fd18c}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--txt);font:15px/1.65 ui-monospace,
+SFMono-Regular,Menlo,monospace;padding:48px 24px 80px}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:30px;margin-bottom:6px}h1 span{color:var(--acc)}
+.sub{color:var(--dim);margin-bottom:28px}
+.big{font-size:15px;color:var(--dim);margin:0 0 18px}
+.big b{color:var(--ok);font-weight:normal;font-size:22px}
+table{width:100%;border-collapse:collapse;margin-bottom:22px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:normal;font-size:12px;
+text-transform:uppercase;letter-spacing:.08em}
+td.id{color:var(--gold)}td.num{text-align:right;font-variant-numeric:tabular-nums}
+.note{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+padding:16px 18px;color:var(--dim);font-size:13.5px;margin-bottom:16px}
+.note b{color:var(--txt);font-weight:normal}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.foot{color:var(--dim);font-size:13px;margin-top:26px}
+"""
+
+
+def status_html(rows, total, seed_addr):
+    body = "".join(
+        f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
+        f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
+        f"<td class='num'>{r['age']}s</td></tr>" for r in rows)
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange — public network status</title><style>{STATUS_CSS}</style>
+</head><body><div class="wrap">
+<h1>blind<span>range</span> — public network</h1>
+<div class="sub">live status, served by the network itself</div>
+<p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
+encrypted keys stored</p>
+<table><tr><th>node</th><th>reachability</th><th>keys</th><th>last seen</th></tr>
+{body}</table>
+<div class="note">Membership is public within a network — this page is
+everything an operator can publish about it. <b>Contents are not.</b> Every
+database here is encrypted under its own master key, so records and index
+entries are unlinkable pseudorandom pairs to every node, to every other user,
+and to whoever runs this seed. You can see that someone is storing; never
+what.</div>
+<div class="note">Nodes marked <b>relay tenant</b> sit behind NAT and were
+never configured for it — they diagnosed their own reachability and now
+receive traffic over an outbound connection, with direct QUIC paths punched
+when the networks allow.</div>
+<div class="foot">join with two commands ·
+<a href="https://blindrange.dev">blindrange.dev</a> ·
+<a href="https://github.com/alviso/blindrange">source</a><br>
+demo network — no durability promises. seed: {seed_addr}</div>
+</div></body></html>"""
+
+
+def service_get(store, peers, path, query, quic=None, status=None):
+    if path in ("/", "/status.json") and status is not None:
+        rows, total = status
+        if path == "/status.json":
+            return 200, {"nodes": rows, "keys": total}
+        return "html", status_html(rows, total, peers.addr)
     if path == "/peers":
         now = time.time()
         return 200, {"peers": {
@@ -594,7 +694,7 @@ def make_quic_service(store, peers, hub, secret):
 # --------------------------------------------------------------- server
 
 def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
-                 quic=None):
+                 quic=None, public_status=False):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"      # keep-alive: reused connections
 
@@ -634,8 +734,19 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
                     url.path.encode()):
                 self._json({"error": "unauthorized"}, 401)
                 return
+            st = (status_rows(store, peers, secret, hub)
+                  if public_status and url.path in ("/", "/status.json")
+                  else None)
             code, obj = service_get(store, peers, url.path, url.query,
-                                    quic=quic)
+                                    quic=quic, status=st)
+            if code == "html":
+                body = obj.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self._json(obj, code)
 
         def log_message(self, *a):
@@ -645,7 +756,7 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
 
 
 def run(host, port, data_dir, seeds, secret="", advertise=None,
-        quic_host="0.0.0.0"):
+        quic_host="0.0.0.0", public_status=False):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
     ident = Identity(data_dir)
@@ -673,7 +784,8 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
                      daemon=True).start()
     server = ThreadingHTTPServer((host, port),
                                  make_handler(store, peers, hub, secret,
-                                              quic=quic))
+                                              quic=quic,
+                                              public_status=public_status))
     server.serve_forever()
 
 
@@ -688,6 +800,10 @@ def main():
     ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
                     help="network-membership secret (or env BLINDRANGE_SECRET); "
                          "empty runs an open network")
+    ap.add_argument("--public-status", action="store_true",
+                    help="serve an unauthenticated status page at / listing "
+                         "live nodes and key counts (off by default: on a "
+                         "private network, membership should not be public)")
     ap.add_argument("--quic-host", default=os.environ.get("BR_QUIC_HOST",
                                                           "0.0.0.0"),
                     help="bind address for the QUIC/UDP socket used by direct "
@@ -699,7 +815,8 @@ def main():
                          "If it turns out to be unreachable, the node automatically "
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
-    run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host)
+    run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host,
+        a.public_status)
 
 
 if __name__ == "__main__":
