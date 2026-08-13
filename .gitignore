@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.db
+*.db-wal
+*.db-shm
+*.brdb
+*.brdb.tmp
+.DS_Store

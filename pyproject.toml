@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blindrange"
+version = "0.1.0"
+description = "Range queries over encrypted data stored on blind, decentralized nodes"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["cryptography>=41"]
+keywords = ["encrypted-database", "searchable-encryption", "structured-encryption",
+            "decentralized", "range-queries", "forward-privacy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Database",
+]
+
+[project.scripts]
+blindrange-node = "blindrange.node:main"
+
+[tool.setuptools]
+packages = ["blindrange"]
