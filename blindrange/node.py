@@ -634,7 +634,8 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
     return Handler
 
 
-def run(host, port, data_dir, seeds, secret="", advertise=None):
+def run(host, port, data_dir, seeds, secret="", advertise=None,
+        quic_host="0.0.0.0"):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
     ident = Identity(data_dir)
@@ -646,7 +647,7 @@ def run(host, port, data_dir, seeds, secret="", advertise=None):
     if not direct_mod.DISABLED:
         try:
             quic = direct_mod.NodeQuic(
-                host, port, ident.node_id,
+                quic_host, port, ident.node_id,
                 make_quic_service(store, peers, hub, secret))
         except Exception as e:              # QUIC is an optimization only
             import sys as _sys
@@ -677,13 +678,18 @@ def main():
     ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
                     help="network-membership secret (or env BLINDRANGE_SECRET); "
                          "empty runs an open network")
+    ap.add_argument("--quic-host", default=os.environ.get("BR_QUIC_HOST",
+                                                          "0.0.0.0"),
+                    help="bind address for the QUIC/UDP socket used by direct "
+                         "paths (default all interfaces — hole punching needs "
+                         "internet reachability even when HTTP is local)")
     ap.add_argument("--advertise", default=None,
                     help="host:port other machines should reach this node at "
                          "(defaults to --host:--port; set it when binding 0.0.0.0). "
                          "If it turns out to be unreachable, the node automatically "
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
-    run(a.host, a.port, a.data, a.seed, a.secret, a.advertise)
+    run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host)
 
 
 if __name__ == "__main__":

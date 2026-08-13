@@ -68,8 +68,14 @@ def _self_signed(common_name):
 
 
 def _addr_tuple(addr: str):
+    """host:port -> (numeric_ip, port). UDP sendto needs a resolved address;
+    a hostname would either block the event loop or fail outright."""
     host, _, port = addr.rpartition(":")
-    return host, int(port)
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        ip = host
+    return ip, int(port)
 
 
 # ------------------------------------------------------------- protocols
@@ -159,6 +165,9 @@ class NodeQuic:
     pings, fires punch bursts, and discovers its own public endpoint."""
 
     def __init__(self, host, port, node_id, service):
+        # QUIC binds all interfaces by default: hole punching needs a socket
+        # that can reach the internet, and a loopback-bound UDP socket cannot
+        # even send a STUN ping. Restrict with --quic-host or BR_NO_QUIC=1.
         self.host, self.port = host, port
         self.node_id = node_id
         self.service = service              # bytes -> bytes, run in executor
