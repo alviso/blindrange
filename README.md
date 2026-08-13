@@ -86,6 +86,15 @@ owner.insert_many([{"amount": 34999, "day": 512, "name": "acme corp"}, ...])
 
 owner.query("amount", 25000, 50000)      # BETWEEN, decrypted only here
 owner.query_prefix("name", "ac")         # LIKE 'ac%'
+owner.query_multi([                      # AND of predicates: record-id sets
+    {"field": "amount", "lo": 25000, "hi": 50000},   # intersect BEFORE any
+    {"field": "day", "lo": 100, "hi": 400}])         # ciphertext is fetched
+
+rid = owner.query("amount", 25000, 50000)[0]["_rid"]
+owner.delete(rid)                        # tombstone + ciphertext removal
+owner.compact()                          # epoch rewrite: merges all writers'
+                                         # chains, drops tombstoned entries
+                                         # (real forgetting); run quiescent
 ```
 
 `my.brdb` is a passphrase-encrypted state file (master key + writer identity +
@@ -131,11 +140,14 @@ Use `--bootstrap host:port` to point the same app at a real network instead.
 python3 -m unittest tests.test_e2e -v
 ```
 
-Nine end-to-end tests against a real 6-node gossip network: membership
+Twelve end-to-end tests against a real 6-node gossip network: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with
-interleaved same-value inserts, and full recovery from an empty counter cache.
+interleaved same-value inserts, full recovery from an empty counter cache,
+two-field AND queries, deletes visible to fresh clients via tombstones, and
+compaction (correctness preserved, tombstoned entries dropped, late writers
+picking up the new epoch).
 
 ## Threat model — measured, not asserted
 
@@ -169,7 +181,13 @@ reveals nothing at all.
 
 ## Honest limitations (v0.1)
 
-- No deletes yet (tombstones + backward privacy are the next research step).
+- Deletes are tombstone-then-compact: between a delete and the next
+  `compact()`, index entries for the deleted record still exist (they resolve
+  to nothing — the ciphertext is removed immediately — but a node that
+  correlates old fetches could notice which entries went dead). Full backward
+  privacy holds only after compaction.
+- `compact()` assumes quiescent writers — it is owner-driven maintenance, not
+  a concurrent background process. Writes racing a compaction can be lost.
 - Read-repair re-homes data lazily on access; there is no background
   anti-entropy sweep yet, so cold data on a churned ring is only healed when
   read (an explicit repair scan is a planned `blindrange-node` subcommand).
@@ -184,9 +202,9 @@ reveals nothing at all.
   writer *id* should have one live instance at a time: two devices sharing a
   copied state file are safe sequentially (queries re-probe own chains), not
   concurrently. Give each device its own invite instead.
-- Read fan-out grows with the number of writers that touched a label, and
-  every query spends a few galloping probes per (label, writer). Fine for a
-  handful of writers; stream compaction for many-writer databases is planned.
+- Read fan-out grows with the number of writers that touched a label since the
+  last compaction, and every query spends a few galloping probes per
+  (label, writer). `compact()` collapses all streams back to one per label.
 - Under simultaneous first-time writer registrations, the registry append
   retries via insert-if-absent; a pathological race combined with the loss of
   a slot's primary replica could hide a writer id until re-registration —

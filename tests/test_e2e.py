@@ -185,6 +185,53 @@ class TestE2E(unittest.TestCase):
         self.assertEqual(got,
                          self._want(lambda r: 100_000 <= r["amount"] <= 300_000))
 
+    def test_10_two_field_and_query(self):
+        got = sorted(r["row"] for r in self.owner.query_multi([
+            {"field": "amount", "lo": 100_000, "hi": 600_000},
+            {"field": "day", "lo": 100, "hi": 400}]))
+        want = self._want(lambda r: 100_000 <= r["amount"] <= 600_000
+                          and 100 <= r["day"] <= 400)
+        self.assertEqual(got, want)
+        self.assertEqual(len(self.owner.last_stats["per_predicate"]), 2)
+        # prefix AND range
+        got = sorted(r["row"] for r in self.owner.query_multi([
+            {"field": "name", "prefix": "ba"},
+            {"field": "day", "lo": 0, "hi": 350}]))
+        want = self._want(lambda r: r["name"].startswith("ba")
+                          and 0 <= r["day"] <= 350)
+        self.assertEqual(got, want)
+
+    def test_11_delete_with_tombstones(self):
+        victims = self.owner.query("amount", 777_777, 777_777)
+        self.assertEqual(len(victims), 2)
+        self.owner.delete_many([r["_rid"] for r in victims])
+        self.assertEqual(self.owner.query("amount", 777_777, 777_777), [])
+        # a completely fresh client sees the deletion too (tombstones are
+        # on the network, not local state)
+        fresh = Owner.accept(f"{self.tmp}/ownerD.brdb", "fourth pass",
+                             self.owner.invite())
+        self.assertEqual(fresh.query("amount", 777_777, 777_777), [])
+        self.rows[:] = [r for r in self.rows if r["row"] not in (20_001, 20_002)]
+
+    def test_12_compaction(self):
+        stats = self.owner.compact()
+        self.assertGreater(stats["entries"], 0)
+        self.assertGreater(stats["dropped"], 0)      # tombstoned rows removed
+        # everything still correct after the epoch rewrite
+        self.assert_query("amount", 100_000, 300_000)
+        self.assert_query("day", 100, 200)
+        got = sorted(r["row"] for r in self.owner.query_prefix("name", "sa"))
+        self.assertEqual(got,
+                         self._want(lambda r: r["name"].startswith("sa")))
+        # other writers pick up the new epoch with one probe and keep working
+        late = Owner.accept(f"{self.tmp}/ownerE.brdb", "fifth pass",
+                            self.owner.invite())
+        late.insert({"amount": 555_555, "day": 77, "name": "late", "row": 30_000})
+        rows = [r["row"] for r in self.owner.query("amount", 555_555, 555_555)]
+        self.assertEqual(rows, [30_000])
+        self.rows.append({"amount": 555_555, "day": 77, "name": "late",
+                          "row": 30_000})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

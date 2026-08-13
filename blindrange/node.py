@@ -54,6 +54,16 @@ class Store:
             self.db.commit()
             return existed
 
+    def delete(self, keys):
+        """Remove keys outright (owner-driven deletes and epoch compaction).
+        The node cannot tell a delete from any other opaque-key operation."""
+        with self.lock:
+            n = 0
+            for k in keys:
+                n += self.db.execute("DELETE FROM kv WHERE k=?", (k,)).rowcount
+            self.db.commit()
+            return n
+
     def mget(self, keys):
         with self.lock:
             self.read_batches += 1
@@ -150,6 +160,8 @@ def make_handler(store: Store, peers: Peers):
                     self._json({"stored": len(entries)})
             elif path == "/mget":
                 self._json({"values": store.mget(data["keys"])})
+            elif path == "/delete":
+                self._json({"deleted": store.delete(data["keys"])})
             elif path == "/gossip":
                 peers.merge(data.get("peers", {}))
                 self._json({"peers": peers.snapshot()})

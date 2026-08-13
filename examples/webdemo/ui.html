@@ -55,17 +55,19 @@ the nodes on the right hold only what the node view shows</div>
 <div class="grid">
   <div>
     <div class="panel">
-      <h2>Owner view — query the encrypted database</h2>
+      <h2>Owner view — query the encrypted database (predicates AND together)</h2>
       <div class="row">
-        <select id="field" onchange="fieldChanged()">
-          <option value="amount">amount ($)</option>
-          <option value="day">order date</option>
-          <option value="customer">customer prefix</option>
-        </select>
-        <span id="range-inputs">
-          <input id="lo" value="250"> — <input id="hi" value="500">
-        </span>
-        <button onclick="runQuery()">run range query</button>
+        <label><input type="checkbox" id="p_amount" checked> amount $</label>
+        <input id="amount_lo" value="250"> — <input id="amount_hi" value="500">
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="p_day" checked> date</label>
+        <input id="day_lo" value="2024-06-01"> — <input id="day_hi" value="2025-12-31">
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="p_cust"> customer prefix</label>
+        <input id="cust_prefix" value="sa" style="width:80px">
+        <button onclick="runQuery()" style="margin-left:auto">run query</button>
       </div>
       <div class="wrap" id="results-wrap">
         <table id="results"><thead><tr>
@@ -103,27 +105,27 @@ const toDate = d => new Date(day0.getTime() + d*86400000)
                     .toISOString().slice(0,10);
 const fromDate = s => Math.round((new Date(s+"T00:00:00Z") - day0)/86400000);
 
-function fieldChanged(){
-  const f = $("field").value;
-  if (f === "amount") { $("range-inputs").innerHTML =
-    '<input id="lo" value="250"> — <input id="hi" value="500">'; }
-  else if (f === "day") { $("range-inputs").innerHTML =
-    '<input id="lo" value="2024-06-01"> — <input id="hi" value="2024-12-31">'; }
-  else { $("range-inputs").innerHTML =
-    '<input id="prefix" value="sa" placeholder="prefix">'; }
+function predicates(){
+  const preds = [];
+  if ($("p_amount").checked)
+    preds.push({field:"amount",
+                lo: Math.round(parseFloat($("amount_lo").value)*100),
+                hi: Math.round(parseFloat($("amount_hi").value)*100)});
+  if ($("p_day").checked)
+    preds.push({field:"day", lo: fromDate($("day_lo").value),
+                hi: fromDate($("day_hi").value)});
+  if ($("p_cust").checked)
+    preds.push({field:"customer", prefix: $("cust_prefix").value});
+  return preds;
 }
 
 async function runQuery(){
-  const f = $("field").value;
-  let body = {field:f};
-  if (f === "customer") body.prefix = $("prefix").value;
-  else if (f === "day") { body.lo = fromDate($("lo").value);
-                          body.hi = fromDate($("hi").value); }
-  else { body.lo = Math.round(parseFloat($("lo").value)*100);
-         body.hi = Math.round(parseFloat($("hi").value)*100); }
+  const preds = predicates();
+  if (!preds.length){ $("qstats").textContent = "enable at least one predicate"; return; }
   $("qstats").textContent = "querying blind nodes…";
   const r = await fetch("/api/query", {method:"POST",
-    headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({predicates:preds})});
   const d = await r.json();
   if (d.error){ $("qstats").textContent = "error: " + d.error; return; }
   const tb = $("results").querySelector("tbody");
@@ -131,10 +133,11 @@ async function runQuery(){
     <td class="num">$${(o.amount/100).toFixed(2)}</td>
     <td>${toDate(o.day)}</td><td>${o.status}</td></tr>`).join("");
   const s = d.stats;
+  const per = (s.per_predicate || []).join(" ∩ ");
   $("qstats").innerHTML = `<b>${d.total}</b> rows in <b>${d.ms}ms</b> · ` +
     `cover <b>${s.cover}</b> intervals · <b>${s.index_keys}</b> opaque index ` +
-    `lookups · <b>${s.candidates}</b> fetched, <b>${s.overfetch}</b> ` +
-    `over-fetch filtered after decryption (the privacy budget at work)`;
+    `lookups · candidates <b>${per}</b> → <b>${s.intersected}</b> intersected ` +
+    `→ <b>${s.overfetch}</b> over-fetch filtered after decryption`;
 }
 
 async function refreshNetwork(){
@@ -169,7 +172,7 @@ async function loadNodeView(){
       `<div class="blob"><b>${k}</b> → ${v}…</div>`).join("");
 }
 
-fieldChanged(); refreshNetwork(); setInterval(refreshNetwork, 4000);
+refreshNetwork(); setInterval(refreshNetwork, 4000);
 setTimeout(loadNodeView, 800); setInterval(loadNodeView, 8000);
 </script>
 </body>

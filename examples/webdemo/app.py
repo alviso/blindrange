@@ -164,12 +164,9 @@ def make_handler(owner: Owner, net):
             data = json.loads(self.rfile.read(n)) if n else {}
             if urlparse(self.path).path == "/api/query":
                 t0 = time.time()
-                field = data["field"]
+                preds = data.get("predicates") or [data]
                 try:
-                    if data.get("prefix") is not None:
-                        rows = owner.query_prefix(field, data["prefix"])
-                    else:
-                        rows = owner.query(field, data["lo"], data["hi"])
+                    rows = owner.query_multi(preds)
                     rows.sort(key=lambda r: r.get("order", ""))
                     self._json({"rows": rows[:200], "total": len(rows),
                                 "ms": round((time.time() - t0) * 1000),
