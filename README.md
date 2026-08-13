@@ -172,10 +172,23 @@ The "central component" this needs is deliberately minimal: **every
 reachable node is a relay**, so the bridge for unconnectable nodes is the
 network itself. A dedicated always-on seed node you run works as a
 predictable relay of last resort, and that's the entire privileged
-infrastructure. Honest trade-offs: relayed traffic costs the relay
-bandwidth and adds a hop of latency; a relay sees the same opaque
-request/response bytes any node sees (nothing more); and direct
-hole-punching (QUIC) to shrink relay usage further is future work.
+infrastructure.
+
+**Direct paths via QUIC hole punching.** Relaying costs four internet
+crossings; a punched path costs one. Nodes run QUIC alongside their HTTP
+port and answer a tiny discovery protocol (STUN-lite ping/pong, punch
+bursts). A tenant learns its public UDP endpoint from its relay and
+advertises it in its signed heartbeat; a client dialing that tenant STUNs
+on a scratch socket, binds its QUIC dial to the same local port, and asks
+the tenant — over the reliable relay path — to punch back. Roughly 80–90%
+of NAT pairs connect directly; **every failure falls back to the relay
+transparently** (with a retry blacklist), so the relay tier never goes
+away. `BR_NO_QUIC=1` disables it entirely. Honest trade-offs: relayed
+traffic costs the relay bandwidth and a hop of latency; a relay sees the
+same opaque request/response bytes any node sees; and QUIC's TLS uses
+throwaway self-signed certs — transport identity was never part of the
+trust model (app-layer HMAC, identity-signed heartbeats, and ciphertext
+payloads carry it).
 
 ### Running nodes on multiple machines
 
@@ -272,7 +285,7 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Eighteen end-to-end tests against real gossip networks: membership
+Twenty end-to-end tests against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with
@@ -283,8 +296,10 @@ picking up the new epoch), rejection of unauthenticated requests, the
 owner-driven repair sweep, hot-label striping across nodes, a writer
 inserting concurrently with a running compaction, gossip-driven
 node-to-node data migration surviving the death of all original holders,
-and a NAT'd node self-assembling as a relay tenant — diagnosed by dialback,
-replicated to and read from entirely through its relay.
+a NAT'd node self-assembling as a relay tenant — diagnosed by dialback,
+replicated to and read from entirely through its relay — and QUIC hole
+punching establishing a direct path to that tenant, with clean relay
+fallback when QUIC is disabled.
 
 ## Threat model — measured, not asserted
 
