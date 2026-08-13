@@ -425,8 +425,9 @@ class Owner:
         import time as _time
         if _time.time() < self._no_direct_until.get(nid, 0):
             return None
-        tenant_udp = getattr(self, "_udp_of", {}).get(nid, "")
-        if not tenant_udp:
+        cands = [c for c in
+                 getattr(self, "_udp_of", {}).get(nid, "").split(",") if c]
+        if not cands:
             self._no_direct_until[nid] = _time.time() + 60
             return None
         if self._dialer is None:
@@ -441,13 +442,16 @@ class Owner:
             POOL.request(relay, "POST", "/relay/send", raw,
                          {"Content-Type": "application/json",
                           **self._sign(raw)}, timeout=15)
-        try:
-            path = self._dialer.dial(tenant_udp, relay, request_punch)
-            self._direct[nid] = path
-            return path
-        except Exception:
-            self._no_direct_until[nid] = _time.time() + 300
-            return None
+        for cand in cands:            # LAN candidate first, then public
+            try:
+                path = self._dialer.dial(cand, relay, request_punch,
+                                         timeout=3.0)
+                self._direct[nid] = path
+                return path
+            except Exception:
+                continue
+        self._no_direct_until[nid] = _time.time() + 300
+        return None
 
     def _drop_direct(self, nid):
         import time as _time

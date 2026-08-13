@@ -67,6 +67,19 @@ def _self_signed(common_name):
     return cert, key
 
 
+def local_ip() -> str:
+    """This host's LAN address (no packets sent — a connected UDP socket just
+    makes the kernel pick the outbound interface)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 53))
+        return sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
 def _addr_tuple(addr: str):
     """host:port -> (numeric_ip, port). UDP sendto needs a resolved address;
     a hostname would either block the event loop or fail outright."""

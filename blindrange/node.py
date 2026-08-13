@@ -518,9 +518,19 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
         quic = _tenant_loop.quic
         if quic is not None and time.time() > stun_at:
             try:
+                # advertise ICE-style CANDIDATES: the LAN address first (works
+                # for peers on the same network, and avoids needing hairpin
+                # NAT when the dialer sits behind the same router), then the
+                # STUN-observed public endpoint for everyone else
                 got = quic.stun(relay)
-                if got:
-                    peers.udp = got
+                cands = []
+                lip = direct_mod.local_ip()
+                if lip:
+                    cands.append(f"{lip}:{quic.port}")
+                if got and got not in cands:
+                    cands.append(got)
+                if cands:
+                    peers.udp = ",".join(cands)
             except Exception:
                 pass
             stun_at = time.time() + 20
