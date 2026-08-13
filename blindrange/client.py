@@ -614,19 +614,21 @@ class Owner:
         """AND of range/prefix predicates. Index phases run per predicate and
         intersect on record ids BEFORE any ciphertext is fetched.
 
-        Latency-shaped for relay topologies: ONE batched galloping preflight
-        discovers the ends of every chain the query touches — the epoch
-        chain, the writer registry, all tombstone chains, and every
-        (label, epoch, writer) chain across all predicates — then ONE lookup
-        enumerates all index entries, and ONE fetches the ciphertexts. A
-        stable warm query is ~4 network rounds total. If the preflight
-        reveals a new epoch or new writers (rare), state is refreshed and the
-        query re-runs once."""
+        Latency-shaped for relay topologies with SPECULATIVE ENUMERATION: the
+        client fetches every index entry its cached counters say exists AND
+        one growth-probe per chain (epoch chain, writer registry, tombstones,
+        every (label, epoch, writer) chain) in a single lookup round. If
+        nothing grew — the common case — the entries are already in hand and
+        one more round fetches ciphertexts: a stable warm query is TWO
+        network rounds. Chains that did grow gallop from their probe hit and
+        fetch the delta; a new epoch or writer refreshes state and re-runs
+        the query once."""
         st = self._st
         me = st["writer"]
         top = st["epoch"]
         writers = list(st["writers"]) or [me]
         remote = st["remote"]
+        k_t = self._k_w(TOMB)
 
         bounds = []
         for p in predicates:
@@ -638,12 +640,16 @@ class Owner:
                         self._encode(p["field"], p["hi"]))
             bounds.append((p["field"], a, b))
 
-        # ---- one batched preflight over every chain this query touches ----
-        spec = {("sys", "epoch"): (lambda i: self._sys_key(b"epoch", i),
-                                   st["epoch_len"]),
-                ("sys", "reg"): (lambda i: self._sys_key(b"registry", i),
-                                 st["reg_len"])}
-        spec.update(self._tomb_spec(writers))
+        # ---- chain descriptors: everything this query touches -------------
+        chains = {("sys", "epoch"): {"fn": lambda i: self._sys_key(b"epoch", i),
+                                     "cached": st["epoch_len"]},
+                  ("sys", "reg"): {"fn": lambda i: self._sys_key(b"registry", i),
+                                   "cached": st["reg_len"]}}
+        for ep in self._epochs():
+            for u in writers:
+                chains[("tomb", ep, u)] = {
+                    "fn": (lambda i, e=ep, u=u: self._ut(k_t, e, u, i)),
+                    "cached": st["tombs"]["counts"].get(f"{ep}|{u}", 0)}
         covers = {}                  # field -> (cover, labels, k_ws)
         for field, a, b in bounds:
             fs = st["schema"][field]
@@ -658,61 +664,98 @@ class Owner:
                         cached = (st["chains"].get(w, 0)
                                   if u == me and ep == top
                                   else remote.get(f"{ep}|{w}", {}).get(u, 0))
-                        spec[("lab", field, ep, w, u)] = (
-                            (lambda i, e=ep, k=k_ws[w], u=u:
-                             self._ut(k, e, u, i)), cached)
-        ends = self._discover_ends(spec)
+                        chains[("lab", field, ep, w, u)] = {
+                            "fn": (lambda i, e=ep, k=k_ws[w], u=u:
+                                   self._ut(k, e, u, i)), "cached": cached}
 
-        # rare: the world changed underneath us — refresh and re-run once
-        if (ends[("sys", "epoch")] > st["epoch_len"]
-                or ends[("sys", "reg")] > st["reg_len"]):
+        # ---- round 1: speculative enumeration + growth probes --------------
+        enum_map = {}                # key -> (cid, i); label entries only
+        probe_map = {}               # key -> cid
+        for cid, ch in chains.items():
+            if cid[0] == "lab":      # tomb rids are cached; sys needs no enum
+                for i in range(1, ch["cached"] + 1):
+                    enum_map[ch["fn"](i)] = (cid, i)
+            probe_map[ch["fn"](ch["cached"] + 1)] = cid
+        got = self._mget(list(enum_map) + list(probe_map))
+        rounds = 1
+
+        grown = {cid for k, cid in probe_map.items() if k in got}
+        if any(cid[0] == "sys" for cid in grown):
             if _retried:
                 raise RuntimeError("system chains unstable across retries")
             self._refresh_epoch()
             self._refresh_writers()
             return self.query_multi(predicates, _retried=True)
 
-        tombs = self._apply_tomb_ends(
-            {k: v for k, v in ends.items() if k[0] == "tomb"})
+        # gallop only the chains that grew; their entry at cached+1 is
+        # already in hand (the probe hit IS an entry)
+        ends = {cid: ch["cached"] for cid, ch in chains.items()
+                if cid[0] != "sys"}
+        if grown:
+            spec = {cid: (chains[cid]["fn"], chains[cid]["cached"] + 1)
+                    for cid in grown}
+            g_ends = self._discover_ends(spec)
+            rounds += getattr(self, "_probe_rounds", 0)
+            delta_keys = {}
+            for cid, end in g_ends.items():
+                ends[cid] = end
+                for i in range(chains[cid]["cached"] + 2, end + 1):
+                    delta_keys[chains[cid]["fn"](i)] = (cid, i)
+            if delta_keys:
+                got.update(self._mget(list(delta_keys)))
+                rounds += 1
+            for cid in grown:
+                enum_map[chains[cid]["fn"](chains[cid]["cached"] + 1)] = (
+                    cid, chains[cid]["cached"] + 1)
+            enum_map.update(delta_keys)
 
-        # update counter caches from discovered ends
-        dirty = False
-        for key, end in ends.items():
-            if key[0] != "lab":
-                continue
-            _t, field, ep, w, u = key
-            if u == me and ep == top:
-                if end > st["chains"].get(w, 0):
-                    st["chains"][w] = end       # future inserts append after
-                    dirty = True
-            elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
-                remote[f"{ep}|{w}"][u] = end
-                dirty = True
-        if dirty:
-            self._save()                 # cache only; losable, re-probable
-
-        # ---- one enumeration round across ALL predicates ----
-        ut_map = {}                      # ut -> (field, k_w, ep, u, i)
-        for key, c in ends.items():
-            if key[0] != "lab":
-                continue
-            _t, field, ep, w, u = key
-            k_w = covers[field][2][w]
-            for i in range(1, c + 1):
-                ut_map[self._ut(k_w, ep, u, i)] = (field, k_w, ep, u, i)
+        # ---- unmask entries; update caches ---------------------------------
+        tombs_st = st["tombs"]
         rid_sets = {field: set() for field, _a, _b in bounds}
-        got = self._mget(list(ut_map)) if ut_map else {}
-        for ut, blob in got.items():
-            field, k_w, ep, u, i = ut_map[ut]
-            rid = bytes(x ^ y for x, y in zip(b64decode(blob),
-                                              self._mask(k_w, ep, u, i)))
-            rid_sets[field].add(rid.hex())
+        dirty = False
+        for key, (cid, i) in enum_map.items():
+            blob = got.get(key)
+            if blob is None:
+                continue
+            if cid[0] == "lab":
+                _t, field, ep, w, u = cid
+                k_w = covers[field][2][w]
+                rid = bytes(x ^ y for x, y in zip(b64decode(blob),
+                                                  self._mask(k_w, ep, u, i)))
+                rid_sets[field].add(rid.hex())
+            else:                    # ("tomb", ep, u)
+                _t, ep, u = cid
+                rid = bytes(x ^ y for x, y in zip(b64decode(blob),
+                                                  self._mask(k_t, ep, u, i)))
+                if rid.hex() not in tombs_st["rids"]:
+                    tombs_st["rids"].append(rid.hex())
+                    dirty = True
+        for cid, end in ends.items():
+            if cid[0] == "lab":
+                _t, field, ep, w, u = cid
+                if u == me and ep == top:
+                    if end > st["chains"].get(w, 0):
+                        st["chains"][w] = end
+                        dirty = True
+                elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
+                    remote[f"{ep}|{w}"][u] = end
+                    dirty = True
+            elif cid[0] == "tomb":
+                _t, ep, u = cid
+                if end != tombs_st["counts"].get(f"{ep}|{u}", 0):
+                    tombs_st["counts"][f"{ep}|{u}"] = end
+                    dirty = True
+        if dirty:
+            self._save()             # cache only; losable, re-probable
+
+        tombs = set(tombs_st["rids"])
         sets = [rid_sets[field] for field, _a, _b in bounds]
         candidates = set.intersection(*sets) - tombs if sets else set()
 
-        # ---- one ciphertext round ----
+        # ---- final round: ciphertexts --------------------------------------
         results = []
         blobs = self._mget(["R:" + r for r in candidates]) if candidates else {}
+        rounds += 1 if candidates else 0
         for key, ct in blobs.items():
             raw = b64decode(ct)
             rec = json.loads(self._aes.decrypt(raw[:12], raw[12:], None))
@@ -722,9 +765,8 @@ class Owner:
                 results.append(rec)
         self.last_stats = {
             "cover": sum(len(covers[f][0]) for f, _a, _b in bounds),
-            "index_keys": len(ut_map),
-            "probe_rounds": getattr(self, "_probe_rounds", 0),
-            "writers": len(writers),
+            "index_keys": len(enum_map), "rounds": rounds,
+            "grown_chains": len(grown), "writers": len(writers),
             "per_predicate": [len(s) for s in sets],
             "intersected": len(candidates),
             "candidates": len(blobs), "results": len(results),
