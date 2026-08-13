@@ -52,6 +52,7 @@ import hmac
 import json
 import os
 from .transport import POOL
+from . import direct as direct_mod
 from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor
 
@@ -77,6 +78,10 @@ class Owner:
         self.pool = ThreadPoolExecutor(max_workers=32)
         self.ring = None
         self.last_stats = {}
+        self._dialer = None                # lazy QUIC dialer thread
+        self._direct = {}                  # node_id -> DirectPath
+        self._no_direct_until = {}         # node_id -> retry-after ts
+        self.direct_requests = 0           # served over punched QUIC paths
         self.refresh_membership()
 
     @classmethod
@@ -162,6 +167,7 @@ class Owner:
             contacts = [self._addr_of[n] for n in self.ring.addrs
                         if n in getattr(self, "_addr_of", {})] + contacts
         found = {}
+        udp = {}
         answers = 0
         for addr in contacts:
             try:
@@ -169,6 +175,8 @@ class Owner:
                 for nid, e in peers.items():
                     if e["age"] <= PEER_LIVE_S:
                         found[nid] = e["addr"]
+                        if e.get("udp"):
+                            udp[nid] = e["udp"]
                 answers += 1
                 if answers >= 2:        # merge two views; one may be stale
                     break
@@ -178,6 +186,7 @@ class Owner:
             raise ConnectionError("no live blindrange node reachable "
                                   f"(tried {contacts})")
         self._addr_of = found
+        self._udp_of = udp
         new_ring = Ring(sorted(found), replicas=3)
         if new_ring != self.ring:
             self.ring = new_ring
@@ -253,8 +262,30 @@ class Owner:
         return json.loads(data)
 
     def _relay(self, via_addr, method, path, body):
-        """Reach a NAT'd node through its relay: "via:relay-addr/node-id"."""
+        """Reach a NAT'd node: over a punched direct QUIC path when one can
+        be established, else through its relay ("via:relay-addr/node-id")."""
         relay, _, nid = via_addr[4:].rpartition("/")
+        direct = self._direct_path(nid, relay)
+        if direct is not None:
+            frame = {"m": method, "p": path.split("?")[0],
+                     "q": path.partition("?")[2],
+                     "b": b64encode(body).decode()}
+            payload = body if method == "POST" else \
+                path.split("?")[0].encode()
+            sig = self._sign(payload)
+            if sig:
+                frame["a"] = sig["X-BR-Auth"]
+            try:
+                out = json.loads(direct.request(
+                    json.dumps(frame).encode(), timeout=10))
+                if out.get("s") == 200:
+                    self.direct_requests += 1
+                    return json.loads(b64decode(out["b"]))
+                raise ConnectionError(f"direct request failed: {out.get('s')}")
+            except ConnectionError:
+                raise
+            except Exception:
+                self._drop_direct(nid)     # path died; fall back to relay
         env = {"to": nid, "id": os.urandom(8).hex(), "method": method,
                "path": path, "body_b64": b64encode(body).decode()}
         raw = json.dumps(env).encode()
@@ -382,6 +413,48 @@ class Owner:
         for a, e in by_primary.items():
             self.pool.submit(self._post, a, "/kv", {"entries": e})
         return out
+
+    def _direct_path(self, nid, relay):
+        """A cached punched QUIC path to this tenant, dialing once if needed.
+        Returns None (and remembers not to retry for a while) on failure."""
+        if direct_mod.DISABLED:
+            return None
+        path = self._direct.get(nid)
+        if path is not None:
+            return path
+        import time as _time
+        if _time.time() < self._no_direct_until.get(nid, 0):
+            return None
+        tenant_udp = getattr(self, "_udp_of", {}).get(nid, "")
+        if not tenant_udp:
+            self._no_direct_until[nid] = _time.time() + 60
+            return None
+        if self._dialer is None:
+            self._dialer = direct_mod.Dialer()
+
+        def request_punch(observed):
+            env = {"to": nid, "id": os.urandom(8).hex(), "method": "POST",
+                   "path": "/punch",
+                   "body_b64": b64encode(json.dumps(
+                       {"udp": observed}).encode()).decode()}
+            raw = json.dumps(env).encode()
+            POOL.request(relay, "POST", "/relay/send", raw,
+                         {"Content-Type": "application/json",
+                          **self._sign(raw)}, timeout=15)
+        try:
+            path = self._dialer.dial(tenant_udp, relay, request_punch)
+            self._direct[nid] = path
+            return path
+        except Exception:
+            self._no_direct_until[nid] = _time.time() + 300
+            return None
+
+    def _drop_direct(self, nid):
+        import time as _time
+        path = self._direct.pop(nid, None)
+        if path is not None:
+            path.close()
+        self._no_direct_until[nid] = _time.time() + 60
 
     # -------------------------------------------- chain-length discovery
     def _discover_ends(self, chains_spec):

@@ -511,5 +511,107 @@ class TestNATRelay(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestQuicDirect(unittest.TestCase):
+    """Punched direct paths: a client reaching a relay tenant should
+    establish a QUIC connection (STUN-lite + punch choreography) and serve
+    requests over it instead of the relay — falling back to the relay
+    transparently when QUIC is unavailable."""
+
+    def _network(self, tmp, secret, tenant_env=None):
+        import os
+        env = {**os.environ, "BR_DIALBACK_FIRST": "1", "BR_DIALBACK_EVERY": "2"}
+        root = str(Path(__file__).resolve().parents[1])
+
+        def start(port, seeds, advertise=None, extra_env=None):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{tmp}/n{port}", "--secret", secret]
+            if advertise:
+                args += ["--advertise", advertise]
+            for s in seeds:
+                args += ["--seed", s]
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=root,
+                                    env={**env, **(extra_env or {})})
+        procs = [start(7971, [])]
+        wait_http("127.0.0.1:7971")
+        # the "NAT'd" tenant: dead TCP advertise; QUIC still on its real port
+        procs.append(start(7972, ["127.0.0.1:7971"],
+                           advertise="127.0.0.1:7982",
+                           extra_env=tenant_env))
+        deadline = time.time() + 30
+        via = None
+        import hashlib
+        import hmac as _hmac
+        import json
+        sig = _hmac.new(secret.encode(), b"/peers", hashlib.sha256).hexdigest()
+        while time.time() < deadline and via is None:
+            req = urllib.request.Request("http://127.0.0.1:7971/peers",
+                                         headers={"X-BR-Auth": sig})
+            with urllib.request.urlopen(req, timeout=3) as r:
+                for e in json.loads(r.read())["peers"].values():
+                    if e["addr"].startswith("via:") and e["age"] <= 12:
+                        via = e["addr"]
+            time.sleep(0.5)
+        self.assertIsNotNone(via, "tenant never assembled")
+        return procs
+
+    def test_direct_path_used_and_fallback(self):
+        import os
+        import shutil as _shutil
+        tmp = tempfile.mkdtemp(prefix="blindrange_quic_")
+        secret = "quicnet"
+        procs = self._network(tmp, secret)
+        try:
+            owner = Owner.create(f"{tmp}/o.brdb", "pw",
+                                 {"x": {"type": "int", "bits": 12,
+                                        "leaf_width": 4}},
+                                 bootstrap=["127.0.0.1:7971"],
+                                 network_secret=secret)
+            rows = [{"x": i * 2, "row": i} for i in range(80)]
+            owner.insert_many(rows)
+            # tenant needs a moment to STUN + advertise its UDP endpoint
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                owner.refresh_membership()
+                if getattr(owner, "_udp_of", {}):
+                    break
+                time.sleep(0.5)
+            self.assertTrue(owner._udp_of, "tenant never advertised UDP")
+            got = sorted(r["row"] for r in owner.query("x", 20, 100))
+            want = sorted(r["row"] for r in rows if 20 <= r["x"] <= 100)
+            self.assertEqual(got, want)
+            self.assertGreater(owner.direct_requests, 0,
+                               "no requests went over the punched path")
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_relay_fallback_when_quic_disabled(self):
+        import shutil as _shutil
+        tmp = tempfile.mkdtemp(prefix="blindrange_noquic_")
+        secret = "noquicnet"
+        procs = self._network(tmp, secret, tenant_env={"BR_NO_QUIC": "1"})
+        try:
+            owner = Owner.create(f"{tmp}/o2.brdb", "pw",
+                                 {"x": {"type": "int", "bits": 12,
+                                        "leaf_width": 4}},
+                                 bootstrap=["127.0.0.1:7971"],
+                                 network_secret=secret)
+            rows = [{"x": i * 2, "row": i} for i in range(60)]
+            owner.insert_many(rows)
+            got = sorted(r["row"] for r in owner.query("x", 20, 100))
+            want = sorted(r["row"] for r in rows if 20 <= r["x"] <= 100)
+            self.assertEqual(got, want)      # relay carried everything
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

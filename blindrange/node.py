@@ -56,6 +56,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey)
 
 from .ring import Ring
+from . import direct as direct_mod
 
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
 PEER_TTL = 15.0           # drop peers silent for this long
@@ -98,10 +99,10 @@ class Identity:
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.node_id = hashlib.sha256(self.pub_raw).hexdigest()[:16]
 
-    def heartbeat(self, addr):
+    def heartbeat(self, addr, udp=""):
         ts = int(time.time() * 1000)
-        msg = f"{addr}|{ts}".encode()
-        return {"addr": addr, "ts": ts, "pub": self.pub_raw.hex(),
+        msg = f"{addr}|{udp}|{ts}".encode()
+        return {"addr": addr, "udp": udp, "ts": ts, "pub": self.pub_raw.hex(),
                 "sig": self.priv.sign(msg).hex()}
 
     def poll_token(self):
@@ -117,7 +118,8 @@ def verify_entry(node_id, e):
         if hashlib.sha256(pub_raw).hexdigest()[:16] != node_id:
             return False
         Ed25519PublicKey.from_public_bytes(pub_raw).verify(
-            bytes.fromhex(e["sig"]), f"{e['addr']}|{e['ts']}".encode())
+            bytes.fromhex(e["sig"]),
+            f"{e['addr']}|{e.get('udp', '')}|{e['ts']}".encode())
         return True
     except Exception:
         return False
@@ -204,6 +206,7 @@ class Peers:
     def __init__(self, ident: Identity, addr: str):
         self.ident = ident
         self.addr = addr                   # mutable: direct or via-addr
+        self.udp = ""                      # mutable: observed public UDP
         self.lock = threading.Lock()
         self.table = {ident.node_id: ident.heartbeat(addr)}
         self.contacts = set()              # bare seed addrs (no identity yet)
@@ -220,7 +223,8 @@ class Peers:
                     if not cur:
                         self.changed_at = now
                     self.table[nid] = e
-            self.table[self.ident.node_id] = self.ident.heartbeat(self.addr)
+            self.table[self.ident.node_id] = self.ident.heartbeat(
+                self.addr, self.udp)
             dead = [nid for nid, e in self.table.items()
                     if now - e["ts"] / 1000 > PEER_TTL
                     and nid != self.ident.node_id]
@@ -230,7 +234,8 @@ class Peers:
 
     def snapshot(self):
         with self.lock:
-            self.table[self.ident.node_id] = self.ident.heartbeat(self.addr)
+            self.table[self.ident.node_id] = self.ident.heartbeat(
+                self.addr, self.udp)
             return dict(self.table)
 
     def live(self):
@@ -333,7 +338,7 @@ def post_any(addr, path, payload: bytes, secret: str, timeout=5):
 # --------------------------------------------------------------- services
 # Request handling shared by the HTTP server and the tenant envelope loop.
 
-def service_post(store, peers, hub, secret, path, data):
+def service_post(store, peers, hub, secret, path, data, quic=None):
     if path == "/kv":
         entries = [(k, v) for k, v in data["entries"]]
         if data.get("nx"):
@@ -365,6 +370,13 @@ def service_post(store, peers, hub, secret, path, data):
         except (OSError, ValueError):
             ok = False
         return 200, {"reachable": ok}
+    if path == "/punch":
+        # fired over the reliable relay path: open our NAT toward the caller
+        target = data.get("udp", "")
+        if quic is not None and target:
+            quic.punch(target)
+        return 200, {"punching": bool(quic and target),
+                     "udp": quic.observed if quic else ""}
     if path == "/relay/poll":
         tok = data.get("token", {})
         if not verify_poll_token(tok):
@@ -389,7 +401,8 @@ def service_get(store, peers, path, query):
     if path == "/peers":
         now = time.time()
         return 200, {"peers": {
-            nid: {"addr": e["addr"], "age": round(now - e["ts"] / 1000, 1)}
+            nid: {"addr": e["addr"], "udp": e.get("udp", ""),
+                  "age": round(now - e["ts"] / 1000, 1)}
             for nid, e in peers.snapshot().items()}}
     if path == "/stats":
         return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
@@ -494,10 +507,22 @@ def _reachability_loop(store, peers, hub, secret, direct_addr):
 
 def _tenant_loop(store, peers, hub, secret, current_addr):
     """While in tenant mode: long-poll the relay, answer forwarded requests.
-    Exits when the node returns to direct mode or switches relay."""
+    Exits when the node returns to direct mode or switches relay. Also keeps
+    the QUIC socket's NAT mapping warm and its public endpoint fresh by
+    STUNing the relay every few poll cycles."""
     my_via = current_addr()
     relay, _nid = parse_via(my_via)
+    stun_at = 0.0
     while current_addr() == my_via:
+        quic = _tenant_loop.quic
+        if quic is not None and time.time() > stun_at:
+            try:
+                got = quic.stun(relay)
+                if got:
+                    peers.udp = got
+            except Exception:
+                pass
+            stun_at = time.time() + 20
         try:
             body = json.dumps({"token": peers.ident.poll_token()}).encode()
             got = _post_direct(relay, "/relay/poll", body, secret,
@@ -509,7 +534,8 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
                 else:
                     data = json.loads(b64decode(env["body_b64"]) or b"{}")
                     code, obj = service_post(store, peers, hub, secret,
-                                             env["path"], data)
+                                             env["path"], data,
+                                             quic=_tenant_loop.quic)
                 reply = {"id": env["id"], "status": code,
                          "body_b64": b64encode(json.dumps(obj).encode()).decode()}
                 _post_direct(relay, "/relay/reply",
@@ -518,9 +544,45 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
             time.sleep(2)                              # relay hiccup; retry
 
 
+_tenant_loop.quic = None
+
+
+def make_quic_service(store, peers, hub, secret):
+    """bytes -> bytes request handler for direct QUIC streams. Frames:
+    request {"m", "p", "q", "b" (b64 body), "a" (HMAC)} ->
+    response {"s": status, "b": b64(json)}."""
+    def service(raw: bytes) -> bytes:
+        try:
+            frame = json.loads(raw)
+            body = b64decode(frame.get("b", "")) if frame.get("b") else b""
+            if secret:
+                payload = body if frame.get("m") == "POST" else \
+                    frame.get("p", "").encode()
+                good = hmac.compare_digest(frame.get("a", ""),
+                                           _sign(secret, payload))
+                if not good:
+                    return json.dumps({"s": 401, "b": ""}).encode()
+            if frame.get("m") == "GET":
+                code, obj = service_get(store, peers, frame.get("p", ""),
+                                        frame.get("q", ""))
+            else:
+                data = json.loads(body) if body else {}
+                code, obj = service_post(store, peers, hub, secret,
+                                         frame.get("p", ""), data,
+                                         quic=_tenant_loop.quic)
+            return json.dumps(
+                {"s": code,
+                 "b": b64encode(json.dumps(obj).encode()).decode()}).encode()
+        except Exception as e:
+            return json.dumps({"s": 500, "b": b64encode(
+                json.dumps({"error": str(e)}).encode()).decode()}).encode()
+    return service
+
+
 # --------------------------------------------------------------- server
 
-def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = ""):
+def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
+                 quic=None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"      # keep-alive: reused connections
 
@@ -550,7 +612,8 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = ""):
                 self._json({"error": "unauthorized"}, 401)
                 return
             data = json.loads(raw) if raw else {}
-            code, obj = service_post(store, peers, hub, secret, path, data)
+            code, obj = service_post(store, peers, hub, secret, path, data,
+                                     quic=quic)
             self._json(obj, code)
 
         def do_GET(self):
@@ -576,6 +639,17 @@ def run(host, port, data_dir, seeds, secret="", advertise=None):
     peers = Peers(ident, addr)
     peers.contacts.update(seeds)
     hub = RelayHub()
+    quic = None
+    if not direct_mod.DISABLED:
+        try:
+            quic = direct_mod.NodeQuic(
+                host, port, ident.node_id,
+                make_quic_service(store, peers, hub, secret))
+        except Exception as e:              # QUIC is an optimization only
+            import sys as _sys
+            print(f"quic disabled: {type(e).__name__}: {e}", file=_sys.stderr)
+            quic = None
+    _tenant_loop.quic = quic
     threading.Thread(target=_gossip_loop, args=(peers, secret),
                      daemon=True).start()
     threading.Thread(target=_repair_loop, args=(store, peers, secret),
@@ -584,7 +658,8 @@ def run(host, port, data_dir, seeds, secret="", advertise=None):
                      args=(store, peers, hub, secret, addr),
                      daemon=True).start()
     server = ThreadingHTTPServer((host, port),
-                                 make_handler(store, peers, hub, secret))
+                                 make_handler(store, peers, hub, secret,
+                                              quic=quic))
     server.serve_forever()
 
 
