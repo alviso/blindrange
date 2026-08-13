@@ -499,19 +499,24 @@ class Owner:
             self._st["reg_len"] = slot
         self._save()
 
-    def _refresh_tombs(self, writers):
-        """The set of deleted record ids across all readable epochs (cached;
-        only new tombstone entries are fetched)."""
+    def _tomb_spec(self, writers):
+        """Gallop spec for tombstone chains, batchable with other chains."""
         k_t = self._k_w(TOMB)
-        tombs = self._st["tombs"]
         spec = {}
         for ep in self._epochs():
             for u in writers:
-                spec[(ep, u)] = ((lambda i, e=ep, u=u: self._ut(k_t, e, u, i)),
-                                 tombs["counts"].get(f"{ep}|{u}", 0))
-        ends = self._discover_ends(spec) if spec else {}
+                spec[("tomb", ep, u)] = (
+                    (lambda i, e=ep, u=u: self._ut(k_t, e, u, i)),
+                    self._st["tombs"]["counts"].get(f"{ep}|{u}", 0))
+        return spec
+
+    def _apply_tomb_ends(self, ends):
+        """Fetch any new tombstone entries given discovered chain ends;
+        returns the full deleted-rid set. ends keys: ("tomb", ep, u)."""
+        k_t = self._k_w(TOMB)
+        tombs = self._st["tombs"]
         new_keys = {}
-        for (ep, u), end in ends.items():
+        for (_t, ep, u), end in ends.items():
             for i in range(tombs["counts"].get(f"{ep}|{u}", 0) + 1, end + 1):
                 new_keys[self._ut(k_t, ep, u, i)] = (ep, u, i)
         if new_keys:
@@ -522,10 +527,17 @@ class Owner:
                             zip(b64decode(blob), self._mask(k_t, ep, u, i)))
                 if rid.hex() not in tombs["rids"]:
                     tombs["rids"].append(rid.hex())
-            for (ep, u), end in ends.items():
+            for (_t, ep, u), end in ends.items():
                 tombs["counts"][f"{ep}|{u}"] = end
             self._save()
         return set(tombs["rids"])
+
+    def _refresh_tombs(self, writers):
+        """The set of deleted record ids across all readable epochs (cached;
+        only new tombstone entries are fetched)."""
+        spec = self._tomb_spec(writers)
+        ends = self._discover_ends(spec) if spec else {}
+        return self._apply_tomb_ends(ends)
 
     # ------------------------------------------------------------- insert
     def insert_many(self, records):
@@ -593,33 +605,107 @@ class Owner:
     def query_prefix(self, field, prefix):
         return self.query_multi([{"field": field, "prefix": prefix}])
 
-    def query_multi(self, predicates):
+    def query_multi(self, predicates, _retried=False):
         """AND of range/prefix predicates. Index phases run per predicate and
-        intersect on record ids BEFORE any ciphertext is fetched — the
-        narrowest way to combine encrypted indexes."""
-        self._refresh_epoch()
-        writers = self._refresh_writers()
-        tombs = self._refresh_tombs(writers)
+        intersect on record ids BEFORE any ciphertext is fetched.
+
+        Latency-shaped for relay topologies: ONE batched galloping preflight
+        discovers the ends of every chain the query touches — the epoch
+        chain, the writer registry, all tombstone chains, and every
+        (label, epoch, writer) chain across all predicates — then ONE lookup
+        enumerates all index entries, and ONE fetches the ciphertexts. A
+        stable warm query is ~4 network rounds total. If the preflight
+        reveals a new epoch or new writers (rare), state is refreshed and the
+        query re-runs once."""
+        st = self._st
+        me = st["writer"]
+        top = st["epoch"]
+        writers = list(st["writers"]) or [me]
+        remote = st["remote"]
+
         bounds = []
         for p in predicates:
-            spec = self._st["schema"][p["field"]]
+            fs = st["schema"][p["field"]]
             if "prefix" in p:
-                a, b = prefix_range(p["prefix"], spec["chars"])
+                a, b = prefix_range(p["prefix"], fs["chars"])
             else:
                 a, b = (self._encode(p["field"], p["lo"]),
                         self._encode(p["field"], p["hi"]))
             bounds.append((p["field"], a, b))
 
-        rid_sets = []
-        agg = {"cover": 0, "index_keys": 0, "probe_rounds": 0}
+        # ---- one batched preflight over every chain this query touches ----
+        spec = {("sys", "epoch"): (lambda i: self._sys_key(b"epoch", i),
+                                   st["epoch_len"]),
+                ("sys", "reg"): (lambda i: self._sys_key(b"registry", i),
+                                 st["reg_len"])}
+        spec.update(self._tomb_spec(writers))
+        covers = {}                  # field -> (cover, labels, k_ws)
         for field, a, b in bounds:
-            rids = self._candidate_rids(field, a, b, writers)
-            agg["cover"] += self.last_stats["cover"]
-            agg["index_keys"] += self.last_stats["index_keys"]
-            agg["probe_rounds"] += self.last_stats["probe_rounds"]
-            rid_sets.append(rids)
-        candidates = set.intersection(*rid_sets) - tombs if rid_sets else set()
+            fs = st["schema"][field]
+            mlvl = max_level(fs["bits"], fs.get("leaf_width", 1))
+            cover = dyadic_cover(a, b, fs["bits"], mlvl)
+            labels = [f"{field}|{lvl}|{idx}" for lvl, idx in cover]
+            k_ws = {w: self._k_w(w) for w in labels}
+            covers[field] = (cover, labels, k_ws)
+            for ep in self._epochs():
+                for w in labels:
+                    for u in writers:
+                        cached = (st["chains"].get(w, 0)
+                                  if u == me and ep == top
+                                  else remote.get(f"{ep}|{w}", {}).get(u, 0))
+                        spec[("lab", field, ep, w, u)] = (
+                            (lambda i, e=ep, k=k_ws[w], u=u:
+                             self._ut(k, e, u, i)), cached)
+        ends = self._discover_ends(spec)
 
+        # rare: the world changed underneath us — refresh and re-run once
+        if (ends[("sys", "epoch")] > st["epoch_len"]
+                or ends[("sys", "reg")] > st["reg_len"]):
+            if _retried:
+                raise RuntimeError("system chains unstable across retries")
+            self._refresh_epoch()
+            self._refresh_writers()
+            return self.query_multi(predicates, _retried=True)
+
+        tombs = self._apply_tomb_ends(
+            {k: v for k, v in ends.items() if k[0] == "tomb"})
+
+        # update counter caches from discovered ends
+        dirty = False
+        for key, end in ends.items():
+            if key[0] != "lab":
+                continue
+            _t, field, ep, w, u = key
+            if u == me and ep == top:
+                if end > st["chains"].get(w, 0):
+                    st["chains"][w] = end       # future inserts append after
+                    dirty = True
+            elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
+                remote[f"{ep}|{w}"][u] = end
+                dirty = True
+        if dirty:
+            self._save()                 # cache only; losable, re-probable
+
+        # ---- one enumeration round across ALL predicates ----
+        ut_map = {}                      # ut -> (field, k_w, ep, u, i)
+        for key, c in ends.items():
+            if key[0] != "lab":
+                continue
+            _t, field, ep, w, u = key
+            k_w = covers[field][2][w]
+            for i in range(1, c + 1):
+                ut_map[self._ut(k_w, ep, u, i)] = (field, k_w, ep, u, i)
+        rid_sets = {field: set() for field, _a, _b in bounds}
+        got = self._mget(list(ut_map)) if ut_map else {}
+        for ut, blob in got.items():
+            field, k_w, ep, u, i = ut_map[ut]
+            rid = bytes(x ^ y for x, y in zip(b64decode(blob),
+                                              self._mask(k_w, ep, u, i)))
+            rid_sets[field].add(rid.hex())
+        sets = [rid_sets[field] for field, _a, _b in bounds]
+        candidates = set.intersection(*sets) - tombs if sets else set()
+
+        # ---- one ciphertext round ----
         results = []
         blobs = self._mget(["R:" + r for r in candidates]) if candidates else {}
         for key, ct in blobs.items():
@@ -629,63 +715,17 @@ class Owner:
                    if f in rec):
                 rec["_rid"] = key[2:]
                 results.append(rec)
-        self.last_stats = {**agg, "writers": len(writers),
-                           "per_predicate": [len(s) for s in rid_sets],
-                           "intersected": len(candidates),
-                           "candidates": len(blobs), "results": len(results),
-                           "overfetch": len(blobs) - len(results)}
+        self.last_stats = {
+            "cover": sum(len(covers[f][0]) for f, _a, _b in bounds),
+            "index_keys": len(ut_map),
+            "probe_rounds": getattr(self, "_probe_rounds", 0),
+            "writers": len(writers),
+            "per_predicate": [len(s) for s in sets],
+            "intersected": len(candidates),
+            "candidates": len(blobs), "results": len(results),
+            "overfetch": len(blobs) - len(results)}
         return results
 
-    def _candidate_rids(self, field, a, b, writers):
-        """Index phase for one predicate: encrypted-index lookups only, no
-        ciphertext fetches. Reads every currently-readable epoch (two while a
-        compaction is in flight). Returns the set of matching record ids."""
-        top = self._st["epoch"]
-        spec = self._st["schema"][field]
-        mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
-        me = self._st["writer"]
-        remote = self._st["remote"]
-        cover = dyadic_cover(a, b, spec["bits"], mlvl)
-        labels = [f"{field}|{lvl}|{idx}" for lvl, idx in cover]
-        k_ws = {w: self._k_w(w) for w in labels}
-
-        # cached counters (even our own) are a lower bound; gallop to the end
-        spec_map = {}
-        for ep in self._epochs():
-            for w in labels:
-                for u in writers:
-                    cached = (self._st["chains"].get(w, 0)
-                              if u == me and ep == top
-                              else remote.get(f"{ep}|{w}", {}).get(u, 0))
-                    spec_map[(ep, w, u)] = (
-                        (lambda i, e=ep, k=k_ws[w], u=u:
-                         self._ut(k, e, u, i)), cached)
-        ends = self._discover_ends(spec_map) if spec_map else {}
-        dirty = False
-        for (ep, w, u), end in ends.items():
-            if u == me and ep == top:
-                if end > self._st["chains"].get(w, 0):
-                    self._st["chains"][w] = end     # future inserts append after
-                    dirty = True
-            elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
-                remote[f"{ep}|{w}"][u] = end
-                dirty = True
-        if dirty:
-            self._save()                     # cache only; losable, re-probable
-
-        ut_map = {}
-        for (ep, w, u), c in ends.items():
-            for i in range(1, c + 1):
-                ut_map[self._ut(k_ws[w], ep, u, i)] = (k_ws[w], ep, u, i)
-        rids = set()
-        for ut, blob in self._mget(list(ut_map)).items():
-            k_w, ep, u, i = ut_map[ut]
-            rid = bytes(x ^ y for x, y in zip(b64decode(blob),
-                                              self._mask(k_w, ep, u, i)))
-            rids.add(rid.hex())
-        self.last_stats = {"cover": len(cover), "index_keys": len(ut_map),
-                           "probe_rounds": getattr(self, "_probe_rounds", 0)}
-        return rids
 
     # --------------------------------------------------------- compaction
     def _walk_epoch(self, E, writers):
