@@ -175,7 +175,9 @@ predictable relay of last resort, and that's the entire privileged
 infrastructure.
 
 **Direct paths via QUIC hole punching.** Relaying costs four internet
-crossings; a punched path costs one. Nodes run QUIC alongside their HTTP
+crossings; a punched path costs one. Measured on the public network (a
+client and two NAT'd nodes on separate home networks, seed in Germany): the
+same range query went from **1.7s over relays to 0.7s over punched paths**. Nodes run QUIC alongside their HTTP
 port and answer a tiny discovery protocol (STUN-lite ping/pong, punch
 bursts). A tenant learns its public UDP endpoint from its relay and
 advertises it in its signed heartbeat; a client dialing that tenant STUNs
