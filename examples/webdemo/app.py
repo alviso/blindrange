@@ -147,7 +147,7 @@ def make_handler(owner: Owner, net):
             elif url.path == "/api/nodeview":
                 addr = q.get("addr", [None])[0] or owner.ring.addrs[0]
                 try:
-                    self._json(owner.intel(addr))
+                    self._json(owner.intel(addr, limit=18))
                 except OSError:
                     self._json({"addr": addr, "down": True})
             elif url.path == "/api/kill" and net:
