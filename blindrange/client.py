@@ -232,6 +232,8 @@ class Owner:
 
     def _post(self, addr, path, payload):
         body = json.dumps(payload).encode()
+        if addr.startswith("via:"):                    # relay-tenant node
+            return self._relay(addr, "POST", path, body)
         req = urllib.request.Request(
             f"http://{addr}{path}", data=body,
             headers={"Content-Type": "application/json", **self._sign(body)})
@@ -239,11 +241,28 @@ class Owner:
             return json.loads(r.read())
 
     def _get(self, addr, path):
+        if addr.startswith("via:"):
+            return self._relay(addr, "GET", path, b"")
         base = path.split("?")[0]
         req = urllib.request.Request(f"http://{addr}{path}",
                                      headers=self._sign(base.encode()))
         with urllib.request.urlopen(req, timeout=3) as r:
             return json.loads(r.read())
+
+    def _relay(self, via_addr, method, path, body):
+        """Reach a NAT'd node through its relay: "via:relay-addr/node-id"."""
+        relay, _, nid = via_addr[4:].rpartition("/")
+        env = {"to": nid, "id": os.urandom(8).hex(), "method": method,
+               "path": path, "body_b64": b64encode(body).decode()}
+        raw = json.dumps(env).encode()
+        req = urllib.request.Request(
+            f"http://{relay}/relay/send", data=raw,
+            headers={"Content-Type": "application/json", **self._sign(raw)})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())
+        if out.get("status") != 200:
+            raise ConnectionError(f"relayed request failed: {out}")
+        return json.loads(b64decode(out["body_b64"]))
 
     def _put(self, kv_pairs):
         """Replicated write with a durability floor: every key must be ACKed

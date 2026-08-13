@@ -417,5 +417,99 @@ class TestNodeBackgroundRepair(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestNATRelay(unittest.TestCase):
+    """Network self-assembly: a node whose advertised address is unreachable
+    (home NAT, no port forwarding) must diagnose that itself via dialback,
+    become a relay tenant of a reachable peer, and keep serving — receiving
+    replicas and answering reads — through the relay."""
+
+    def test_unreachable_node_self_assembles_via_relay(self):
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_nat_")
+        secret = "natnet"
+        env = {**os.environ, "BR_DIALBACK_FIRST": "1", "BR_DIALBACK_EVERY": "2",
+               "BR_REPAIR_EVERY": "0.5", "BR_REPAIR_BATCH": "5000"}
+        root = str(Path(__file__).resolve().parents[1])
+
+        def start(port, seeds, advertise=None):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{tmp}/n{port}", "--secret", secret]
+            if advertise:
+                args += ["--advertise", advertise]
+            for s in seeds:
+                args += ["--seed", s]
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=root,
+                                    env=env)
+
+        procs = []
+        try:
+            procs.append(start(7951, []))
+            wait_http("127.0.0.1:7951")
+            procs.append(start(7952, ["127.0.0.1:7951"]))
+            wait_peers("127.0.0.1:7951", 2, secret)
+
+            # the "NAT'd" node: listens on 7953 but advertises a dead port —
+            # exactly what a home router does to an unsolicited inbound dial
+            procs.append(start(7953, ["127.0.0.1:7951"],
+                               advertise="127.0.0.1:7963"))
+            wait_http("127.0.0.1:7953")
+
+            # it must self-diagnose and re-advertise as via:<relay>/<id>
+            import hashlib
+            import hmac as _hmac
+            sig = _hmac.new(secret.encode(), b"/peers",
+                            hashlib.sha256).hexdigest()
+            via_addr = None
+            deadline = time.time() + 30
+            while time.time() < deadline and via_addr is None:
+                req = urllib.request.Request("http://127.0.0.1:7951/peers",
+                                             headers={"X-BR-Auth": sig})
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    peers = json.loads(r.read())["peers"]
+                for e in peers.values():
+                    if e["addr"].startswith("via:") and e["age"] <= 12:
+                        via_addr = e["addr"]
+                time.sleep(0.5)
+            self.assertIsNotNone(via_addr, "node never entered tenant mode")
+
+            # write data: with 3 nodes and RF3 the tenant replicates
+            # everything — its copies arrive only through the relay
+            owner = Owner.create(f"{tmp}/o.brdb", "pw",
+                                 {"x": {"type": "int", "bits": 12,
+                                        "leaf_width": 4}},
+                                 bootstrap=["127.0.0.1:7951"],
+                                 network_secret=secret)
+            rows = [{"x": i * 3, "row": i} for i in range(120)]
+            owner.insert_many(rows)
+
+            def keys_on(port):          # test backdoor: the tenant's real port
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/stats", timeout=3) as r:
+                    return json.loads(r.read())["keys"]
+            deadline = time.time() + 60
+            while time.time() < deadline and keys_on(7953) < keys_on(7951):
+                time.sleep(1)
+            self.assertGreaterEqual(keys_on(7953), keys_on(7951),
+                                    "replicas never reached the tenant")
+
+            # reads through the relay work: fetch the tenant's intel via its
+            # via-address (client -> relay -> tenant -> back)
+            intel = owner.intel(via_addr)
+            self.assertGreater(intel["count"], 0)
+
+            # and ordinary queries are correct with the tenant in the ring
+            got = sorted(r["row"] for r in owner.query("x", 30, 300))
+            want = sorted(r["row"] for r in rows if 30 <= r["x"] <= 300)
+            self.assertEqual(got, want)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

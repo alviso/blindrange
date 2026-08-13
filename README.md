@@ -135,6 +135,29 @@ nodes and replication recovers after churn with no owner involvement. The
 e2e suite proves the full arc: data written to a two-node network migrates
 to a third node that joined later, and survives both original nodes dying.
 
+### NAT and network self-assembly
+
+Nobody should have to open a router port to run a node. On joining, every
+node asks a peer to **dial it back** at its advertised address. If that
+fails (a typical home NAT), the node automatically becomes a **relay
+tenant**: it keeps an outbound long-poll open to a reachable peer (its
+relay) and advertises itself as `via:<relay-addr>/<node-id>`. Anyone —
+client or node — reaches it by handing an envelope to the relay, which
+forwards it over the tenant's own outbound connection. Tenants still dial
+*out* directly for gossip and repair; only inbound traffic is relayed.
+Reachability is re-checked periodically, so nodes move between direct and
+tenant mode as their connectivity changes — no configuration, no port
+forwarding, no manual role assignment.
+
+The "central component" this needs is deliberately minimal: **every
+reachable node is a relay**, so the bridge for unconnectable nodes is the
+network itself. A dedicated always-on seed node you run works as a
+predictable relay of last resort, and that's the entire privileged
+infrastructure. Honest trade-offs: relayed traffic costs the relay
+bandwidth and adds a hop of latency; a relay sees the same opaque
+request/response bytes any node sees (nothing more); and direct
+hole-punching (QUIC) to shrink relay usage further is future work.
+
 ### Running nodes on multiple machines
 
 Bind to the LAN and advertise a reachable address:
@@ -150,9 +173,10 @@ blindrange-node --port 7501 --data ~/.blindrange/n1 \
     --seed 192.168.1.10:7501 --secret <network-secret>
 ```
 
-Clients bootstrap the same way: `bootstrap=["192.168.1.10:7501"]`. Nodes
-behind NAT need a reachable address — today that means a LAN, a VPN, or an
-overlay like Tailscale/Headscale; native NAT traversal is on the roadmap.
+Clients bootstrap the same way: `bootstrap=["192.168.1.10:7501"]`. A node
+behind NAT just points `--seed` at any reachable peer and self-assembles as
+a relay tenant (see above) — no port forwarding needed. At least one node in
+the network must be directly reachable to serve as seed and relay.
 
 Own a database (the only place keys ever exist):
 
@@ -229,7 +253,7 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Seventeen end-to-end tests against real gossip networks: membership
+Eighteen end-to-end tests against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with
@@ -238,8 +262,10 @@ two-field AND queries, deletes visible to fresh clients via tombstones, and
 compaction (correctness preserved, tombstoned entries dropped, late writers
 picking up the new epoch), rejection of unauthenticated requests, the
 owner-driven repair sweep, hot-label striping across nodes, a writer
-inserting concurrently with a running compaction, and gossip-driven
-node-to-node data migration surviving the death of all original holders.
+inserting concurrently with a running compaction, gossip-driven
+node-to-node data migration surviving the death of all original holders,
+and a NAT'd node self-assembling as a relay tenant — diagnosed by dialback,
+replicated to and read from entirely through its relay.
 
 ## Threat model — measured, not asserted
 

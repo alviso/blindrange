@@ -8,11 +8,21 @@ network); to use the network, a client needs the address of any one live node.
 Identity: each node generates an Ed25519 keypair on first start (kept in its
 data directory). Its node id is a hash of the public key, and every gossip
 heartbeat ("I am at <addr> at time <t>") is signed by the node itself and
-verified by everyone who relays or receives it — so no insider can forge
-another node's liveness or redirect its traffic by advertising a wrong
-address. Placement hashes node ids, not addresses, so a node can change
-address (DHCP, new network) without reshuffling data. This is not Sybil
-resistance: anyone holding the network secret can mint new identities.
+verified by everyone who relays or receives it. Placement hashes node ids,
+so a node can change address without reshuffling data. This is not Sybil
+resistance: anyone holding the network secret can mint identities.
+
+Self-assembly / NAT: on joining, a node asks a peer to DIAL IT BACK at its
+advertised address. If that fails (typical home NAT — no port forwarding),
+the node automatically becomes a RELAY TENANT: it keeps an outbound long-poll
+open to a reachable peer (its relay) and advertises the address
+"via:<relay-addr>/<node-id>". Anyone can reach it by posting an envelope to
+the relay, which forwards over the tenant's own outbound connection. Every
+reachable node is a relay — the bridge for unconnectable nodes is the network
+itself, not a special server (though a dedicated always-on seed works too).
+Reachability is re-checked periodically, so nodes move between direct and
+tenant mode as their connectivity changes. Tenants still dial OUT directly
+for gossip and repair; only inbound traffic uses the relay.
 
 Self-healing: a background thread continuously walks this node's keys in
 small batches and re-pushes each to the key's current replica set — so data
@@ -35,6 +45,8 @@ import sqlite3
 import threading
 import time
 import urllib.request
+from base64 import b64decode, b64encode
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -49,6 +61,22 @@ PEER_TTL = 15.0           # drop peers silent for this long
 REPAIR_EVERY = float(os.environ.get("BR_REPAIR_EVERY", "5"))
 REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "200"))
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
+DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
+DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
+POLL_WAIT = 20.0          # relay parks a tenant's poll this long
+SEND_WAIT = 15.0          # relay waits this long for a tenant's reply
+TENANT_FRESH = 45.0       # tenant counts as connected if polled this recently
+
+
+def is_via(addr: str) -> bool:
+    return addr.startswith("via:")
+
+
+def parse_via(addr: str):
+    """"via:host:port/node_id" -> (relay_addr, node_id)"""
+    rest = addr[4:]
+    relay, _, nid = rest.rpartition("/")
+    return relay, nid
 
 
 class Identity:
@@ -75,6 +103,11 @@ class Identity:
         return {"addr": addr, "ts": ts, "pub": self.pub_raw.hex(),
                 "sig": self.priv.sign(msg).hex()}
 
+    def poll_token(self):
+        ts = int(time.time() * 1000)
+        return {"node_id": self.node_id, "ts": ts, "pub": self.pub_raw.hex(),
+                "sig": self.priv.sign(f"poll|{ts}".encode()).hex()}
+
 
 def verify_entry(node_id, e):
     """A peer entry is only accepted if its own key signed it."""
@@ -84,6 +117,20 @@ def verify_entry(node_id, e):
             return False
         Ed25519PublicKey.from_public_bytes(pub_raw).verify(
             bytes.fromhex(e["sig"]), f"{e['addr']}|{e['ts']}".encode())
+        return True
+    except Exception:
+        return False
+
+
+def verify_poll_token(tok):
+    try:
+        pub_raw = bytes.fromhex(tok["pub"])
+        if hashlib.sha256(pub_raw).hexdigest()[:16] != tok["node_id"]:
+            return False
+        if abs(time.time() * 1000 - tok["ts"]) > 30_000:
+            return False
+        Ed25519PublicKey.from_public_bytes(pub_raw).verify(
+            bytes.fromhex(tok["sig"]), f"poll|{tok['ts']}".encode())
         return True
     except Exception:
         return False
@@ -105,8 +152,6 @@ class Store:
             self.db.commit()
 
     def put_nx(self, entries):
-        """Insert-if-absent; returns the keys that already existed (unchanged).
-        Lets clients do lock-free appends to shared chains (writer registry)."""
         with self.lock:
             existed = []
             for k, v in entries:
@@ -118,8 +163,6 @@ class Store:
             return existed
 
     def delete(self, keys):
-        """Remove keys outright (owner-driven deletes and epoch compaction).
-        The node cannot tell a delete from any other opaque-key operation."""
         with self.lock:
             n = 0
             for k in keys:
@@ -159,10 +202,10 @@ class Peers:
 
     def __init__(self, ident: Identity, addr: str):
         self.ident = ident
-        self.addr = addr
+        self.addr = addr                   # mutable: direct or via-addr
         self.lock = threading.Lock()
         self.table = {ident.node_id: ident.heartbeat(addr)}
-        self.contacts = set()          # bare seed addrs (no identity yet)
+        self.contacts = set()              # bare seed addrs (no identity yet)
         self.changed_at = time.time()
 
     def merge(self, other: dict):
@@ -194,16 +237,74 @@ class Peers:
         return {nid: e for nid, e in self.snapshot().items()
                 if now - e["ts"] / 1000 <= PEER_TTL}
 
+    def live_direct(self, exclude_self=True):
+        """Peers reachable without a relay (candidates for dialback/relaying)."""
+        return {nid: e for nid, e in self.live().items()
+                if not is_via(e["addr"])
+                and not (exclude_self and nid == self.ident.node_id)}
+
     def stable_since(self):
         with self.lock:
             return time.time() - self.changed_at
+
+
+class RelayHub:
+    """The relay side, present on every node: tenants park long-polls here;
+    anyone can post an envelope for a tenant; replies are matched back."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.tenants = {}      # node_id -> {"q": deque, "ev": Event, "seen": ts}
+        self.replies = {}      # env_id -> {"ev": Event, "result": ...}
+
+    def _tenant(self, nid):
+        with self.lock:
+            t = self.tenants.get(nid)
+            if not t:
+                t = {"q": deque(), "ev": threading.Event(), "seen": 0.0}
+                self.tenants[nid] = t
+            return t
+
+    def poll(self, nid):
+        """Park up to POLL_WAIT; return queued envelopes for this tenant."""
+        t = self._tenant(nid)
+        t["seen"] = time.time()
+        t["ev"].wait(POLL_WAIT)
+        with self.lock:
+            envs = list(t["q"])
+            t["q"].clear()
+            t["ev"].clear()
+            t["seen"] = time.time()
+        return envs
+
+    def send(self, nid, envelope):
+        """Deliver an envelope to a connected tenant; wait for its reply."""
+        t = self._tenant(nid)
+        if time.time() - t["seen"] > TENANT_FRESH:
+            return None                                # tenant not connected
+        slot = {"ev": threading.Event(), "result": None}
+        with self.lock:
+            self.replies[envelope["id"]] = slot
+            t["q"].append(envelope)
+            t["ev"].set()
+        slot["ev"].wait(SEND_WAIT)
+        with self.lock:
+            self.replies.pop(envelope["id"], None)
+        return slot["result"]
+
+    def reply(self, env_id, result):
+        with self.lock:
+            slot = self.replies.get(env_id)
+        if slot:
+            slot["result"] = result
+            slot["ev"].set()
 
 
 def _sign(secret: str, payload: bytes) -> str:
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
-def _post(addr, path, payload: bytes, secret: str, timeout=3):
+def _post_direct(addr, path, payload: bytes, secret: str, timeout=5):
     headers = {"Content-Type": "application/json"}
     if secret:
         headers["X-BR-Auth"] = _sign(secret, payload)
@@ -212,6 +313,92 @@ def _post(addr, path, payload: bytes, secret: str, timeout=3):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
+
+def post_any(addr, path, payload: bytes, secret: str, timeout=5):
+    """POST to a direct address, or through a relay for a via-address."""
+    if not is_via(addr):
+        return _post_direct(addr, path, payload, secret, timeout)
+    relay, nid = parse_via(addr)
+    env = {"to": nid, "id": os.urandom(8).hex(), "method": "POST",
+           "path": path, "body_b64": b64encode(payload).decode()}
+    out = _post_direct(relay, "/relay/send", json.dumps(env).encode(),
+                       secret, timeout=timeout + SEND_WAIT)
+    if out.get("status") != 200:
+        raise ConnectionError(f"relayed request failed: {out}")
+    return json.loads(b64decode(out["body_b64"]))
+
+
+# --------------------------------------------------------------- services
+# Request handling shared by the HTTP server and the tenant envelope loop.
+
+def service_post(store, peers, hub, secret, path, data):
+    if path == "/kv":
+        entries = [(k, v) for k, v in data["entries"]]
+        if data.get("nx"):
+            existed = store.put_nx(entries)
+            return 200, {"stored": len(entries) - len(existed),
+                         "existed": existed}
+        store.put(entries)
+        return 200, {"stored": len(entries)}
+    if path == "/mget":
+        return 200, {"values": store.mget(data["keys"])}
+    if path == "/delete":
+        return 200, {"deleted": store.delete(data["keys"])}
+    if path == "/gossip":
+        peers.merge(data.get("peers", {}))
+        return 200, {"peers": peers.snapshot()}
+    if path == "/dialback":
+        target = data.get("addr", "")
+        if is_via(target):
+            return 400, {"error": "dialback is for direct addresses"}
+        try:
+            req = urllib.request.Request(f"http://{target}/stats")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                ok = r.status == 200
+        except OSError:
+            ok = False
+        return 200, {"reachable": ok}
+    if path == "/relay/poll":
+        tok = data.get("token", {})
+        if not verify_poll_token(tok):
+            return 401, {"error": "bad poll token"}
+        return 200, {"envelopes": hub.poll(tok["node_id"])}
+    if path == "/relay/send":
+        result = hub.send(data["to"], {"id": data["id"],
+                                       "method": data.get("method", "POST"),
+                                       "path": data["path"],
+                                       "body_b64": data.get("body_b64", "")})
+        if result is None:
+            return 404, {"error": "tenant not connected"}
+        return 200, result
+    if path == "/relay/reply":
+        hub.reply(data["id"], {"status": data["status"],
+                               "body_b64": data.get("body_b64", "")})
+        return 200, {"ok": True}
+    return 404, {"error": "unknown"}
+
+
+def service_get(store, peers, path, query):
+    if path == "/peers":
+        now = time.time()
+        return 200, {"peers": {
+            nid: {"addr": e["addr"], "age": round(now - e["ts"] / 1000, 1)}
+            for nid, e in peers.snapshot().items()}}
+    if path == "/stats":
+        return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
+                     "keys": store.count(),
+                     "read_batches": store.read_batches,
+                     "peers": len(peers.live()),
+                     "mode": "tenant" if is_via(peers.addr) else "direct"}
+    if path == "/intel":
+        n = int(parse_qs(query).get("limit", ["4"])[0])
+        return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
+                     "count": store.count(),
+                     "sample": [[k, v] for k, v in store.sample(n)]}
+    return 404, {"error": "unknown"}
+
+
+# --------------------------------------------------------------- daemons
 
 def _gossip_loop(peers: Peers, secret: str):
     while True:
@@ -226,21 +413,18 @@ def _gossip_loop(peers: Peers, secret: str):
         target = random.choice(targets)
         try:
             body = json.dumps({"peers": peers.snapshot()}).encode()
-            got = _post(target, "/gossip", body, secret)
+            got = post_any(target, "/gossip", body, secret)
             peers.merge(got["peers"])
         except OSError:
             pass                                       # peer down; TTL handles it
 
 
 def _repair_loop(store: Store, peers: Peers, secret: str):
-    """Continuously re-push this node's keys to their current replica sets.
-    Data migrates to joined nodes and replication heals after churn without
-    any owner involvement. Idempotent (INSERT OR REPLACE everywhere)."""
     cursor = ""
     while True:
         time.sleep(REPAIR_EVERY + random.random())
         if peers.stable_since() < REPAIR_SETTLE:
-            continue                                   # membership still moving
+            continue
         live = peers.live()
         if len(live) < 2:
             continue
@@ -248,7 +432,7 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
         addr_of = {nid: e["addr"] for nid, e in live.items()}
         batch = store.batch_after(cursor, REPAIR_BATCH)
         if not batch:
-            cursor = ""                                # wrapped; start over
+            cursor = ""
             continue
         cursor = batch[-1][0]
         by_addr = {}
@@ -258,13 +442,77 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
                     by_addr.setdefault(addr_of[nid], []).append([k, v])
         for addr, entries in by_addr.items():
             try:
-                _post(addr, "/kv", json.dumps({"entries": entries}).encode(),
-                      secret, timeout=5)
+                post_any(addr, "/kv",
+                         json.dumps({"entries": entries}).encode(), secret)
             except OSError:
                 pass
 
 
-def make_handler(store: Store, peers: Peers, secret: str = ""):
+def _reachability_loop(store, peers, hub, secret, direct_addr):
+    """Self-assembly: determine own reachability by dialback, become a relay
+    tenant when unreachable, revert when reachable again."""
+    ident = peers.ident
+    time.sleep(DIALBACK_FIRST)
+    relay_nid = None
+    while True:
+        candidates = peers.live_direct()
+        if candidates:
+            probe = random.choice(list(candidates.values()))
+            try:
+                got = post_any(probe["addr"], "/dialback",
+                               json.dumps({"addr": direct_addr}).encode(),
+                               secret)
+                reachable = got.get("reachable", False)
+            except OSError:
+                reachable = None                       # probe failed; no info
+            if reachable is True and is_via(peers.addr):
+                peers.addr = direct_addr               # NAT opened up: go direct
+                relay_nid = None
+            elif reachable is False:
+                pool = {n: e for n, e in candidates.items()}
+                if relay_nid not in pool and pool:
+                    relay_nid = random.choice(list(pool))
+                if relay_nid:
+                    via = f"via:{pool[relay_nid]['addr']}/{ident.node_id}"
+                    if peers.addr != via:
+                        peers.addr = via
+                        threading.Thread(
+                            target=_tenant_loop,
+                            args=(store, peers, hub, secret,
+                                  lambda: peers.addr),
+                            daemon=True).start()
+        time.sleep(DIALBACK_EVERY)
+
+
+def _tenant_loop(store, peers, hub, secret, current_addr):
+    """While in tenant mode: long-poll the relay, answer forwarded requests.
+    Exits when the node returns to direct mode or switches relay."""
+    my_via = current_addr()
+    relay, _nid = parse_via(my_via)
+    while current_addr() == my_via:
+        try:
+            body = json.dumps({"token": peers.ident.poll_token()}).encode()
+            got = _post_direct(relay, "/relay/poll", body, secret,
+                               timeout=POLL_WAIT + 10)
+            for env in got.get("envelopes", []):
+                if env["method"] == "GET":
+                    path, _, query = env["path"].partition("?")
+                    code, obj = service_get(store, peers, path, query)
+                else:
+                    data = json.loads(b64decode(env["body_b64"]) or b"{}")
+                    code, obj = service_post(store, peers, hub, secret,
+                                             env["path"], data)
+                reply = {"id": env["id"], "status": code,
+                         "body_b64": b64encode(json.dumps(obj).encode()).decode()}
+                _post_direct(relay, "/relay/reply",
+                             json.dumps(reply).encode(), secret)
+        except OSError:
+            time.sleep(2)                              # relay hiccup; retry
+
+
+# --------------------------------------------------------------- server
+
+def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = ""):
     class Handler(BaseHTTPRequestHandler):
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()
@@ -292,24 +540,8 @@ def make_handler(store: Store, peers: Peers, secret: str = ""):
                 self._json({"error": "unauthorized"}, 401)
                 return
             data = json.loads(raw) if raw else {}
-            if path == "/kv":
-                entries = [(k, v) for k, v in data["entries"]]
-                if data.get("nx"):
-                    existed = store.put_nx(entries)
-                    self._json({"stored": len(entries) - len(existed),
-                                "existed": existed})
-                else:
-                    store.put(entries)
-                    self._json({"stored": len(entries)})
-            elif path == "/mget":
-                self._json({"values": store.mget(data["keys"])})
-            elif path == "/delete":
-                self._json({"deleted": store.delete(data["keys"])})
-            elif path == "/gossip":
-                peers.merge(data.get("peers", {}))
-                self._json({"peers": peers.snapshot()})
-            else:
-                self._json({"error": "unknown"}, 404)
+            code, obj = service_post(store, peers, hub, secret, path, data)
+            self._json(obj, code)
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -317,26 +549,8 @@ def make_handler(store: Store, peers: Peers, secret: str = ""):
                     url.path.encode()):
                 self._json({"error": "unauthorized"}, 401)
                 return
-            if url.path == "/peers":
-                now = time.time()
-                self._json({"peers": {
-                    nid: {"addr": e["addr"],
-                          "age": round(now - e["ts"] / 1000, 1)}
-                    for nid, e in peers.snapshot().items()}})
-            elif url.path == "/stats":
-                self._json({"addr": peers.addr,
-                            "node_id": peers.ident.node_id,
-                            "keys": store.count(),
-                            "read_batches": store.read_batches,
-                            "peers": len(peers.live())})
-            elif url.path == "/intel":
-                n = int(parse_qs(url.query).get("limit", ["4"])[0])
-                self._json({"addr": peers.addr,
-                            "node_id": peers.ident.node_id,
-                            "count": store.count(),
-                            "sample": [[k, v] for k, v in store.sample(n)]})
-            else:
-                self._json({"error": "unknown"}, 404)
+            code, obj = service_get(store, peers, url.path, url.query)
+            self._json(obj, code)
 
         def log_message(self, *a):
             pass
@@ -351,12 +565,16 @@ def run(host, port, data_dir, seeds, secret="", advertise=None):
     store = Store(os.path.join(data_dir, "kv.db"))
     peers = Peers(ident, addr)
     peers.contacts.update(seeds)
+    hub = RelayHub()
     threading.Thread(target=_gossip_loop, args=(peers, secret),
                      daemon=True).start()
     threading.Thread(target=_repair_loop, args=(store, peers, secret),
                      daemon=True).start()
+    threading.Thread(target=_reachability_loop,
+                     args=(store, peers, hub, secret, addr),
+                     daemon=True).start()
     server = ThreadingHTTPServer((host, port),
-                                 make_handler(store, peers, secret))
+                                 make_handler(store, peers, hub, secret))
     server.serve_forever()
 
 
@@ -373,7 +591,9 @@ def main():
                          "empty runs an open network")
     ap.add_argument("--advertise", default=None,
                     help="host:port other machines should reach this node at "
-                         "(defaults to --host:--port; set it when binding 0.0.0.0)")
+                         "(defaults to --host:--port; set it when binding 0.0.0.0). "
+                         "If it turns out to be unreachable, the node automatically "
+                         "relays through a reachable peer instead.")
     a = ap.parse_args()
     run(a.host, a.port, a.data, a.seed, a.secret, a.advertise)
 
