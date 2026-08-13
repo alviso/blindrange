@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange — range queries over encrypted data on blind nodes</title>
+<meta name="description" content="An open-source encrypted database distributed across nodes that cannot read it. Range queries without order leakage, forward privacy at HMAC speed, and every leak measured and disclosed.">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:880px; margin:0 auto; padding:48px 24px 80px; }
+  h1 { font-size:44px; letter-spacing:-1px; margin:24px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:28px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.12em;
+       color:var(--acc); margin:48px 0 14px; }
+  p { margin:0 0 14px; color:var(--txt); }
+  p.dim, li.dim { color:var(--dim); }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .btns { display:flex; gap:12px; flex-wrap:wrap; margin:26px 0 8px; }
+  .btn { border:1px solid var(--line); border-radius:8px; padding:10px 18px;
+         color:var(--txt); background:var(--panel); }
+  .btn.primary { border-color:var(--acc); color:var(--acc); }
+  .btn:hover { text-decoration:none; border-color:var(--acc); }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:16px 18px; overflow-x:auto; font-size:13.5px; line-height:1.55;
+        margin:0 0 14px; color:var(--txt); }
+  pre .c { color:var(--dim); }  pre .g { color:var(--ok); }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin:0 0 14px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--dim); font-weight:normal; text-transform:uppercase;
+       font-size:12px; letter-spacing:.08em; }
+  td.k { color:var(--warn); white-space:nowrap; }
+  ul { margin:0 0 14px 20px; }
+  li { margin-bottom:6px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+           gap:14px; margin:0 0 14px; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:16px 18px; }
+  .card h3 { font-size:15px; margin-bottom:8px; color:var(--txt); }
+  .card p { font-size:13.5px; color:var(--dim); margin:0; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>blind<span>range</span></h1>
+<div class="tag">Range queries over encrypted data, served by machines that
+<b>cannot read it</b>. A decentralized database with no central
+infrastructure, no trusted component, and — unusually — <b>every leak
+measured and published</b>.</div>
+
+<div class="btns">
+  <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
+  <a class="btn" href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">Threat model</a>
+  <a class="btn" href="https://github.com/alviso/blindrange/tree/main/prototype">The measurements</a>
+</div>
+
+<h2>The trick</h2>
+<p>Order-preserving encryption — the classic way to run <code>BETWEEN</code>
+on ciphertext — was broken by a decade of inference attacks, because
+revealing <em>order</em> reveals nearly everything. blindrange gives up
+server-side sorting and keeps only range <em>filters</em>, which is enough to
+change the game: a range collapses into a handful of dyadic intervals, each
+interval becomes a pseudorandom key via a PRF only the data owner can
+compute, and the network answers <b>exact-match lookups on opaque keys</b>.
+Nodes never see a comparison, an ordering, or a byte of plaintext.
+AES-256-GCM covers the payloads; the owner decrypts and post-filters at
+home.</p>
+
+<pre><span class="c"># WHERE amount BETWEEN 250 AND 500 — on data the nodes can't read</span>
+owner.query("amount", 25000, 50000)
+owner.query_prefix("name", "ac")            <span class="c"># LIKE 'ac%'</span>
+owner.query_multi([...])                    <span class="c"># AND across fields</span>
+owner.delete(rid); owner.compact()          <span class="c"># real forgetting</span></pre>
+
+<h2>What a node operator sees</h2>
+<pre>I:39d8286d9d20f107ce3e03e74045ac44  →  utqJUnFcSPs=
+I:98a16f60dd371e5eff15b038b7acb55f  →  ZG32xdJmFUU=
+R:b59b23f85755164b                  →  eDF7iT+qCl4K2/LuQDdJv6…
+<span class="g">no keys · no order · no equality · no co-occurrence · forward private</span></pre>
+<p class="dim">Because the owner walks the index (nodes never receive a label
+key), forward privacy comes from plain HMAC counter chains — no public-key
+crypto in the hot path. A full snapshot of every disk in the network is
+unlinkable pseudorandom pairs.</p>
+
+<h2>A network anyone can run</h2>
+<div class="cards">
+  <div class="card"><h3>No central anything</h3><p>Membership is gossip;
+  joining — as a node or a client — takes the address of any one live peer.
+  Ed25519 identities make heartbeats unforgeable, and placement follows
+  stable node ids, not addresses.</p></div>
+  <div class="card"><h3>Self-healing</h3><p>Nodes continuously re-push their
+  keys to each key's current replica set. Data migrates to newcomers and
+  replication recovers from churn with no owner involvement — proven by
+  tests that kill every original holder.</p></div>
+  <div class="card"><h3>Multi-writer, no coordination</h3><p>Per-writer
+  append-only chains make the index a grow-only CRDT. Sync is galloping
+  probes against the network itself; counters are a cache, never a single
+  point of failure.</p></div>
+  <div class="card"><h3>Safe maintenance</h3><p>LSM-style compaction merges
+  streams, drops deleted entries for real, and is safe under concurrent
+  writes via an open/drain/seal epoch protocol.</p></div>
+</div>
+
+<h2>Honesty as the design principle</h2>
+<p>Every queryable-encryption scheme leaks something. Most products bury
+that. blindrange ships an <a
+href="https://github.com/alviso/blindrange/blob/main/prototype/attack.py">attack
+harness</a> that runs the real attacks from the literature against its own
+design and prints the numbers:</p>
+<table>
+  <tr><th>What</th><th>Result, measured</th></tr>
+  <tr><td class="k">Payload confidentiality</td><td>Holds unconditionally.
+  A fully-colluding network holds keys it cannot link and blobs it cannot
+  decrypt.</td></tr>
+  <tr><td class="k">At rest</td><td>Zero structure — the snapshot equality
+  attack that recovers value-groups from naive schemes finds
+  <b>nothing</b>.</td></tr>
+  <tr><td class="k">Query watcher</td><td>An adversary logging every query
+  can reconstruct a column's values over time —
+  <b>bounded structurally</b> by each field's <code>leaf_width</code>: no
+  observer ever resolves finer than the leaf, no matter how long it
+  watches. A privacy budget you cannot accidentally overspend.</td></tr>
+  <tr><td class="k">Who it's for</td><td>Not healthcare, not high-stakes
+  PII. Ordinary business data on infrastructure you don't fully trust —
+  with the trade-offs in front of you, not in a footnote.</td></tr>
+</table>
+
+<h2>Try it in five minutes</h2>
+<pre><span class="c"># three nodes, one machine (or three machines — see README)</span>
+pip install -e . && blindrange-node --port 7501 --data ~/.br/n1 --secret s
+blindrange-node --port 7502 --data ~/.br/n2 --seed 127.0.0.1:7501 --secret s
+blindrange-node --port 7503 --data ~/.br/n3 --seed 127.0.0.1:7501 --secret s
+
+<span class="c"># or the full sample app: encrypted orders, live network panel,</span>
+<span class="c"># kill-a-node buttons, and a window into what nodes actually see</span>
+python3 examples/webdemo/app.py     <span class="g"># → http://127.0.0.1:8600</span></pre>
+
+<div class="foot">MIT-licensed research prototype. Built on structured
+encryption (Kamara–Moataz, MongoDB QE lineage), Sophos-style forward
+privacy, and the attack literature it takes seriously
+(Naveed–Kamara–Wright, Grubbs et al., Kellaris et al.).
+<a href="https://github.com/alviso/blindrange">github.com/alviso/blindrange</a></div>
+
+</div>
+</body>
+</html>

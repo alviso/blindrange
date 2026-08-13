@@ -1,5 +1,10 @@
 # blindrange
 
+[![CI](https://github.com/alviso/blindrange/actions/workflows/ci.yml/badge.svg)](https://github.com/alviso/blindrange/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![Status: research](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#threat-model--measured-not-asserted)
+
 Range queries over encrypted data stored on **blind, decentralized nodes**.
 
 A key-holding owner, an arbitrary number of small storage nodes that hold only
@@ -22,6 +27,42 @@ healthcare data or high-stakes PII; it is aimed at ordinary business data on
 infrastructure you don't fully trust.
 
 ## How it works
+
+```mermaid
+flowchart LR
+    subgraph OWNER["Data owner — the only place keys exist"]
+        direction TB
+        K["master key<br/>(.brdb state file)"]
+        Q["query: amount BETWEEN a AND b"]
+        DY["dyadic cover<br/>range → interval labels"]
+        PRF["PRF chains<br/>label → opaque keys"]
+        DEC["decrypt + post-filter<br/>AES-256-GCM"]
+        Q --> DY --> PRF
+        K --- PRF
+    end
+
+    subgraph NET["Blind node network — untrusted, self-healing"]
+        direction TB
+        N1["node<br/>opaque k→v"]
+        N2["node<br/>opaque k→v"]
+        N3["node<br/>opaque k→v"]
+        N4["…thousands"]
+        N1 <-. "gossip +<br/>background repair" .-> N2
+        N2 <-. " " .-> N3
+        N3 <-. " " .-> N4
+    end
+
+    PRF -- "exact-match lookups<br/>on pseudorandom keys" --> NET
+    NET -- "ciphertext blobs" --> DEC
+
+    style OWNER fill:#0d2137,stroke:#5cc8ff,color:#d7dce4
+    style NET fill:#1a1408,stroke:#e0b060,color:#d7dce4
+```
+
+The nodes never hold a key, never see plaintext, never evaluate a comparison,
+never learn an ordering. Everything on the right side of that boundary is
+opaque `key → blob` storage plus gossip — which is why nodes can be run by
+anyone.
 
 Server-side `ORDER BY` fundamentally requires the server to see order — and
 order leakage is what broke Order-Preserving Encryption (see the attack
