@@ -125,7 +125,8 @@ class TestClientApp(unittest.TestCase):
 
         got = self.post("/api/query", {"predicates": [
             {"field": "amount", "lo": "1000", "hi": "2000"}]})
-        self.assertEqual(got["total"], 2)               # 1879.26, 1864.17
+        self.assertEqual(got["count"], 2)               # 1879.26, 1864.17
+        self.assertFalse(got["more"])
         amounts = sorted(r["amount"] for r in got["rows"])
         self.assertEqual(amounts, ["1,864.17", "1,879.26"])
         self.assertEqual(got["rows"][0]["status"] in
@@ -135,10 +136,10 @@ class TestClientApp(unittest.TestCase):
         got = self.post("/api/query", {"predicates": [
             {"field": "amount", "lo": "800", "hi": "2500"},
             {"field": "date", "lo": "2024-01-01", "hi": "2024-12-31"}]})
-        self.assertEqual(got["total"], 3)
+        self.assertEqual(got["count"], 3)
         pref = self.post("/api/query", {"predicates": [
             {"field": "customer", "prefix": "ac"}]})
-        self.assertEqual(pref["total"], 1)
+        self.assertEqual(pref["count"], 1)
 
     def test_03_insert_and_delete(self):
         self.post("/api/insert", {"record": {
@@ -146,11 +147,11 @@ class TestClientApp(unittest.TestCase):
             "date": "2024-05-05", "note": "added by hand"}})
         got = self.post("/api/query", {"predicates": [
             {"field": "customer", "prefix": "ze"}]})
-        self.assertEqual(got["total"], 1)
+        self.assertEqual(got["count"], 1)
         self.assertEqual(got["rows"][0]["note"], "added by hand")
         self.post("/api/delete", {"rids": [got["rows"][0]["_rid"]]})
         self.assertEqual(self.post("/api/query", {"predicates": [
-            {"field": "customer", "prefix": "ze"}]})["total"], 0)
+            {"field": "customer", "prefix": "ze"}]})["count"], 0)
 
     def test_04_invite_adds_a_device(self):
         invite = self.post("/api/invite", {})["invite"]
@@ -160,7 +161,22 @@ class TestClientApp(unittest.TestCase):
         self.assertTrue(state["open"])
         got = self.post("/api/query", {"predicates": [
             {"field": "amount", "lo": "1000", "hi": "2000"}]})
-        self.assertEqual(got["total"], 2)     # sees the first device's rows
+        self.assertEqual(got["count"], 2)     # sees the first device's rows
+
+    def test_04b_paging_and_sorting(self):
+        page = self.post("/api/query", {"predicates": [
+            {"field": "amount", "lo": "0", "hi": "9000"}], "limit": 2,
+            "order": "amount"})
+        self.assertEqual(page["count"], 2)
+        self.assertTrue(page["more"])
+        # display values are formatted ("1,864.17"), so compare numerically
+        first = [float(r["amount"].replace(",", "")) for r in page["rows"]]
+        self.assertEqual(first, sorted(first))
+        nxt = self.post("/api/query", {"predicates": [
+            {"field": "amount", "lo": "0", "hi": "9000"}], "limit": 2,
+            "order": "amount", "after": page["cursor"]})
+        self.assertEqual(nxt["count"], 2)
+        self.assertNotEqual(nxt["rows"][0]["_rid"], page["rows"][0]["_rid"])
 
     def test_05_errors_are_reported_not_crashed(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:

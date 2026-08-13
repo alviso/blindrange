@@ -327,7 +327,7 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Thirty-four tests. Ten cover the schema helpers and the client app (CSV inference,
+Thirty-five tests. Ten cover the schema helpers and the client app (CSV inference,
 value round-trips, the guarantee that any precision a user picks is a legal
 leaf width, and the browser API end to end against real nodes). Twenty-four are end-to-end against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
