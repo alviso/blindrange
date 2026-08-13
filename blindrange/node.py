@@ -349,13 +349,19 @@ def service_post(store, peers, hub, secret, path, data):
         return 200, {"peers": peers.snapshot()}
     if path == "/dialback":
         target = data.get("addr", "")
+        asker = data.get("node_id", "")
         if is_via(target):
             return 400, {"error": "dialback is for direct addresses"}
+        # reachable only if the node that ANSWERS at the address is the node
+        # that ASKED — otherwise the probe hit someone else (classic case: a
+        # loopback advertise makes the prober dial its own node) and the
+        # address is useless as an advertise for the asker
         try:
             req = urllib.request.Request(f"http://{target}/stats")
             with urllib.request.urlopen(req, timeout=2) as r:
-                ok = r.status == 200
-        except OSError:
+                answered = json.loads(r.read()).get("node_id", "")
+            ok = bool(asker) and answered == asker
+        except (OSError, ValueError):
             ok = False
         return 200, {"reachable": ok}
     if path == "/relay/poll":
@@ -460,7 +466,8 @@ def _reachability_loop(store, peers, hub, secret, direct_addr):
             probe = random.choice(list(candidates.values()))
             try:
                 got = post_any(probe["addr"], "/dialback",
-                               json.dumps({"addr": direct_addr}).encode(),
+                               json.dumps({"addr": direct_addr,
+                                           "node_id": ident.node_id}).encode(),
                                secret)
                 reachable = got.get("reachable", False)
             except OSError:
