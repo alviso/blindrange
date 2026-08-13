@@ -97,6 +97,29 @@ Three design decisions do the heavy lifting:
    index via a 5-bit/char prefix encoding so alphanumeric ranges and `LIKE
    'x%'` are integer ranges.
 
+## The client — start here
+
+```bash
+pip install -e .
+blindrange ui
+```
+
+A local client opens in your browser. **Drop a CSV** and it reads the file on
+your machine, proposes a schema, and shows in plain language what each field
+would reveal — "amounts are indistinguishable within $20.48 buckets, and
+never finer, however long anyone watches" — with a dial to change it. Confirm
+and the rows are encrypted and stored across the network. Then query by
+range, date, and prefix, add rows, delete them, and share the database with
+another device by invite.
+
+Keys live in that local process — never in the browser, never on a server.
+The page is served over plain HTTP from `127.0.0.1`, which is also why it can
+talk to plain-HTTP nodes at all: a hosted HTTPS app could not.
+
+Prefer the terminal? `blindrange init` walks through the same schema
+questions and `blindrange info FILE` prints what an existing database
+reveals.
+
 ## The public network
 
 There is a live demo network. Join it — as a node or a client — via the
@@ -289,7 +312,10 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Twenty end-to-end tests against real gossip networks: membership
+Thirty tests. Ten cover the schema helpers and the client app (CSV inference,
+value round-trips, the guarantee that any precision a user picks is a legal
+leaf width, and the browser API end to end against real nodes). Twenty are
+end-to-end against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with

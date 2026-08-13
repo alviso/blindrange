@@ -22,7 +22,11 @@ classifiers = [
 ]
 
 [project.scripts]
+blindrange = "blindrange.cli:main"
 blindrange-node = "blindrange.node:main"
 
 [tool.setuptools]
 packages = ["blindrange"]
+
+[tool.setuptools.package-data]
+blindrange = ["*.html"]

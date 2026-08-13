@@ -1,0 +1,19 @@
+Order,Customer,Amount,Date,Status
+SO-2024-1001,acme corp,1879.26,2024-03-09,paid
+SO-2024-1008,tidal ab,865.13,2024-09-10,refunded
+SO-2024-1013,harbor plc,2043.31,2024-06-17,shipped
+SO-2024-1030,scout oy,1206.37,2024-03-01,paid
+SO-2024-1033,sable zrt,1297.12,2026-05-04,shipped
+SO-2024-1060,cedar gmbh,1215.10,2026-07-26,shipped
+SO-2024-1064,salt bt,1864.17,2025-12-24,pending
+SO-2024-1081,birch & co,1818.77,2025-10-29,refunded
+SO-2024-1093,delta ag,739.34,2024-11-02,pending
+SO-2024-1106,iris kft,914.88,2024-06-09,paid
+SO-2024-1107,acme corp,2440.10,2025-07-20,paid
+SO-2024-1147,apex ltd,1618.43,2025-01-01,pending
+SO-2024-1151,acme corp,1249.98,2024-07-14,shipped
+SO-2024-1162,apex ltd,1933.48,2025-09-11,shipped
+SO-2024-1198,umbra sarl,2351.78,2026-07-28,pending
+SO-2024-1201,sable zrt,1022.94,2024-07-08,paid
+SO-2025-1005,harbor plc,2043.31,2024-06-17,shipped
+SO-2025-1012,scout oy,1706.56,2024-08-26,shipped

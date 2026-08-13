@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --gold:#e0b060; --ok:#7fd18c;
+          --bad:#e07a7a; }
+  * { box-sizing:border-box; margin:0 }
+  html,body { height:100% }
+  body { background:var(--bg); color:var(--txt); font:14px/1.6 ui-monospace,
+         SFMono-Regular,Menlo,monospace; display:flex; flex-direction:column;
+         padding:18px; overflow:hidden }
+  h1 { font-size:19px } h1 span { color:var(--acc) }
+  .sub { color:var(--dim); font-size:12.5px; margin-bottom:14px }
+  #app { flex:1; display:flex; flex-direction:column; min-height:0 }
+  .grid { display:grid; grid-template-columns:1.6fr 1fr; gap:14px; flex:1;
+          min-height:0 }
+  .col { display:flex; flex-direction:column; gap:14px; min-height:0 }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:10px; padding:14px; min-height:0 }
+  .panel.grow { flex:1; display:flex; flex-direction:column }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.09em;
+       color:var(--dim); margin-bottom:10px; font-weight:normal }
+  input,select,button,textarea { background:#0d0f13; color:var(--txt);
+       border:1px solid var(--line); border-radius:6px; padding:7px 9px;
+       font:inherit }
+  input,select { min-width:0 }
+  button { cursor:pointer } button:hover { border-color:var(--acc) }
+  button.pri { border-color:var(--acc); color:var(--acc) }
+  button.danger:hover { border-color:var(--bad); color:var(--bad) }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+         margin-bottom:9px }
+  table { width:100%; border-collapse:collapse; font-size:13px }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line);
+          white-space:nowrap }
+  th { color:var(--dim); font-weight:normal }
+  .scroll { flex:1; min-height:0; overflow:auto }
+  .dim { color:var(--dim) } .ok { color:var(--ok) } .gold { color:var(--gold) }
+  .stats { color:var(--dim); font-size:12px; margin-top:8px }
+  .stats b { color:var(--acc); font-weight:normal }
+  .node { display:flex; justify-content:space-between; padding:4px 6px;
+          border-bottom:1px solid var(--line); font-size:12.5px }
+  .center { max-width:760px; margin:6vh auto; overflow:auto }
+  .big { font-size:26px; margin-bottom:6px }
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:12px;
+           margin:18px 0 }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:16px; cursor:pointer }
+  .card:hover { border-color:var(--acc) }
+  .card h3 { font-size:15px; margin-bottom:6px; font-weight:normal }
+  .card p { color:var(--dim); font-size:12.5px }
+  .field { border:1px solid var(--line); border-radius:8px; padding:10px;
+           margin-bottom:8px }
+  .field .desc { color:var(--ok); font-size:12px; margin-top:6px }
+  textarea { width:100%; height:120px; resize:vertical }
+  .err { color:var(--bad); font-size:12.5px; margin:8px 0 }
+  .tabs { display:flex; gap:6px; margin-bottom:10px }
+  .tabs button.on { border-color:var(--acc); color:var(--acc) }
+  label.in { display:flex; flex-direction:column; gap:4px; font-size:12px;
+             color:var(--dim) }
+  .hide { display:none }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const el = (h) => { const d=document.createElement('div'); d.innerHTML=h.trim();
+                    return d.firstChild; };
+let ST = {open:false};
+let LAST = {rows:[], stats:{}};
+let DRAFT = null;          // {schema, csv, rows, skipped}
+
+async function api(path, body){
+  const r = await fetch(path, body===undefined ? {} :
+    {method:'POST', headers:{'Content-Type':'application/json'},
+     body:JSON.stringify(body)});
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d;
+}
+const esc = s => String(s==null?'':s).replace(/[<>&]/g,
+  c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+
+async function refresh(){ ST = await api('/api/state'); render(); }
+
+// ------------------------------------------------------------- welcome
+function welcome(err){
+  return `
+  <div class="center">
+    <h1 class="big">blind<span>range</span></h1>
+    <div class="sub">an encrypted database on machines that cannot read it —
+      your keys stay in this process, on this computer</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="cards">
+      <div class="card" onclick="view('csv')">
+        <h3>Start from a CSV →</h3>
+        <p>Drop a spreadsheet. We suggest a schema, show exactly what each
+           field would reveal, then import it encrypted.</p></div>
+      <div class="card" onclick="view('new')">
+        <h3>Design a schema →</h3>
+        <p>Choose fields and how precisely each should be queryable.</p></div>
+      <div class="card" onclick="view('open')">
+        <h3>Open a database →</h3>
+        <p>You have a .brdb file and its passphrase.</p></div>
+      <div class="card" onclick="view('invite')">
+        <h3>Join with an invite →</h3>
+        <p>Someone shared a database with you — add this device as a
+           writer.</p></div>
+    </div>
+    <div class="sub">Nothing here is uploaded to us. There is no us.</div>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- forms
+function netPicker(){
+  return `
+  <div class="row">
+    <label class="in">network
+      <select id="network">
+        <option value="public">public demo network (easiest)</option>
+        <option value="custom">my own network…</option>
+      </select></label>
+    <label class="in hide" id="customwrap">node address
+      <input id="netaddr" placeholder="127.0.0.1:7501"></label>
+    <label class="in hide" id="secretwrap">network secret
+      <input id="netsecret" placeholder="(optional)"></label>
+  </div>`;
+}
+function wireNet(){
+  const sel = $('#network');
+  if (!sel) return;
+  sel.onchange = () => {
+    const custom = sel.value === 'custom';
+    $('#customwrap').classList.toggle('hide', !custom);
+    $('#secretwrap').classList.toggle('hide', !custom);
+  };
+}
+const netValue = () => $('#network').value === 'custom'
+  ? {network: $('#netaddr').value.trim(), secret: $('#netsecret').value.trim()}
+  : {network: 'public'};
+
+function fileAndPass(fileDefault){
+  return `<div class="row">
+    <label class="in">database file
+      <input id="file" value="${fileDefault}" size="26"></label>
+    <label class="in">passphrase
+      <input id="pass" type="password" size="20"></label>
+  </div>`;
+}
+
+function viewOpen(err){
+  return `<div class="center">
+    <h1 class="big">Open a database</h1>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">
+      ${fileAndPass('my.brdb')}
+      <div class="row"><button class="pri" onclick="doOpen()">open</button>
+      <button onclick="view('welcome')">back</button></div>
+    </div></div>`;
+}
+async function doOpen(){
+  try { await api('/api/open', {file:$('#file').value.trim(),
+                                passphrase:$('#pass').value});
+        await refresh(); }
+  catch(e){ render(viewOpen(e.message)); }
+}
+
+function viewInvite(err){
+  return `<div class="center">
+    <h1 class="big">Join with an invite</h1>
+    <div class="sub">An invite carries the database's master key. Treat it
+      like a key: it grants full read and write access.</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">
+      <div class="row" style="display:block"><label class="in">invite string
+        <textarea id="invite" placeholder="paste the invite here"></textarea>
+      </label></div>
+      ${fileAndPass('shared.brdb')}
+      <div class="row"><button class="pri" onclick="doAccept()">join</button>
+      <button onclick="view('welcome')">back</button></div>
+    </div></div>`;
+}
+async function doAccept(){
+  try { await api('/api/accept', {invite:$('#invite').value.trim(),
+        file:$('#file').value.trim(), passphrase:$('#pass').value});
+        await refresh(); }
+  catch(e){ render(viewInvite(e.message)); }
+}
+
+// ------------------------------------------------------------ CSV flow
+function viewCsv(err){
+  return `<div class="center">
+    <h1 class="big">Start from a CSV</h1>
+    <div class="sub">Nothing leaves this computer. We read the file here,
+      suggest a schema, and tell you what each choice reveals.</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">
+      <div class="row"><input type="file" id="csvfile" accept=".csv,.tsv,.txt">
+      </div>
+      <div class="row" style="display:block"><label class="in">…or paste it
+        <textarea id="csvtext" placeholder="order,customer,amount,date
+SO-1001,acme corp,1879.26,2024-03-09"></textarea></label></div>
+      <div class="row"><button class="pri" onclick="doInfer()">suggest a
+        schema →</button><button onclick="view('welcome')">back</button></div>
+    </div></div>`;
+}
+function wireCsv(){
+  const f = $('#csvfile');
+  if (f) f.onchange = async () => {
+    const file = f.files[0]; if (!file) return;
+    $('#csvtext').value = await file.text();
+  };
+}
+async function doInfer(){
+  try {
+    const csv = $('#csvtext').value.trim();
+    if (!csv) throw new Error('choose or paste a CSV first');
+    const d = await api('/api/infer', {csv});
+    DRAFT = {...d, csv};
+    render(viewSchema());
+  } catch(e){ render(viewCsv(e.message)); }
+}
+
+const PRECISION = {
+  money:[[1,'exact to the cent'],[128,'about $1'],
+         [2048,'about $20'],[8192,'about $80']],
+  date:[[1,'exact day'],[8,'about a week'],[32,'about a month'],
+        [128,'about a quarter']],
+  number:[[1,'exact'],[8,'within 8'],[64,'within 64'],[512,'within 512']],
+  text:[[1,'exact prefix'],[16,'blur the last character'],
+        [1024,'blur the last two']]
+};
+
+function viewSchema(err){
+  const s = DRAFT.schema;
+  const fields = Object.entries(s).map(([n,sp])=>`
+    <div class="field">
+      <div class="row" style="margin:0">
+        <b>${esc(sp.label||n)}</b>
+        <span class="dim">→ ${esc(n)} · ${esc(sp.kind)}</span>
+        <select style="margin-left:auto" onchange="setPrec('${n}',this.value)">
+          ${(PRECISION[sp.kind]||PRECISION.number).map(([v,l])=>
+            `<option value="${v}" ${Number(sp.leaf_width)===v?'selected':''}>
+             ${l}</option>`).join('')}
+        </select>
+        <button class="danger" onclick="dropField('${n}')">don't index</button>
+      </div>
+      <div class="desc">${esc(sp.describe)}</div>
+    </div>`).join('');
+  return `<div class="center">
+    <h1 class="big">What should be queryable?</h1>
+    <div class="sub">${DRAFT.total} rows · indexed fields can be searched by
+      range or prefix. Everything else is still stored — inside the
+      ciphertext, where it leaks nothing at all.</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">${fields || '<div class="dim">no indexed fields</div>'}
+      ${DRAFT.skipped.length?`<div class="sub">stored but not indexed:
+        ${DRAFT.skipped.map(esc).join(', ')}</div>`:''}
+    </div>
+    <div class="panel" style="margin-top:12px">
+      ${netPicker()}
+      ${fileAndPass('my.brdb')}
+      <div class="row"><button class="pri" onclick="doCreateImport()">create
+        &amp; import encrypted →</button>
+        <button onclick="view('csv')">back</button></div>
+    </div></div>`;
+}
+async function setPrec(name, lw){
+  DRAFT.schema[name].leaf_width = Number(lw);
+  const d = await api('/api/infer', {csv: DRAFT.csv});   // re-describe
+  DRAFT.schema[name].describe = describeLocal(name, DRAFT.schema[name],
+                                              d.schema[name]);
+  render(viewSchema());
+}
+function describeLocal(n, sp, fresh){
+  // server describes from its own inference; adjust the phrase for the
+  // chosen precision without another round trip
+  const lw = Number(sp.leaf_width);
+  if (sp.kind==='money') return `${n}: amounts are indistinguishable within $${(lw/100).toFixed(2)} buckets — and never finer, however long anyone watches.`;
+  if (sp.kind==='date') return `${n}: dates are indistinguishable within ${lw}-day buckets — and never finer, however long anyone watches.`;
+  if (sp.kind==='text') return `${n}: prefix-searchable on the first ${sp.chars} characters${lw>1?', the tail blurred':' exactly'} — and never finer, however long anyone watches.`;
+  return `${n}: values are indistinguishable within buckets of ${lw} — and never finer, however long anyone watches.`;
+}
+function dropField(name){ delete DRAFT.schema[name];
+  DRAFT.skipped.push(name); render(viewSchema()); }
+
+async function doCreateImport(){
+  try {
+    const body = {file:$('#file').value.trim(), passphrase:$('#pass').value,
+                  schema:DRAFT.schema, ...netValue()};
+    if (!body.passphrase) throw new Error('choose a passphrase');
+    render(`<div class="center"><h1 class="big">encrypting…</h1>
+      <div class="sub">creating the database and importing your rows</div>
+      </div>`);
+    await api('/api/create', body);
+    const r = await api('/api/import', {csv: DRAFT.csv});
+    DRAFT = null;
+    await refresh();
+    toast(`imported ${r.imported} rows${r.skipped?`, ${r.skipped} skipped`:''}`);
+  } catch(e){ render(viewSchema(e.message)); }
+}
+
+// ------------------------------------------------------- manual schema
+function viewNew(err){
+  if (!DRAFT || !DRAFT.manual) DRAFT = {manual:true, schema:{}, skipped:[],
+                                        total:0, csv:''};
+  const rows = Object.entries(DRAFT.schema).map(([n,sp])=>`
+    <div class="field"><div class="row" style="margin:0">
+      <b>${esc(n)}</b><span class="dim">${esc(sp.kind)}</span>
+      <button class="danger" style="margin-left:auto"
+        onclick="dropField('${n}')">remove</button></div>
+      <div class="desc">${esc(sp.describe||'')}</div></div>`).join('');
+  return `<div class="center">
+    <h1 class="big">Design a schema</h1>
+    <div class="sub">Add the fields you want to query by.</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">${rows||'<div class="dim">no fields yet</div>'}
+      <div class="row" style="margin-top:10px">
+        <input id="fname" placeholder="field name" size="14">
+        <select id="fkind">
+          <option value="money">money</option><option value="date">date</option>
+          <option value="number">number</option><option value="text">text</option>
+        </select>
+        <select id="fprec"></select>
+        <input id="ftop" placeholder="largest value" size="12">
+        <button onclick="addField()">add field</button>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      ${netPicker()}${fileAndPass('my.brdb')}
+      <div class="row"><button class="pri" onclick="doCreateEmpty()">create
+        database →</button><button onclick="view('welcome')">back</button>
+      </div></div></div>`;
+}
+function wireNew(){
+  const k = $('#fkind'); if (!k) return;
+  const fill = () => { $('#fprec').innerHTML =
+    PRECISION[k.value].map(([v,l])=>`<option value="${v}">${l}</option>`)
+    .join(''); $('#ftop').classList.toggle('hide', k.value==='date'); };
+  k.onchange = fill; fill();
+}
+function addField(){
+  const n = $('#fname').value.trim().toLowerCase().replace(/\s+/g,'_');
+  if (!n) return;
+  const kind = $('#fkind').value, lw = Number($('#fprec').value);
+  const top = Number($('#ftop').value || (kind==='money'?10000:1000000));
+  let sp;
+  if (kind==='money') sp={type:'int', bits:Math.ceil(Math.log2(top*100+1)),
+      leaf_width:lw, kind:'money', scale:100, label:n};
+  else if (kind==='date') sp={type:'int', bits:12, leaf_width:lw, kind:'date',
+      scale:1, epoch:'2024-01-01', label:n};
+  else if (kind==='text') sp={type:'str', bits:20, chars:4, leaf_width:lw,
+      kind:'text', label:n};
+  else sp={type:'int', bits:Math.ceil(Math.log2(top+1)), leaf_width:lw,
+      kind:'number', scale:1, label:n};
+  sp.describe = describeLocal(n, sp);
+  DRAFT.schema[n] = sp; render(viewNew());
+}
+async function doCreateEmpty(){
+  try {
+    if (!Object.keys(DRAFT.schema).length) throw new Error('add a field first');
+    await api('/api/create', {file:$('#file').value.trim(),
+      passphrase:$('#pass').value, schema:DRAFT.schema, ...netValue()});
+    DRAFT = null; await refresh();
+  } catch(e){ render(viewNew(e.message)); }
+}
+
+// ------------------------------------------------------------ workspace
+function workspace(){
+  const fields = Object.entries(ST.schema);
+  const conds = fields.map(([n,sp],i)=>`
+    <div class="row">
+      <label style="width:150px"><input type="checkbox" id="use_${n}"
+        ${i===0?'checked':''}> ${esc(sp.label||n)}</label>
+      ${sp.kind==='text'
+        ? `<input id="pfx_${n}" placeholder="starts with…" size="14">`
+        : `<input id="lo_${n}" placeholder="from" size="12">
+           <span class="dim">—</span>
+           <input id="hi_${n}" placeholder="to" size="12">`}
+      <span class="dim" style="font-size:11.5px">${esc(sp.kind)}</span>
+    </div>`).join('');
+  const nodes = (ST.nodes||[]).map(n=>`<div class="node">
+      <span>${esc(n.addr).slice(0,40)}</span>
+      <span class="dim">${n.keys==null?'—':n.keys+' keys'} · ${esc(n.mode)}</span>
+    </div>`).join('') || '<div class="dim">no nodes reachable</div>';
+  return `
+  <h1>blind<span>range</span> <span class="dim"
+      style="font-size:13px">${esc(ST.file)}</span></h1>
+  <div class="sub">keys held here, in this process · data unreadable to every
+    node storing it</div>
+  <div class="grid">
+    <div class="col">
+      <div class="panel grow">
+        <h2>Query — conditions combine with AND</h2>
+        ${conds}
+        <div class="row"><button class="pri" onclick="runQuery()">run</button>
+          <button onclick="view('add')">add a row</button>
+          <button onclick="view('csvmore')">import CSV</button>
+          <span id="qstats" class="stats"></span></div>
+        <div class="scroll"><table id="results"></table></div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="panel">
+        <h2>Network</h2>${nodes}
+        <div class="row" style="margin-top:10px">
+          <button onclick="maintain('compact')">compact</button>
+          <button onclick="maintain('repair')">repair</button>
+          <button onclick="showInvite()">share / add device</button>
+        </div>
+      </div>
+      <div class="panel grow">
+        <h2>What this database reveals</h2>
+        <div class="scroll" style="font-size:12.5px">
+          ${fields.map(([n,sp])=>`<div style="margin-bottom:8px" class="ok">
+             ${esc(sp.describe)}</div>`).join('')}
+          <div class="dim">Fields you store but don't index leak nothing at
+            all. Equality between indexed values is always visible to a node,
+            and a persistent watcher of your queries can narrow values to the
+            precision above — never finer.
+            <a href="https://blindrange.dev" style="color:var(--acc)"
+               target="_blank">full threat model</a></div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+async function runQuery(){
+  const preds = [];
+  for (const [n,sp] of Object.entries(ST.schema)){
+    if (!$('#use_'+n)?.checked) continue;
+    if (sp.kind==='text'){
+      const p = $('#pfx_'+n).value.trim(); if (p) preds.push({field:n, prefix:p});
+    } else {
+      const lo=$('#lo_'+n).value.trim(), hi=$('#hi_'+n).value.trim();
+      if (lo!=='' && hi!=='') preds.push({field:n, lo, hi});
+    }
+  }
+  $('#qstats').textContent = 'querying…';
+  try {
+    const d = await api('/api/query', {predicates:preds});
+    LAST = d;
+    const cols = [...new Set(d.rows.flatMap(r=>Object.keys(r)))]
+                 .filter(c=>c!=='_rid');
+    $('#results').innerHTML = `<thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`)
+      .join('')}<th></th></tr></thead><tbody>${
+      d.rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join('')}
+        <td><button class="danger" onclick="del('${r._rid}')">delete</button>
+        </td></tr>`).join('')}</tbody>`;
+    const s = d.stats||{};
+    $('#qstats').innerHTML = `<b>${d.total}</b> rows · <b>${s.index_keys||0}</b>
+      opaque lookups · <b>${s.rounds||0}</b> network rounds`;
+  } catch(e){ $('#qstats').textContent = e.message; }
+}
+async function del(rid){
+  try { await api('/api/delete', {rids:[rid]}); runQuery(); }
+  catch(e){ toast(e.message); }
+}
+async function maintain(what){
+  toast(what+'…');
+  try { const r = await api('/api/maintain', {what});
+        toast(what+': '+JSON.stringify(r)); await refresh(); }
+  catch(e){ toast(e.message); }
+}
+async function showInvite(){
+  try { const d = await api('/api/invite', {});
+    render(`<div class="center"><h1 class="big">Share this database</h1>
+      <div class="sub">This invite contains the master key. Anyone holding it
+        can read and write everything. Send it over a channel you trust, then
+        delete it.</div>
+      <div class="panel"><textarea readonly style="height:150px">${
+        esc(d.invite)}</textarea>
+      <div class="row"><button onclick="copyInvite(this)">copy</button>
+      <button class="pri" onclick="refresh()">done</button></div></div></div>`);
+  } catch(e){ toast(e.message); }
+}
+function copyInvite(btn){
+  navigator.clipboard.writeText($('textarea').value);
+  btn.textContent = 'copied';
+}
+
+function viewAdd(err){
+  const inputs = Object.entries(ST.schema).map(([n,sp])=>`
+    <label class="in">${esc(sp.label||n)} <span class="dim">${esc(sp.kind)}
+      </span><input id="v_${n}" size="24"></label>`).join('');
+  return `<div class="center"><h1 class="big">Add a row</h1>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel"><div class="row">${inputs}</div>
+    <div class="row"><label class="in">extra field name
+      <input id="xk" size="14"></label>
+      <label class="in">value <input id="xv" size="18"></label>
+      <span class="dim">optional — stored, never indexed</span></div>
+    <div class="row"><button class="pri" onclick="doInsert()">store
+      encrypted</button><button onclick="refresh()">back</button></div>
+    </div></div>`;
+}
+async function doInsert(){
+  try {
+    const rec = {};
+    for (const n of Object.keys(ST.schema)){
+      const v = $('#v_'+n).value.trim();
+      if (v!=='') rec[n] = v;
+    }
+    const xk = $('#xk').value.trim();
+    if (xk) rec[xk] = $('#xv').value;
+    if (!Object.keys(rec).length) throw new Error('nothing to store');
+    await api('/api/insert', {record:rec});
+    await refresh(); toast('stored');
+  } catch(e){ render(viewAdd(e.message)); }
+}
+
+function viewCsvMore(err){
+  return `<div class="center"><h1 class="big">Import more rows</h1>
+    <div class="sub">Columns are matched to this database's fields by name.</div>
+    ${err?`<div class="err">${esc(err)}</div>`:''}
+    <div class="panel">
+      <div class="row"><input type="file" id="csvfile" accept=".csv,.tsv,.txt">
+      </div>
+      <div class="row" style="display:block"><label class="in">…or paste
+        <textarea id="csvtext"></textarea></label></div>
+      <div class="row"><button class="pri" onclick="doImportMore()">import
+        </button><button onclick="refresh()">back</button></div>
+    </div></div>`;
+}
+async function doImportMore(){
+  try {
+    const csv = $('#csvtext').value.trim();
+    if (!csv) throw new Error('choose or paste a CSV');
+    const r = await api('/api/import', {csv});
+    await refresh(); toast(`imported ${r.imported} rows`);
+  } catch(e){ render(viewCsvMore(e.message)); }
+}
+
+// ----------------------------------------------------------------- shell
+let VIEW = null;
+function view(v){ VIEW = v; render(); }
+function toast(msg){
+  const t = el(`<div style="position:fixed;bottom:18px;left:50%;
+    transform:translateX(-50%);background:var(--panel);border:1px solid
+    var(--acc);border-radius:8px;padding:8px 14px;font-size:13px">${esc(msg)}
+    </div>`);
+  document.body.appendChild(t); setTimeout(()=>t.remove(), 3200);
+}
+function render(html){
+  if (html){ $('#app').innerHTML = html; wireNet(); wireCsv(); wireNew();
+             return; }
+  if (!ST.open){
+    const v = {open:viewOpen, csv:viewCsv, new:viewNew, invite:viewInvite}[VIEW];
+    $('#app').innerHTML = v ? v() : welcome();
+  } else if (VIEW==='add'){ $('#app').innerHTML = viewAdd();
+  } else if (VIEW==='csvmore'){ $('#app').innerHTML = viewCsvMore();
+  } else { VIEW = null; $('#app').innerHTML = workspace(); }
+  wireNet(); wireCsv(); wireNew();
+}
+refresh();
+</script>
+</body>
+</html>

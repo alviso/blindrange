@@ -18,6 +18,8 @@ jobs:
       - run: pip install cryptography aioquic
       - name: End-to-end suite (real 6-node gossip network)
         run: python -m unittest tests.test_e2e -v
+      - name: Client app and schema helpers
+        run: python -m unittest tests.test_client_app -v
       - name: Prototype sanity (base scheme + structural privacy budget)
         run: |
           cd prototype
