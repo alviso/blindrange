@@ -278,6 +278,10 @@ owner.compact()                          # epoch rewrite: merges all writers'
                                          # chains, drops tombstoned entries
                                          # (real forgetting); SAFE under
                                          # concurrent writes (open/drain/seal)
+owner.count("amount", 25000, 50000)      # exact, no records fetched at all
+owner.histogram("amount", 0, 10 ** 6, buckets=20)
+owner.approx_sum("amount", 0, 10 ** 6)   # (estimate, error_bound, count)
+
 owner.repair()                           # full owner-driven anti-entropy pass
                                          # (nodes also heal continuously
                                          # among themselves)
@@ -327,7 +331,7 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Thirty-five tests. Ten cover the schema helpers and the client app (CSV inference,
+Thirty-eight tests. Ten cover the schema helpers and the client app (CSV inference,
 value round-trips, the guarantee that any precision a user picks is a legal
 leaf width, and the browser API end to end against real nodes). Twenty-four are end-to-end against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,

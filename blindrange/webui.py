@@ -179,6 +179,24 @@ def api_query(body):
             "more": more, "cursor": cursor, "stats": owner.last_stats}
 
 
+def api_aggregate(body):
+    """Count and summarise a range without fetching or decrypting a row."""
+    owner = need_owner()
+    p = body["predicate"]
+    field = p["field"]
+    spec = owner.schema[field]
+    lo, hi = S.to_stored(spec, p["lo"]), S.to_stored(spec, p["hi"])
+    bars = owner.histogram(field, lo, hi, buckets=int(body.get("buckets", 20)))
+    est, err, n = owner.approx_sum(field, lo, hi)
+    scale = spec.get("scale", 1)
+    return {"field": field, "kind": spec.get("kind", "number"), "count": n,
+            "deleted_pending": owner.count_deleted(),
+            "sum": est / scale, "sum_error": err / scale,
+            "bars": [{"lo": S.to_display(spec, b["lo"]),
+                      "hi": S.to_display(spec, b["hi"]),
+                      "count": b["count"]} for b in bars]}
+
+
 def api_delete(body):
     owner = need_owner()
     n = owner.delete_many(body["rids"])
@@ -208,7 +226,7 @@ def api_maintain(body):
 ROUTES = {"/api/open": api_open, "/api/create": api_create,
           "/api/infer": api_infer, "/api/import": api_import,
           "/api/insert": api_insert, "/api/query": api_query,
-          "/api/delete": api_delete, "/api/invite": api_invite,
+          "/api/delete": api_delete, "/api/aggregate": api_aggregate, "/api/invite": api_invite,
           "/api/accept": api_accept, "/api/maintain": api_maintain}
 
 

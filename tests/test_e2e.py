@@ -314,6 +314,26 @@ class TestE2E(unittest.TestCase):
                          sorted(r["row"] for r in want))
         self.assertEqual(self.owner.last_stats["driver"], "day")
 
+    def test_12f_count_and_histogram_fetch_no_records(self):
+        lo, hi = 100_000, 600_000
+        want = [r for r in self.rows if lo <= r["amount"] <= hi]
+        self.assertEqual(self.owner.count("amount", lo, hi), len(want))
+        self.assertEqual(self.owner.last_stats["records_fetched"], 0)
+        self.assertEqual(self.owner.last_stats["decrypted"], 0)
+
+        bars = self.owner.histogram("amount", lo, hi, buckets=8)
+        self.assertLessEqual(len(bars), 8)
+        self.assertEqual(sum(b["count"] for b in bars), len(want))
+        self.assertEqual(self.owner.last_stats["records_fetched"], 0)
+
+    def test_12g_approx_sum_stays_inside_its_error_bound(self):
+        lo, hi = 100_000, 600_000
+        rows = [r["amount"] for r in self.rows if lo <= r["amount"] <= hi]
+        est, err, n = self.owner.approx_sum("amount", lo, hi)
+        self.assertEqual(n, len(rows))
+        self.assertLessEqual(abs(est - sum(rows)), err,
+                             "estimate escaped the leaf_width error bound")
+
     def test_13_unauthenticated_requests_rejected(self):
         import json as _json
         req = urllib.request.Request(

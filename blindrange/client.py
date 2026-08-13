@@ -50,6 +50,7 @@ delete_many() takes.
 import hashlib
 import hmac
 import json
+import math
 import os
 from .transport import POOL
 from . import direct as direct_mod
@@ -686,6 +687,95 @@ class Owner:
 
     def query_prefix(self, field, prefix):
         return self.query_multi([{"field": field, "prefix": prefix}])
+    # -------------------------------------------------------- aggregates
+    # A leaf label IS a value bucket and a chain's length is how many entries
+    # sit in it, so counts and histograms come from index metadata alone —
+    # no ciphertext fetched, nothing decrypted. Exact sums are impossible
+    # (nodes cannot compute on ciphertext); the approximation's error is
+    # bounded by leaf_width, which is the privacy budget you already chose.
+
+    def _chain_lengths(self, field, intervals, writers):
+        """{(level, idx): entries} for the given index intervals."""
+        gallop, k_ws = {}, {}
+        for lvl, idx in intervals:
+            w = f"{field}|{lvl}|{idx}"
+            k_ws[w] = self._k_w(w)
+            for ep in self._epochs():
+                for u in writers:
+                    gallop[(ep, lvl, idx, u)] = (
+                        (lambda i, e=ep, k=k_ws[w], u=u: self._ut(k, e, u, i)),
+                        0)
+        ends = self._discover_ends(gallop) if gallop else {}
+        out = {}
+        for (_ep, lvl, idx, _u), c in ends.items():
+            out[(lvl, idx)] = out.get((lvl, idx), 0) + c
+        return out
+
+    def count(self, field, lo, hi):
+        """How many records match, without fetching or decrypting any.
+
+        Costs one batched probe over the range's minimal cover (~2·log2 of
+        the domain), so it is cheap however large the answer is.
+
+        Caveats worth knowing: entries deleted since the last compact() are
+        still counted (subtract count_deleted() if that matters), a range
+        that does not fall on leaf boundaries counts whole edge leaves — the
+        same resolution limit that protects the data — and while a
+        compaction is in flight both epochs are read, which can double-count.
+        """
+        spec = self._st["schema"][field]
+        mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+        a, b = self._encode(field, lo), self._encode(field, hi)
+        self._refresh_epoch()
+        writers = self._refresh_writers()
+        cover = dyadic_cover(a, b, spec["bits"], mlvl)
+        total = sum(self._chain_lengths(field, cover, writers).values())
+        self.last_stats = {"cover": len(cover), "records_fetched": 0,
+                           "decrypted": 0}
+        return total
+
+    def count_deleted(self):
+        """Tombstones not yet reclaimed by compact() — the error bar on
+        count() and histogram()."""
+        return len(self._refresh_tombs(self._refresh_writers()))
+
+    def histogram(self, field, lo, hi, buckets=None):
+        """Distribution over [lo, hi] at leaf granularity, from metadata
+        alone. Returns [{"lo", "hi", "count"}] in stored units, ascending.
+        `buckets` merges adjacent leaves into at most that many bars."""
+        spec = self._st["schema"][field]
+        mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+        w = spec.get("leaf_width", 1)
+        a, b = self._encode(field, lo), self._encode(field, hi)
+        self._refresh_epoch()
+        writers = self._refresh_writers()
+        leaves = [(mlvl, idx) for idx in range(a // w, b // w + 1)]
+        lengths = self._chain_lengths(field, leaves, writers)
+        bars = [{"lo": idx * w, "hi": idx * w + w - 1,
+                 "count": lengths.get((mlvl, idx), 0)}
+                for _lvl, idx in leaves]
+        if buckets and len(bars) > buckets:
+            step = math.ceil(len(bars) / buckets)
+            bars = [{"lo": grp[0]["lo"], "hi": grp[-1]["hi"],
+                     "count": sum(g["count"] for g in grp)}
+                    for grp in (bars[i:i + step]
+                                for i in range(0, len(bars), step))]
+        self.last_stats = {"buckets": len(bars), "records_fetched": 0,
+                           "decrypted": 0}
+        return bars
+
+    def approx_sum(self, field, lo, hi):
+        """Estimate the sum over a range without reading any record.
+
+        Each bucket contributes count × midpoint, so the per-record error is
+        at most leaf_width/2 — the resolution you traded away for privacy is
+        exactly the error bar. Returns (estimate, worst_case_error, count).
+        """
+        bars = self.histogram(field, lo, hi)
+        n = sum(bar["count"] for bar in bars)
+        est = sum(bar["count"] * ((bar["lo"] + bar["hi"]) / 2) for bar in bars)
+        half = (self._st["schema"][field].get("leaf_width", 1)) / 2
+        return est, n * half, n
 
     # --------------------------------------------------------- streaming
     def _units(self, field, a, b, ordered):

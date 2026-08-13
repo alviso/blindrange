@@ -406,6 +406,7 @@ function workspace(){
                  .map(([n,sp])=>`<option value="${n}">${esc(sp.label||n)}</option>`)
                  .join('')}
             </select></label>
+          <button onclick="runCount()">count only</button>
           <button onclick="view('add')">add a row</button>
           <button onclick="view('csvmore')">import CSV</button>
           <span id="qstats" class="stats"></span></div>
@@ -475,6 +476,37 @@ async function runQuery(append){
       batches${s.ordered?' · sorted client-side':''}`;
   } catch(e){ $('#qstats').textContent = e.message; }
 }
+async function runCount(){
+  const pred = Object.entries(ST.schema).map(([n,sp])=>{
+    if (!$('#use_'+n)?.checked || sp.kind==='text') return null;
+    const lo=$('#lo_'+n).value.trim(), hi=$('#hi_'+n).value.trim();
+    return (lo!==''&&hi!=='') ? {field:n, lo, hi} : null;
+  }).find(Boolean);
+  if (!pred){ $('#qstats').textContent =
+    'tick a number or date field with a range to count'; return; }
+  $('#qstats').textContent = 'counting from index metadata…';
+  try {
+    const d = await api('/api/aggregate', {predicate:pred});
+    const max = Math.max(1, ...d.bars.map(b=>b.count));
+    const money = d.kind==='money';
+    const fmt = v => money ? '$'+Number(v).toLocaleString(undefined,
+                    {minimumFractionDigits:2, maximumFractionDigits:2})
+                  : v;
+    $('#results').innerHTML = `<thead><tr><th>${esc(d.field)} bucket</th>
+      <th>rows</th><th style="width:60%"></th></tr></thead><tbody>${
+      d.bars.map(b=>`<tr><td>${esc(b.lo)} – ${esc(b.hi)}</td>
+        <td>${b.count}</td><td><div style="height:9px;border-radius:3px;
+        background:var(--acc);opacity:.75;width:${(b.count/max*100).toFixed(1)}%
+        "></div></td></tr>`).join('')}</tbody>`;
+    $('#qstats').innerHTML = `<b>${d.count}</b> rows match ·
+      ${money||d.kind==='number'?`sum ≈ <b>${fmt(d.sum.toFixed(2))}</b>
+      ± ${fmt(d.sum_error.toFixed(2))} · `:''}
+      <b>0</b> records fetched, <b>0</b> decrypted${
+      d.deleted_pending?` · ${d.deleted_pending} deleted rows still counted
+      until compaction`:''}`;
+  } catch(e){ $('#qstats').textContent = e.message; }
+}
+
 async function del(rid){
   try { await api('/api/delete', {rids:[rid]}); runQuery(); }
   catch(e){ toast(e.message); }

@@ -178,6 +178,19 @@ class TestClientApp(unittest.TestCase):
         self.assertEqual(nxt["count"], 2)
         self.assertNotEqual(nxt["rows"][0]["_rid"], page["rows"][0]["_rid"])
 
+    def test_04c_aggregate_without_fetching_rows(self):
+        d = self.post("/api/aggregate", {"predicate": {
+            "field": "amount", "lo": "0", "hi": "9000"}})
+        self.assertEqual(d["kind"], "money")
+        self.assertGreater(d["sum"], 0)
+        self.assertEqual(sum(b["count"] for b in d["bars"]), d["count"])
+        # index metadata still counts rows deleted since the last compact —
+        # the documented caveat, and why the API reports it alongside
+        live = self.post("/api/query", {"predicates": [
+            {"field": "amount", "lo": "0", "hi": "9000"}]})["count"]
+        self.assertEqual(d["count"] - d["deleted_pending"], live)
+        self.assertEqual(d["deleted_pending"], 1)   # test_03 deleted one
+
     def test_05_errors_are_reported_not_crashed(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self.post("/api/open", {"file": "/nope/missing.brdb",
