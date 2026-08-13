@@ -109,6 +109,14 @@ unlinkable pseudorandom pairs.</p>
   <div class="card"><h3>Safe maintenance</h3><p>LSM-style compaction merges
   streams, drops deleted entries for real, and is safe under concurrent
   writes via an open/drain/seal epoch protocol.</p></div>
+  <div class="card"><h3>No port forwarding, ever</h3><p>A node that isn't
+  reachable diagnoses that itself and becomes a relay tenant of a peer.
+  Every reachable node is a relay, so the bridge for unconnectable nodes
+  is the network — not a special server.</p></div>
+  <div class="card"><h3>Direct paths when possible</h3><p>Tenants advertise
+  LAN and public candidates; clients punch a QUIC path straight to them,
+  falling back to the relay transparently. Measured on real home networks:
+  <b>1.7s → 0.7s</b> for the same query.</p></div>
 </div>
 
 <h2>Honesty as the design principle</h2>
@@ -135,13 +143,22 @@ design and prints the numbers:</p>
   with the trade-offs in front of you, not in a footnote.</td></tr>
 </table>
 
-<h2>Try it in five minutes</h2>
-<pre><span class="c"># three nodes, one machine (or three machines — see README)</span>
-pip install -e . && blindrange-node --port 7501 --data ~/.br/n1 --secret s
-blindrange-node --port 7502 --data ~/.br/n2 --seed 127.0.0.1:7501 --secret s
-blindrange-node --port 7503 --data ~/.br/n3 --seed 127.0.0.1:7501 --secret s
+<h2>Join the live network</h2>
+<p>There is a public demo network. Two commands make your machine a node —
+from behind any router, no configuration:</p>
+<pre>pip install -e .
+blindrange-node --port 7501 --data ~/.br/n1 \
+    --seed seed.blindrange.dev:7501 --secret blindrange-public</pre>
+<p class="dim">That "secret" is published deliberately: on an open demo
+network it only turns away drive-by scanners and carries no security role —
+confidentiality comes from keys that never leave your machine. It's a demo
+network with no durability promises; run your own for anything real.</p>
 
-<span class="c"># or the full sample app: encrypted orders, live network panel,</span>
+<pre><span class="c"># your own network: as many nodes as you like, anywhere</span>
+blindrange-node --port 7501 --data ~/.br/n1 --secret &lt;your-secret&gt;
+blindrange-node --port 7502 --data ~/.br/n2 --seed &lt;host&gt;:7501 --secret &lt;your-secret&gt;
+
+<span class="c"># or the sample app: encrypted orders, live network panel,</span>
 <span class="c"># kill-a-node buttons, and a window into what nodes actually see</span>
 python3 examples/webdemo/app.py     <span class="g"># → http://127.0.0.1:8600</span></pre>
 
