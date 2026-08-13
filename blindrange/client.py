@@ -51,7 +51,7 @@ import hashlib
 import hmac
 import json
 import os
-import urllib.request
+from .transport import POOL
 from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor
 
@@ -234,20 +234,23 @@ class Owner:
         body = json.dumps(payload).encode()
         if addr.startswith("via:"):                    # relay-tenant node
             return self._relay(addr, "POST", path, body)
-        req = urllib.request.Request(
-            f"http://{addr}{path}", data=body,
-            headers={"Content-Type": "application/json", **self._sign(body)})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
+        status, data = POOL.request(
+            addr, "POST", path, body,
+            {"Content-Type": "application/json", **self._sign(body)},
+            timeout=10)
+        if status >= 400:
+            raise ConnectionError(f"HTTP {status} from {addr}{path}")
+        return json.loads(data)
 
     def _get(self, addr, path):
         if addr.startswith("via:"):
             return self._relay(addr, "GET", path, b"")
         base = path.split("?")[0]
-        req = urllib.request.Request(f"http://{addr}{path}",
-                                     headers=self._sign(base.encode()))
-        with urllib.request.urlopen(req, timeout=3) as r:
-            return json.loads(r.read())
+        status, data = POOL.request(addr, "GET", path, None,
+                                    self._sign(base.encode()), timeout=5)
+        if status >= 400:
+            raise ConnectionError(f"HTTP {status} from {addr}{path}")
+        return json.loads(data)
 
     def _relay(self, via_addr, method, path, body):
         """Reach a NAT'd node through its relay: "via:relay-addr/node-id"."""
@@ -255,11 +258,13 @@ class Owner:
         env = {"to": nid, "id": os.urandom(8).hex(), "method": method,
                "path": path, "body_b64": b64encode(body).decode()}
         raw = json.dumps(env).encode()
-        req = urllib.request.Request(
-            f"http://{relay}/relay/send", data=raw,
-            headers={"Content-Type": "application/json", **self._sign(raw)})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            out = json.loads(r.read())
+        status, data = POOL.request(
+            relay, "POST", "/relay/send", raw,
+            {"Content-Type": "application/json", **self._sign(raw)},
+            timeout=30)
+        if status >= 400:
+            raise ConnectionError(f"HTTP {status} from relay {relay}")
+        out = json.loads(data)
         if out.get("status") != 200:
             raise ConnectionError(f"relayed request failed: {out}")
         return json.loads(b64decode(out["body_b64"]))

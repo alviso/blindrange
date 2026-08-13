@@ -44,11 +44,12 @@ import random
 import sqlite3
 import threading
 import time
-import urllib.request
 from base64 import b64decode, b64encode
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+from .transport import POOL
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -308,10 +309,11 @@ def _post_direct(addr, path, payload: bytes, secret: str, timeout=5):
     headers = {"Content-Type": "application/json"}
     if secret:
         headers["X-BR-Auth"] = _sign(secret, payload)
-    req = urllib.request.Request(f"http://{addr}{path}", data=payload,
-                                 headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    status, data = POOL.request(addr, "POST", path, payload, headers,
+                                timeout=timeout)
+    if status >= 400:
+        raise ConnectionError(f"HTTP {status} from {addr}{path}")
+    return json.loads(data)
 
 
 def post_any(addr, path, payload: bytes, secret: str, timeout=5):
@@ -357,9 +359,8 @@ def service_post(store, peers, hub, secret, path, data):
         # loopback advertise makes the prober dial its own node) and the
         # address is useless as an advertise for the asker
         try:
-            req = urllib.request.Request(f"http://{target}/stats")
-            with urllib.request.urlopen(req, timeout=2) as r:
-                answered = json.loads(r.read()).get("node_id", "")
+            status, raw = POOL.request(target, "GET", "/stats", timeout=2)
+            answered = json.loads(raw).get("node_id", "") if status == 200 else ""
             ok = bool(asker) and answered == asker
         except (OSError, ValueError):
             ok = False
@@ -521,6 +522,8 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
 
 def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = ""):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"      # keep-alive: reused connections
+
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()
             self.send_response(code)
