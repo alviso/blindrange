@@ -397,7 +397,7 @@ def service_post(store, peers, hub, secret, path, data, quic=None):
     return 404, {"error": "unknown"}
 
 
-def service_get(store, peers, path, query):
+def service_get(store, peers, path, query, quic=None):
     if path == "/peers":
         now = time.time()
         return 200, {"peers": {
@@ -409,7 +409,8 @@ def service_get(store, peers, path, query):
                      "keys": store.count(),
                      "read_batches": store.read_batches,
                      "peers": len(peers.live()),
-                     "mode": "tenant" if is_via(peers.addr) else "direct"}
+                     "mode": "tenant" if is_via(peers.addr) else "direct",
+                     "quic": quic is not None, "udp": peers.udp}
     if path == "/intel":
         n = int(parse_qs(query).get("limit", ["4"])[0])
         return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
@@ -530,7 +531,8 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
             for env in got.get("envelopes", []):
                 if env["method"] == "GET":
                     path, _, query = env["path"].partition("?")
-                    code, obj = service_get(store, peers, path, query)
+                    code, obj = service_get(store, peers, path, query,
+                                            quic=_tenant_loop.quic)
                 else:
                     data = json.loads(b64decode(env["body_b64"]) or b"{}")
                     code, obj = service_post(store, peers, hub, secret,
@@ -622,7 +624,8 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
                     url.path.encode()):
                 self._json({"error": "unauthorized"}, 401)
                 return
-            code, obj = service_get(store, peers, url.path, url.query)
+            code, obj = service_get(store, peers, url.path, url.query,
+                                    quic=quic)
             self._json(obj, code)
 
         def log_message(self, *a):
