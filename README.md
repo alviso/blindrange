@@ -95,7 +95,26 @@ Three design decisions do the heavy lifting:
    index via a 5-bit/char prefix encoding so alphanumeric ranges and `LIKE
    'x%'` are integer ranges.
 
-## Quickstart
+## The public network
+
+There is a live demo network. Join it — as a node or a client — via the
+always-on seed:
+
+```bash
+pip install -e .
+blindrange-node --port 7501 --data ~/.blindrange/n1 \
+    --seed seed.blindrange.dev:7501 --secret blindrange-public
+```
+
+No port forwarding needed: if your machine isn't reachable, it self-assembles
+as a relay tenant of the seed (watch `"mode"` in `/stats`). The network
+"secret" `blindrange-public` is published on purpose — on this open demo
+network it only filters drive-by scanners and has **no** security role;
+confidentiality comes from your keys, which never leave your machine. Demo
+network, no durability promises: run your own network (below) for anything
+you care about.
+
+## Quickstart (your own network)
 
 ```bash
 pip install -e .
