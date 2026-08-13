@@ -225,9 +225,13 @@ def main():
         print(f"spawned {a.nodes} local blind nodes (seed {first}, {live} live)")
 
     if Path(state_path).exists():
-        owner = Owner.open(state_path, a.passphrase, bootstrap=bootstrap)
-        print(f"opened existing owner state {state_path}")
-    else:
+        try:
+            owner = Owner.open(state_path, a.passphrase, bootstrap=bootstrap)
+            print(f"opened existing owner state {state_path}")
+        except ValueError:                       # pre-multi-writer state file
+            Path(state_path).unlink()
+            print("old-format state file removed; reseeding")
+    if not Path(state_path).exists():
         owner = Owner.create(state_path, a.passphrase, SCHEMA, bootstrap)
         orders = sample_orders(a.orders)
         t0 = time.time()

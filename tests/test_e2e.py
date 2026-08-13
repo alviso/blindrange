@@ -145,6 +145,46 @@ class TestE2E(unittest.TestCase):
         with self.assertRaises(InvalidTag):
             Owner.open(self.state, "wrong horse")
 
+    def test_08_multi_writer(self):
+        # onboard a second writer via invite; separate state, separate passphrase
+        ownerB = Owner.accept(f"{self.tmp}/ownerB.brdb", "second pass",
+                              self.owner.invite())
+        rngb = random.Random(77)
+        rows_b = [{"amount": rngb.randint(500, 900_000),
+                   "day": rngb.randint(0, 700),
+                   "name": "bay" + str(i), "row": 10_000 + i}
+                  for i in range(60)]
+        ownerB.insert_many(rows_b)
+        self.rows.extend(rows_b)
+
+        # A sees B's rows purely via registry + galloping (no state sharing)
+        self.assert_query("amount", 100_000, 300_000)
+        self.assertGreaterEqual(self.owner.last_stats["writers"], 2)
+        # and B sees A's rows
+        got = sorted(r["row"] for r in ownerB.query("day", 100, 200))
+        self.assertEqual(got, self._want(lambda r: 100 <= r["day"] <= 200))
+
+        # interleaved writes to the SAME value never collide (namespaced chains)
+        self.owner.insert({"amount": 777_777, "day": 42, "name": "dup a",
+                           "row": 20_001})
+        ownerB.insert({"amount": 777_777, "day": 42, "name": "dup b",
+                       "row": 20_002})
+        rows = sorted(r["row"] for r in
+                      self.owner.query("amount", 777_777, 777_777))
+        self.assertEqual(rows, [20_001, 20_002])
+        self.rows.extend([
+            {"amount": 777_777, "day": 42, "name": "dup a", "row": 20_001},
+            {"amount": 777_777, "day": 42, "name": "dup b", "row": 20_002}])
+
+    def test_09_cache_loss_is_recoverable(self):
+        # a brand-new writer with an empty cache reconstructs everything by
+        # probing the network — counters are a cache, not the database
+        fresh = Owner.accept(f"{self.tmp}/ownerC.brdb", "third pass",
+                             self.owner.invite())
+        got = sorted(r["row"] for r in fresh.query("amount", 100_000, 300_000))
+        self.assertEqual(got,
+                         self._want(lambda r: 100_000 <= r["amount"] <= 300_000))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

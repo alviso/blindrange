@@ -41,6 +41,19 @@ class Store:
             self.db.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)", entries)
             self.db.commit()
 
+    def put_nx(self, entries):
+        """Insert-if-absent; returns the keys that already existed (unchanged).
+        Lets clients do lock-free appends to shared chains (writer registry)."""
+        with self.lock:
+            existed = []
+            for k, v in entries:
+                if self.db.execute("SELECT 1 FROM kv WHERE k=?", (k,)).fetchone():
+                    existed.append(k)
+                else:
+                    self.db.execute("INSERT INTO kv VALUES (?,?)", (k, v))
+            self.db.commit()
+            return existed
+
     def mget(self, keys):
         with self.lock:
             self.read_batches += 1
@@ -127,8 +140,14 @@ def make_handler(store: Store, peers: Peers):
             path = urlparse(self.path).path
             data = self._body()
             if path == "/kv":
-                store.put([(k, v) for k, v in data["entries"]])
-                self._json({"stored": len(data["entries"])})
+                entries = [(k, v) for k, v in data["entries"]]
+                if data.get("nx"):
+                    existed = store.put_nx(entries)
+                    self._json({"stored": len(entries) - len(existed),
+                                "existed": existed})
+                else:
+                    store.put(entries)
+                    self._json({"stored": len(entries)})
             elif path == "/mget":
                 self._json({"values": store.mget(data["keys"])})
             elif path == "/gossip":

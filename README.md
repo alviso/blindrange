@@ -88,9 +88,27 @@ owner.query("amount", 25000, 50000)      # BETWEEN, decrypted only here
 owner.query_prefix("name", "ac")         # LIKE 'ac%'
 ```
 
-`my.brdb` is a passphrase-encrypted state file (master key + per-label
-counters). It **is** the database from the owner's perspective — losing it
-loses access. Reopen anywhere with `Owner.open("my.brdb", "passphrase")`.
+`my.brdb` is a passphrase-encrypted state file (master key + writer identity +
+counter caches). Reopen anywhere with `Owner.open("my.brdb", "passphrase")`.
+
+**Multiple writers, no coordination.** The index is per-(label, writer)
+append-only chains — a grow-only CRDT: writers never contend, views merge by
+union, offline writers just append when they reconnect. Onboard a second
+writer with an invite (a secret string — it contains the master key):
+
+```python
+invite = owner.invite()                       # transmit securely, then discard
+other  = Owner.accept("their.brdb", "their pass", invite)
+```
+
+There is no sync protocol to run: entry keys are deterministic, so readers
+discover other writers' chain lengths by **galloping probes** against the
+network itself (exponential-then-binary, batched), and writers announce
+themselves once in an encrypted on-network registry appended lock-free via
+insert-if-absent. Counters — even your own — are treated as a cache and a
+lower bound: a client with a stale or empty cache reconstructs everything by
+probing, so the state file is not a correctness-critical single point of
+failure. Only the master key is unrecoverable.
 
 ## The sample application
 
@@ -113,10 +131,11 @@ Use `--bootstrap host:port` to point the same app at a real network instead.
 python3 -m unittest tests.test_e2e -v
 ```
 
-Seven end-to-end tests against a real 6-node gossip network: membership
+Nine end-to-end tests against a real 6-node gossip network: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
-node join with read-repair, owner reopen from the encrypted state file, and
-wrong-passphrase rejection.
+node join with read-repair, owner reopen from the encrypted state file,
+wrong-passphrase rejection, two writers reading each other's data with
+interleaved same-value inserts, and full recovery from an empty counter cache.
 
 ## Threat model — measured, not asserted
 
@@ -161,12 +180,21 @@ reveals nothing at all.
 - A malicious (not just curious) node can drop or serve stale blobs — AES-GCM
   makes forgery detectable, but availability attacks are only mitigated by
   replication, not proven impossible.
-- One owner writes at a time (per-label counters are client state; concurrent
-  writers need coordination or per-writer label spaces — planned).
+- Multiple writers are supported (per-writer chains, no coordination), but one
+  writer *id* should have one live instance at a time: two devices sharing a
+  copied state file are safe sequentially (queries re-probe own chains), not
+  concurrently. Give each device its own invite instead.
+- Read fan-out grows with the number of writers that touched a label, and
+  every query spends a few galloping probes per (label, writer). Fine for a
+  handful of writers; stream compaction for many-writer databases is planned.
+- Under simultaneous first-time writer registrations, the registry append
+  retries via insert-if-absent; a pathological race combined with the loss of
+  a slot's primary replica could hide a writer id until re-registration —
+  writer onboarding is rare and owner-driven, but know the edge exists.
 - Hot labels concentrate entries; splitting oversized buckets across nodes is
   planned.
-- The owner state file is a single point of failure for *access* (not for the
-  network) — back it up like a key, because it is one.
+- Losing the master key loses the database; losing the rest of the state file
+  costs only a re-probe. Back the key up accordingly.
 
 ## The research trail (`prototype/`)
 
