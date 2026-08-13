@@ -219,8 +219,8 @@ def main():
                 req = urllib.request.Request(f"http://{first}/peers",
                                              headers={"X-BR-Auth": sig})
                 with urllib.request.urlopen(req, timeout=2) as r:
-                    live = sum(1 for age in json.loads(r.read())["peers"].values()
-                               if age <= 12)
+                    live = sum(1 for e in json.loads(r.read())["peers"].values()
+                               if e["age"] <= 12)
                 if live >= a.nodes:
                     break
             except OSError:

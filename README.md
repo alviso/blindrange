@@ -78,6 +78,41 @@ confidentiality never depends on it (that's the cryptography's job), and it is
 not transport encryption (run inside TLS/VPN/Tailscale for that). Omit it for
 an open playground network.
 
+Every node also has an **identity**: an Ed25519 keypair generated on first
+start (kept in its data directory). Gossip heartbeats ("I am at addr X at
+time T") are signed by the node itself and verified by everyone who stores or
+relays them, so no insider can forge another node's liveness or hijack its
+traffic by advertising a wrong address. Placement hashes node *ids*, not
+addresses — a node can move (DHCP, new network) without reshuffling data.
+This is not Sybil resistance: anyone with the network secret can mint
+identities.
+
+Nodes are **self-healing**: each continuously walks its own keys in small
+batches (tunable via `BR_REPAIR_EVERY` / `BR_REPAIR_BATCH`) and re-pushes
+them to each key's current replica set — so data migrates to newly joined
+nodes and replication recovers after churn with no owner involvement. The
+e2e suite proves the full arc: data written to a two-node network migrates
+to a third node that joined later, and survives both original nodes dying.
+
+### Running nodes on multiple machines
+
+Bind to the LAN and advertise a reachable address:
+
+```bash
+# machine A (192.168.1.10) — starts the network
+blindrange-node --port 7501 --data ~/.blindrange/n1 \
+    --host 0.0.0.0 --advertise 192.168.1.10:7501 --secret <network-secret>
+
+# machine B — joins via any live peer
+blindrange-node --port 7501 --data ~/.blindrange/n1 \
+    --host 0.0.0.0 --advertise 192.168.1.20:7501 \
+    --seed 192.168.1.10:7501 --secret <network-secret>
+```
+
+Clients bootstrap the same way: `bootstrap=["192.168.1.10:7501"]`. Nodes
+behind NAT need a reachable address — today that means a LAN, a VPN, or an
+overlay like Tailscale/Headscale; native NAT traversal is on the roadmap.
+
 Own a database (the only place keys ever exist):
 
 ```python
@@ -102,10 +137,11 @@ rid = owner.query("amount", 25000, 50000)[0]["_rid"]
 owner.delete(rid)                        # tombstone + ciphertext removal
 owner.compact()                          # epoch rewrite: merges all writers'
                                          # chains, drops tombstoned entries
-                                         # (real forgetting); run quiescent
-owner.repair()                           # anti-entropy sweep: re-places every
-                                         # reachable key on its current
-                                         # replica set (heals ring churn)
+                                         # (real forgetting); SAFE under
+                                         # concurrent writes (open/drain/seal)
+owner.repair()                           # full owner-driven anti-entropy pass
+                                         # (nodes also heal continuously
+                                         # among themselves)
 ```
 
 `my.brdb` is a passphrase-encrypted state file (master key + writer identity +
@@ -152,15 +188,17 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Fourteen end-to-end tests against a real 6-node gossip network: membership
+Seventeen end-to-end tests against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with
 interleaved same-value inserts, full recovery from an empty counter cache,
 two-field AND queries, deletes visible to fresh clients via tombstones, and
 compaction (correctness preserved, tombstoned entries dropped, late writers
-picking up the new epoch), rejection of unauthenticated requests, and the
-anti-entropy repair sweep.
+picking up the new epoch), rejection of unauthenticated requests, the
+owner-driven repair sweep, hot-label striping across nodes, a writer
+inserting concurrently with a running compaction, and gossip-driven
+node-to-node data migration surviving the death of all original holders.
 
 ## Threat model — measured, not asserted
 
@@ -199,8 +237,14 @@ reveals nothing at all.
   to nothing — the ciphertext is removed immediately — but a node that
   correlates old fetches could notice which entries went dead). Full backward
   privacy holds only after compaction.
-- `compact()` assumes quiescent writers — it is owner-driven maintenance, not
-  a concurrent background process. Writes racing a compaction can be lost.
+- `compact()` is safe under concurrent writes via the open/drain/seal epoch
+  protocol (readers consult both epochs mid-compaction; the drain re-walks
+  the old epoch until stable). The residual edge: a write that checked the
+  epoch *before* the open marker and then takes longer to land than a full
+  drain pass could in principle be missed — the stability requirement makes
+  this window effectively zero, but it is not cryptographically closed
+  (write-intent leases would close it; future work). One compactor at a
+  time, enforced by an insert-if-absent epoch slot.
 - Read-repair heals what queries touch; `owner.repair()` sweeps everything
   else, but it is owner-driven — nodes do not yet repair among themselves.
 - The network secret is shared membership auth (anti-vandalism), not
@@ -221,8 +265,11 @@ reveals nothing at all.
   retries via insert-if-absent; a pathological race combined with the loss of
   a slot's primary replica could hide a writer id until re-registration —
   writer onboarding is rare and owner-driven, but know the edge exists.
-- Hot labels concentrate entries; splitting oversized buckets across nodes is
-  planned.
+- Hot labels do NOT concentrate on single nodes: every chain entry is its own
+  PRF-derived key, so a popular value's entries stripe across the whole ring
+  (verified in the e2e suite). What a hot label does cost is enumeration
+  (reading a long chain at query time) — proportional to result size, and
+  collapsed by compaction.
 - Losing the master key loses the database; losing the rest of the state file
   costs only a re-probe. Back the key up accordingly.
 

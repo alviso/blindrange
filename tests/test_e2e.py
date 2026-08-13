@@ -39,12 +39,15 @@ def wait_peers(addr, n, secret, tries=120):
     import json
     sig = hmac.new(secret.encode(), b"/peers", hashlib.sha256).hexdigest()
     for _ in range(tries):
-        req = urllib.request.Request(f"http://{addr}/peers",
-                                     headers={"X-BR-Auth": sig})
-        with urllib.request.urlopen(req, timeout=2) as r:
-            peers = json.loads(r.read())["peers"]
-        if sum(1 for age in peers.values() if age <= 12) >= n:
-            return
+        try:
+            req = urllib.request.Request(f"http://{addr}/peers",
+                                         headers={"X-BR-Auth": sig})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                peers = json.loads(r.read())["peers"]
+            if sum(1 for e in peers.values() if e["age"] <= 12) >= n:
+                return
+        except OSError:
+            pass                                    # node still starting
         time.sleep(0.25)
     raise RuntimeError(f"{addr} never saw {n} live peers")
 
@@ -90,6 +93,7 @@ class TestE2E(unittest.TestCase):
         for p in cls.procs.values():
             if p.poll() is None:
                 p.terminate()
+            p.wait()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     # ---- helpers ------------------------------------------------------
@@ -118,6 +122,28 @@ class TestE2E(unittest.TestCase):
         want = self._want(lambda r: r["name"].startswith("sa"))
         self.assertEqual(got, want)
 
+    def test_03b_hot_label_striping(self):
+        # 100 records with the SAME value: per-entry PRF keys must stripe the
+        # hot label's entries across the ring, not pile onto one node
+        import json
+        def keycounts():
+            out = {}
+            for n in self.owner.network():
+                if "keys" in n:
+                    out[n["addr"]] = n["keys"]
+            return out
+        before = keycounts()
+        hot = [{"amount": 999_999, "day": 999, "name": "hot" + str(i),
+                "row": 40_000 + i} for i in range(100)]
+        self.owner.insert_many(hot)
+        self.rows.extend(hot)
+        after = keycounts()
+        gained = sum(1 for a in after if after[a] > before.get(a, 0))
+        self.assertGreaterEqual(gained, 4,
+                                f"hot label concentrated: {before} -> {after}")
+        got = self._got(self.owner.query("amount", 999_999, 999_999))
+        self.assertEqual(got, sorted(r["row"] for r in hot))
+
     def test_04_survives_node_death(self):
         for port in (BASE + 2, BASE + 4):           # kill 2 of 6 (RF=3)
             self.procs[port].terminate()
@@ -134,9 +160,16 @@ class TestE2E(unittest.TestCase):
             cwd=str(Path(__file__).resolve().parents[1]))
         wait_http(f"127.0.0.1:{port}")
         wait_peers(f"127.0.0.1:{port}", 5, self.secret)  # learns the network
-        time.sleep(3)                               # let the dead pair expire
-        addrs = self.owner.refresh_membership()
-        self.assertIn(f"127.0.0.1:{port}", addrs)
+        # membership is eventually consistent: poll until the owner's view
+        # includes the new node and has dropped the dead pair
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            self.owner.refresh_membership()
+            if f"127.0.0.1:{port}" in self.owner._addr_of.values():
+                break
+            time.sleep(0.5)
+        self.assertIn(f"127.0.0.1:{port}",
+                      self.owner._addr_of.values())
         self.assert_query("amount", 100_000, 300_000)   # failover + read-repair
 
     def test_06_owner_reopen_and_insert(self):
@@ -259,6 +292,129 @@ class TestE2E(unittest.TestCase):
         self.assertGreaterEqual(stats["checked"], stats["healed"])
         self.assert_query("amount", 100_000, 300_000)
         self.assert_query("day", 100, 200)
+
+    def test_15_concurrent_compaction(self):
+        # a writer keeps inserting WHILE the compactor runs; the open/drain/
+        # seal protocol must lose nothing
+        import threading
+        racer = Owner.accept(f"{self.tmp}/ownerF.brdb", "sixth pass",
+                             self.owner.invite())
+        raced = [{"amount": 888_000 + i, "day": 20 + (i % 30),
+                  "name": "race" + str(i), "row": 50_000 + i}
+                 for i in range(30)]
+        errors = []
+
+        def insert_loop():
+            try:
+                for rec in raced:
+                    racer.insert(rec)
+            except Exception as e:                    # surface, don't swallow
+                errors.append(e)
+
+        t = threading.Thread(target=insert_loop)
+        t.start()
+        stats = self.owner.compact()
+        t.join()
+        self.assertFalse(errors)
+        self.assertGreater(stats["entries"], 0)
+        self.rows.extend(raced)
+        got = self._got(self.owner.query("amount", 888_000, 888_100))
+        self.assertEqual(got, sorted(r["row"] for r in raced))
+        self.assert_query("amount", 100_000, 300_000)   # older data intact
+
+
+class TestNodeBackgroundRepair(unittest.TestCase):
+    """Nodes heal the network among THEMSELVES: data written before a node
+    joined must migrate to it with no owner involvement, until the original
+    holders can all die without data loss."""
+
+    def test_gossip_driven_migration(self):
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_repair_")
+        secret = "repairnet"
+        env = {**os.environ, "BR_REPAIR_EVERY": "0.5",
+               "BR_REPAIR_BATCH": "5000"}
+        root = str(Path(__file__).resolve().parents[1])
+        ports = [7701, 7702, 7703]
+
+        def start(port, seeds):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{tmp}/n{port}",
+                    "--secret", secret]
+            for s in seeds:
+                args += ["--seed", s]
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=root,
+                                    env=env)
+        procs = {}
+        try:
+            procs[7701] = start(7701, [])
+            wait_http("127.0.0.1:7701")
+            procs[7702] = start(7702, ["127.0.0.1:7701"])
+            wait_peers("127.0.0.1:7701", 2, secret)
+
+            owner = Owner.create(f"{tmp}/o.brdb", "pw",
+                                 {"x": {"type": "int", "bits": 12,
+                                        "leaf_width": 4}},
+                                 bootstrap=["127.0.0.1:7701"],
+                                 network_secret=secret)
+            rows = [{"x": i * 3, "row": i} for i in range(150)]
+            owner.insert_many(rows)
+
+            procs[7703] = start(7703, ["127.0.0.1:7701"])   # joins AFTER data
+            wait_http("127.0.0.1:7703")
+            wait_peers("127.0.0.1:7703", 3, secret)
+            # the owner must learn about the newcomer WHILE it can still ask
+            # someone — a client whose entire contact list dies while it
+            # slept has lost its network (same as losing all bootstraps)
+            deadline = time.time() + 20
+            while time.time() < deadline and len(owner.ring.addrs) < 3:
+                owner.refresh_membership()
+                time.sleep(0.5)
+            self.assertEqual(len(owner.ring.addrs), 3)
+
+            # with 3 nodes and RF3, background repair must copy EVERY key to
+            # the newcomer — poll its key count up to ~60s
+            import hashlib
+            import hmac
+            def keys_on(port):
+                sig = hmac.new(secret.encode(), b"/intel",
+                               hashlib.sha256).hexdigest()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/intel?limit=1",
+                    headers={"X-BR-Auth": sig})
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    return json.loads(r.read())["count"]
+            target = keys_on(7701)
+            deadline = time.time() + 60
+            while time.time() < deadline and keys_on(7703) < target:
+                time.sleep(1)
+            self.assertGreaterEqual(keys_on(7703), target,
+                                    "background repair never converged")
+
+            # the original holders can now die: the newcomer alone suffices
+            for p in (7701, 7702):
+                procs[p].terminate()
+                procs[p].wait()
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    owner.refresh_membership()
+                    if len(owner.ring.addrs) == 1:
+                        break
+                except ConnectionError:
+                    pass
+                time.sleep(0.5)
+            got = sorted(r["row"] for r in owner.query("x", 30, 300))
+            want = sorted(r["row"] for r in rows if 30 <= r["x"] <= 300)
+            self.assertEqual(got, want)
+        finally:
+            for p in procs.values():
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

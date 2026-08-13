@@ -1,13 +1,27 @@
 """blindrange-node: a distributable blind storage node.
 
-Stores opaque key -> opaque blob in SQLite. Holds no key material, evaluates
-no comparisons, and answers only exact-match lookups. Every node also gossips
-a peer table, so the network has NO central infrastructure: to join, a node
-needs the address of any one live peer (or none, to start a new network); to
-use the network, a client needs the address of any one live node. Everything
-else is discovered.
+Stores opaque key -> opaque blob in SQLite. Holds no data keys, evaluates no
+comparisons, and answers only exact-match lookups. Membership is gossip: to
+join, a node needs the address of any one live peer (or none, to start a new
+network); to use the network, a client needs the address of any one live node.
 
-  blindrange-node --port 7501 --data ~/.blindrange/n1 [--seed host:port ...]
+Identity: each node generates an Ed25519 keypair on first start (kept in its
+data directory). Its node id is a hash of the public key, and every gossip
+heartbeat ("I am at <addr> at time <t>") is signed by the node itself and
+verified by everyone who relays or receives it — so no insider can forge
+another node's liveness or redirect its traffic by advertising a wrong
+address. Placement hashes node ids, not addresses, so a node can change
+address (DHCP, new network) without reshuffling data. This is not Sybil
+resistance: anyone holding the network secret can mint new identities.
+
+Self-healing: a background thread continuously walks this node's keys in
+small batches and re-pushes each to the key's current replica set — so data
+migrates to new nodes and replication heals after churn without any owner
+involvement. Rate is tunable (BR_REPAIR_EVERY seconds, BR_REPAIR_BATCH keys).
+
+  blindrange-node --port 7501 --data ~/.blindrange/n1 \
+      [--seed host:port ...] [--secret <network-secret>] \
+      [--host 0.0.0.0 --advertise 192.168.1.20:7501]
 
 Transparency: GET /intel shows a sample of everything this operator can see.
 """
@@ -24,8 +38,55 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey)
+
+from .ring import Ring
+
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
 PEER_TTL = 15.0           # drop peers silent for this long
+REPAIR_EVERY = float(os.environ.get("BR_REPAIR_EVERY", "5"))
+REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "200"))
+REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
+
+
+class Identity:
+    def __init__(self, data_dir):
+        path = os.path.join(data_dir, "node.key")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                self.priv = Ed25519PrivateKey.from_private_bytes(f.read())
+        else:
+            self.priv = Ed25519PrivateKey.generate()
+            raw = self.priv.private_bytes(
+                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                serialization.NoEncryption())
+            with open(path, "wb") as f:
+                os.fchmod(f.fileno(), 0o600) if hasattr(os, "fchmod") else None
+                f.write(raw)
+        self.pub_raw = self.priv.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        self.node_id = hashlib.sha256(self.pub_raw).hexdigest()[:16]
+
+    def heartbeat(self, addr):
+        ts = int(time.time() * 1000)
+        msg = f"{addr}|{ts}".encode()
+        return {"addr": addr, "ts": ts, "pub": self.pub_raw.hex(),
+                "sig": self.priv.sign(msg).hex()}
+
+
+def verify_entry(node_id, e):
+    """A peer entry is only accepted if its own key signed it."""
+    try:
+        pub_raw = bytes.fromhex(e["pub"])
+        if hashlib.sha256(pub_raw).hexdigest()[:16] != node_id:
+            return False
+        Ed25519PublicKey.from_public_bytes(pub_raw).verify(
+            bytes.fromhex(e["sig"]), f"{e['addr']}|{e['ts']}".encode())
+        return True
+    except Exception:
+        return False
 
 
 class Store:
@@ -76,6 +137,12 @@ class Store:
                     out[k] = row[0]
             return out
 
+    def batch_after(self, last_key, n):
+        with self.lock:
+            return self.db.execute(
+                "SELECT k, v FROM kv WHERE k > ? ORDER BY k LIMIT ?",
+                (last_key, n)).fetchall()
+
     def count(self):
         with self.lock:
             return self.db.execute("SELECT COUNT(*) FROM kv").fetchone()[0]
@@ -87,58 +154,114 @@ class Store:
 
 
 class Peers:
-    """Gossiped membership table: addr -> last-heard-from timestamp."""
+    """Gossiped membership: node_id -> signed heartbeat. Only entries whose
+    signature verifies against their own key are ever stored or relayed."""
 
-    def __init__(self, self_addr):
-        self.self_addr = self_addr
+    def __init__(self, ident: Identity, addr: str):
+        self.ident = ident
+        self.addr = addr
         self.lock = threading.Lock()
-        self.table = {self_addr: time.time()}
+        self.table = {ident.node_id: ident.heartbeat(addr)}
+        self.contacts = set()          # bare seed addrs (no identity yet)
+        self.changed_at = time.time()
 
     def merge(self, other: dict):
         now = time.time()
         with self.lock:
-            for addr, ts in other.items():
-                ts = min(float(ts), now)               # never trust future stamps
-                if ts > self.table.get(addr, 0):
-                    self.table[addr] = ts
-            self.table[self.self_addr] = now
-            dead = [a for a, ts in self.table.items()
-                    if now - ts > PEER_TTL and a != self.self_addr]
-            for a in dead:
-                del self.table[a]
+            for nid, e in other.items():
+                if nid == self.ident.node_id:
+                    continue
+                cur = self.table.get(nid)
+                if (not cur or e["ts"] > cur["ts"]) and verify_entry(nid, e):
+                    if not cur:
+                        self.changed_at = now
+                    self.table[nid] = e
+            self.table[self.ident.node_id] = self.ident.heartbeat(self.addr)
+            dead = [nid for nid, e in self.table.items()
+                    if now - e["ts"] / 1000 > PEER_TTL
+                    and nid != self.ident.node_id]
+            for nid in dead:
+                del self.table[nid]
+                self.changed_at = now
 
     def snapshot(self):
         with self.lock:
-            self.table[self.self_addr] = time.time()
+            self.table[self.ident.node_id] = self.ident.heartbeat(self.addr)
             return dict(self.table)
 
     def live(self):
         now = time.time()
-        return [a for a, ts in self.snapshot().items() if now - ts <= PEER_TTL]
+        return {nid: e for nid, e in self.snapshot().items()
+                if now - e["ts"] / 1000 <= PEER_TTL}
+
+    def stable_since(self):
+        with self.lock:
+            return time.time() - self.changed_at
 
 
 def _sign(secret: str, payload: bytes) -> str:
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
+def _post(addr, path, payload: bytes, secret: str, timeout=3):
+    headers = {"Content-Type": "application/json"}
+    if secret:
+        headers["X-BR-Auth"] = _sign(secret, payload)
+    req = urllib.request.Request(f"http://{addr}{path}", data=payload,
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
 def _gossip_loop(peers: Peers, secret: str):
     while True:
         time.sleep(GOSSIP_EVERY + random.random() * 0.5)
-        others = [a for a in peers.live() if a != peers.self_addr]
-        if not others:
+        live = peers.live()
+        targets = [e["addr"] for nid, e in live.items()
+                   if nid != peers.ident.node_id]
+        targets += [a for a in peers.contacts
+                    if a not in {e["addr"] for e in live.values()}]
+        if not targets:
             continue
-        target = random.choice(others)
+        target = random.choice(targets)
         try:
             body = json.dumps({"peers": peers.snapshot()}).encode()
-            headers = {"Content-Type": "application/json"}
-            if secret:
-                headers["X-BR-Auth"] = _sign(secret, body)
-            req = urllib.request.Request(f"http://{target}/gossip", data=body,
-                                         headers=headers)
-            with urllib.request.urlopen(req, timeout=3) as r:
-                peers.merge(json.loads(r.read())["peers"])
+            got = _post(target, "/gossip", body, secret)
+            peers.merge(got["peers"])
         except OSError:
             pass                                       # peer down; TTL handles it
+
+
+def _repair_loop(store: Store, peers: Peers, secret: str):
+    """Continuously re-push this node's keys to their current replica sets.
+    Data migrates to joined nodes and replication heals after churn without
+    any owner involvement. Idempotent (INSERT OR REPLACE everywhere)."""
+    cursor = ""
+    while True:
+        time.sleep(REPAIR_EVERY + random.random())
+        if peers.stable_since() < REPAIR_SETTLE:
+            continue                                   # membership still moving
+        live = peers.live()
+        if len(live) < 2:
+            continue
+        ring = Ring(sorted(live), replicas=3)
+        addr_of = {nid: e["addr"] for nid, e in live.items()}
+        batch = store.batch_after(cursor, REPAIR_BATCH)
+        if not batch:
+            cursor = ""                                # wrapped; start over
+            continue
+        cursor = batch[-1][0]
+        by_addr = {}
+        for k, v in batch:
+            for nid in ring.route(k):
+                if nid != peers.ident.node_id and nid in addr_of:
+                    by_addr.setdefault(addr_of[nid], []).append([k, v])
+        for addr, entries in by_addr.items():
+            try:
+                _post(addr, "/kv", json.dumps({"entries": entries}).encode(),
+                      secret, timeout=5)
+            except OSError:
+                pass
 
 
 def make_handler(store: Store, peers: Peers, secret: str = ""):
@@ -196,15 +319,21 @@ def make_handler(store: Store, peers: Peers, secret: str = ""):
                 return
             if url.path == "/peers":
                 now = time.time()
-                self._json({"peers": {a: round(now - ts, 1)
-                                      for a, ts in peers.snapshot().items()}})
+                self._json({"peers": {
+                    nid: {"addr": e["addr"],
+                          "age": round(now - e["ts"] / 1000, 1)}
+                    for nid, e in peers.snapshot().items()}})
             elif url.path == "/stats":
-                self._json({"addr": peers.self_addr, "keys": store.count(),
+                self._json({"addr": peers.addr,
+                            "node_id": peers.ident.node_id,
+                            "keys": store.count(),
                             "read_batches": store.read_batches,
                             "peers": len(peers.live())})
             elif url.path == "/intel":
                 n = int(parse_qs(url.query).get("limit", ["4"])[0])
-                self._json({"addr": peers.self_addr, "count": store.count(),
+                self._json({"addr": peers.addr,
+                            "node_id": peers.ident.node_id,
+                            "count": store.count(),
                             "sample": [[k, v] for k, v in store.sample(n)]})
             else:
                 self._json({"error": "unknown"}, 404)
@@ -215,13 +344,16 @@ def make_handler(store: Store, peers: Peers, secret: str = ""):
     return Handler
 
 
-def run(host, port, data_dir, seeds, secret=""):
-    addr = f"{host}:{port}"
+def run(host, port, data_dir, seeds, secret="", advertise=None):
+    os.makedirs(data_dir, exist_ok=True)
+    addr = advertise or f"{host}:{port}"
+    ident = Identity(data_dir)
     store = Store(os.path.join(data_dir, "kv.db"))
-    peers = Peers(addr)
-    if seeds:
-        peers.merge({s: time.time() for s in seeds})
+    peers = Peers(ident, addr)
+    peers.contacts.update(seeds)
     threading.Thread(target=_gossip_loop, args=(peers, secret),
+                     daemon=True).start()
+    threading.Thread(target=_repair_loop, args=(store, peers, secret),
                      daemon=True).start()
     server = ThreadingHTTPServer((host, port),
                                  make_handler(store, peers, secret))
@@ -230,7 +362,8 @@ def run(host, port, data_dir, seeds, secret=""):
 
 def main():
     ap = argparse.ArgumentParser(description="blindrange blind storage node")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (0.0.0.0 to serve a LAN)")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--data", required=True, help="data directory for this node")
     ap.add_argument("--seed", action="append", default=[],
@@ -238,8 +371,11 @@ def main():
     ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
                     help="network-membership secret (or env BLINDRANGE_SECRET); "
                          "empty runs an open network")
+    ap.add_argument("--advertise", default=None,
+                    help="host:port other machines should reach this node at "
+                         "(defaults to --host:--port; set it when binding 0.0.0.0)")
     a = ap.parse_args()
-    run(a.host, a.port, a.data, a.seed, a.secret)
+    run(a.host, a.port, a.data, a.seed, a.secret, a.advertise)
 
 
 if __name__ == "__main__":

@@ -85,9 +85,9 @@ class Owner:
             if f.startswith("@"):
                 raise ValueError("field names starting with '@' are reserved")
             max_level(spec["bits"], spec.get("leaf_width", 1))   # validate early
-        return {"v": 3, "master": master_hex, "writer": os.urandom(8).hex(),
-                "schema": schema, "epoch": 0, "chains": {}, "remote": {},
-                "writers": [], "reg_len": 0,
+        return {"v": 4, "master": master_hex, "writer": os.urandom(8).hex(),
+                "schema": schema, "epoch": 0, "epoch_len": 0, "sealed_max": -1,
+                "chains": {}, "remote": {}, "writers": [], "reg_len": 0,
                 "tombs": {"counts": {}, "rids": []},
                 "secret": "", "bootstrap": list(bootstrap)}
 
@@ -134,7 +134,7 @@ class Owner:
         raw = AESGCM(key).decrypt(bytes.fromhex(blob["nonce"]),
                                   bytes.fromhex(blob["ct"]), None)
         state = json.loads(raw)
-        if state.get("v") != 3:
+        if state.get("v") != 4:
             raise ValueError("state file uses an older format; "
                              "re-create the database")
         if bootstrap:
@@ -154,27 +154,37 @@ class Owner:
 
     # ---------------------------------------------------------- membership
     def refresh_membership(self):
-        """Discover live nodes by asking any known node for its peer table."""
+        """Discover live nodes by asking any known node for its peer table.
+        The ring hashes NODE IDS (stable identities), not addresses — a node
+        can move address without reshuffling data placement."""
         contacts = list(self._st["bootstrap"])
         if self.ring:
-            contacts = list(self.ring.addrs) + contacts
-        seen = {}
+            contacts = [self._addr_of[n] for n in self.ring.addrs
+                        if n in getattr(self, "_addr_of", {})] + contacts
+        found = {}
+        answers = 0
         for addr in contacts:
             try:
-                ages = self._get(addr, "/peers")["peers"]
-                for a, age in ages.items():
-                    if age <= PEER_LIVE_S:
-                        seen[a] = True
-                break                                   # one live answer is enough
+                peers = self._get(addr, "/peers")["peers"]
+                for nid, e in peers.items():
+                    if e["age"] <= PEER_LIVE_S:
+                        found[nid] = e["addr"]
+                answers += 1
+                if answers >= 2:        # merge two views; one may be stale
+                    break
             except OSError:
                 continue
-        if not seen:
+        if not found:
             raise ConnectionError("no live blindrange node reachable "
                                   f"(tried {contacts})")
-        new_ring = Ring(sorted(seen), replicas=3)
+        self._addr_of = found
+        new_ring = Ring(sorted(found), replicas=3)
         if new_ring != self.ring:
             self.ring = new_ring
-        return sorted(seen)
+        return sorted(found)
+
+    def _addr(self, node_id):
+        return self._addr_of.get(node_id)
 
     # ------------------------------------------------------------ crypto
     def _k_w(self, w):
@@ -236,21 +246,53 @@ class Owner:
             return json.loads(r.read())
 
     def _put(self, kv_pairs):
+        """Replicated write with a durability floor: every key must be ACKed
+        by at least MIN_ACKS live nodes (or every reachable one, if fewer).
+        Keys that fall short — replicas dead, membership stale — are retried
+        on further ring successors, so a write never silently ends up as a
+        single copy on a node nobody else has discovered yet."""
+        MIN_ACKS = 2
         by_node = {}
         for k, v in kv_pairs:
-            for addr in self.ring.route(k):
-                by_node.setdefault(addr, []).append([k, v])
-        jobs = [self.pool.submit(self._post, a, "/kv", {"entries": e})
-                for a, e in by_node.items()]
-        failures = sum(1 for j in jobs if not _ok(j))
-        if failures == len(jobs):
-            raise ConnectionError("all replicas rejected the write")
+            for nid in self.ring.route(k):
+                addr = self._addr(nid)
+                if addr:
+                    by_node.setdefault(addr, []).append([k, v])
+        jobs = {a: self.pool.submit(self._post, a, "/kv", {"entries": e})
+                for a, e in by_node.items()}
+        acks = {k: 0 for k, _ in kv_pairs}
+        for a, j in jobs.items():
+            if _ok(j):
+                for k, _v in by_node[a]:
+                    acks[k] += 1
+        vals = dict(kv_pairs)
+        need = min(MIN_ACKS, max(1, len(self._addr_of)))
+        weak = [k for k, n in acks.items() if n < need]
+        if weak:
+            for k in weak:
+                for nid in self.ring.route(k, self.ring.replicas + 3):
+                    if acks[k] >= need:
+                        break
+                    addr = self._addr(nid)
+                    if not addr or any(k == k2 for k2, _ in
+                                       by_node.get(addr, [])):
+                        continue
+                    try:
+                        self._post(addr, "/kv", {"entries": [[k, vals[k]]]})
+                        acks[k] += 1
+                    except OSError:
+                        continue
+        if any(n == 0 for n in acks.values()):
+            raise ConnectionError("write not durable: some keys got zero ACKs")
 
     def _put_nx(self, key, value):
         """Insert-if-absent on all replicas. False if any replica already had
         the key (a concurrent writer won the slot)."""
         won = True
-        for addr in self.ring.route(key):
+        for nid in self.ring.route(key):
+            addr = self._addr(nid)
+            if not addr:
+                continue
             try:
                 r = self._post(addr, "/kv", {"entries": [[key, value]],
                                              "nx": True})
@@ -265,8 +307,10 @@ class Owner:
         PROBE_EXTRA = 3
         by_node = {}
         for k in keys:
-            for addr in self.ring.route(k, self.ring.replicas + PROBE_EXTRA):
-                by_node.setdefault(addr, []).append(k)
+            for nid in self.ring.route(k, self.ring.replicas + PROBE_EXTRA):
+                addr = self._addr(nid)
+                if addr:
+                    by_node.setdefault(addr, []).append(k)
         jobs = [self.pool.submit(self._post, a, "/delete", {"keys": ks})
                 for a, ks in by_node.items()]
         for j in jobs:
@@ -278,7 +322,9 @@ class Owner:
         Probes PROBE_EXTRA successors beyond the replica set, covering keys
         written under an earlier ring whose holders have shifted out of it."""
         PROBE_EXTRA = 3
-        route = {k: self.ring.route(k, self.ring.replicas + PROBE_EXTRA)
+        route = {k: [self._addr(n) for n in
+                     self.ring.route(k, self.ring.replicas + PROBE_EXTRA)
+                     if self._addr(n)]
                  for k in keys}
         out, found_at = {}, {}
         for level in range(self.ring.replicas + PROBE_EXTRA):
@@ -300,7 +346,8 @@ class Owner:
         if repairs:
             by_primary = {}
             for k, v in repairs:
-                by_primary.setdefault(route[k][0], []).append([k, v])
+                if route[k]:
+                    by_primary.setdefault(route[k][0], []).append([k, v])
             for a, e in by_primary.items():
                 self.pool.submit(self._post, a, "/kv", {"entries": e})
         return out
@@ -345,19 +392,48 @@ class Owner:
 
     # ---------------------------------------------------- system chains
     def _refresh_epoch(self):
-        """One probe (typically) against the on-network epoch chain. A new
-        epoch means a compaction happened: local chain caches reset (they are
-        caches — probing rebuilds them)."""
+        """One probe (typically) against the on-network epoch chain, whose
+        entries are markers: "open:N" (epoch N exists — write there) and
+        "sealed:N" (epoch N is fully merged into N+1 — stop reading it).
+        Between a compactor's open and sealed markers, readers read BOTH
+        epochs, which is what makes compaction safe under concurrent writes."""
+        st = self._st
         end = self._discover_ends(
             {"e": (lambda i: self._sys_key(b"epoch", i),
-                   self._st["epoch"])})["e"]
-        if end > self._st["epoch"]:
-            self._st["epoch"] = end
-            self._st["chains"] = {}
-            self._st["remote"] = {}
-            self._st["tombs"] = {"counts": {}, "rids": []}
+                   st["epoch_len"])})["e"]
+        if end > st["epoch_len"]:
+            keys = {i: self._sys_key(b"epoch", i)
+                    for i in range(st["epoch_len"] + 1, end + 1)}
+            got = self._mget(list(keys.values()))
+            for i in sorted(keys):
+                if keys[i] not in got:
+                    continue
+                txt = self._sys_decode(got[keys[i]])
+                if txt.startswith("open:"):
+                    n = int(txt.split(":")[1])
+                    if n > st["epoch"]:
+                        st["epoch"] = n
+                        st["chains"] = {}          # own chains were older-epoch
+                elif txt.startswith("sealed:"):
+                    st["sealed_max"] = max(st["sealed_max"],
+                                           int(txt.split(":")[1]))
+            st["epoch_len"] = end
+            # prune caches for epochs no longer readable
+            live = set(self._epochs())
+            st["remote"] = {k: v for k, v in st["remote"].items()
+                            if int(k.split("|")[0]) in live}
+            st["tombs"]["counts"] = {
+                k: v for k, v in st["tombs"]["counts"].items()
+                if int(k.split("|")[0]) in live}
             self._save()
-        return self._st["epoch"]
+        return st["epoch"]
+
+    def _epochs(self):
+        """The epochs a correct reader must consult right now."""
+        st = self._st
+        if st["epoch"] > 0 and st["epoch"] - 1 > st["sealed_max"]:
+            return [st["epoch"] - 1, st["epoch"]]
+        return [st["epoch"]]
 
     def _refresh_writers(self):
         """Learn any new writers from the on-network registry chain."""
@@ -398,28 +474,30 @@ class Owner:
         self._save()
 
     def _refresh_tombs(self, writers):
-        """The set of deleted record ids in the current epoch (cached; only
-        new tombstone entries are fetched)."""
-        E = self._st["epoch"]
+        """The set of deleted record ids across all readable epochs (cached;
+        only new tombstone entries are fetched)."""
         k_t = self._k_w(TOMB)
         tombs = self._st["tombs"]
-        spec = {u: ((lambda i, u=u: self._ut(k_t, E, u, i)),
-                    tombs["counts"].get(u, 0)) for u in writers}
+        spec = {}
+        for ep in self._epochs():
+            for u in writers:
+                spec[(ep, u)] = ((lambda i, e=ep, u=u: self._ut(k_t, e, u, i)),
+                                 tombs["counts"].get(f"{ep}|{u}", 0))
         ends = self._discover_ends(spec) if spec else {}
         new_keys = {}
-        for u, end in ends.items():
-            for i in range(tombs["counts"].get(u, 0) + 1, end + 1):
-                new_keys[self._ut(k_t, E, u, i)] = (u, i)
+        for (ep, u), end in ends.items():
+            for i in range(tombs["counts"].get(f"{ep}|{u}", 0) + 1, end + 1):
+                new_keys[self._ut(k_t, ep, u, i)] = (ep, u, i)
         if new_keys:
             got = self._mget(list(new_keys))
             for ut, blob in got.items():
-                u, i = new_keys[ut]
+                ep, u, i = new_keys[ut]
                 rid = bytes(x ^ y for x, y in
-                            zip(b64decode(blob), self._mask(k_t, E, u, i)))
+                            zip(b64decode(blob), self._mask(k_t, ep, u, i)))
                 if rid.hex() not in tombs["rids"]:
                     tombs["rids"].append(rid.hex())
-            for u, end in ends.items():
-                tombs["counts"][u] = end
+            for (ep, u), end in ends.items():
+                tombs["counts"][f"{ep}|{u}"] = end
             self._save()
         return set(tombs["rids"])
 
@@ -464,14 +542,14 @@ class Owner:
         me = self._st["writer"]
         k_t = self._k_w(TOMB)
         tombs = self._st["tombs"]
-        base = tombs["counts"].get(me, 0)
+        base = tombs["counts"].get(f"{E}|{me}", 0)
         puts = []
         for n, rid_hex in enumerate(rids, start=base + 1):
             rid = bytes.fromhex(rid_hex)
             masked = bytes(x ^ y for x, y in zip(rid, self._mask(k_t, E, me, n)))
             puts.append((self._ut(k_t, E, me, n), b64encode(masked).decode()))
         self._put(puts)
-        tombs["counts"][me] = base + len(rids)
+        tombs["counts"][f"{E}|{me}"] = base + len(rids)
         for r in rids:
             if r not in tombs["rids"]:
                 tombs["rids"].append(r)
@@ -534,8 +612,9 @@ class Owner:
 
     def _candidate_rids(self, field, a, b, writers):
         """Index phase for one predicate: encrypted-index lookups only, no
-        ciphertext fetches. Returns the set of matching record ids."""
-        E = self._st["epoch"]
+        ciphertext fetches. Reads every currently-readable epoch (two while a
+        compaction is in flight). Returns the set of matching record ids."""
+        top = self._st["epoch"]
         spec = self._st["schema"][field]
         mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
         me = self._st["writer"]
@@ -546,139 +625,48 @@ class Owner:
 
         # cached counters (even our own) are a lower bound; gallop to the end
         spec_map = {}
-        for w in labels:
-            for u in writers:
-                cached = (self._st["chains"].get(w, 0) if u == me
-                          else remote.get(w, {}).get(u, 0))
-                spec_map[(w, u)] = (
-                    (lambda i, k=k_ws[w], u=u: self._ut(k, E, u, i)), cached)
+        for ep in self._epochs():
+            for w in labels:
+                for u in writers:
+                    cached = (self._st["chains"].get(w, 0)
+                              if u == me and ep == top
+                              else remote.get(f"{ep}|{w}", {}).get(u, 0))
+                    spec_map[(ep, w, u)] = (
+                        (lambda i, e=ep, k=k_ws[w], u=u:
+                         self._ut(k, e, u, i)), cached)
         ends = self._discover_ends(spec_map) if spec_map else {}
         dirty = False
-        for (w, u), end in ends.items():
-            if u == me:
+        for (ep, w, u), end in ends.items():
+            if u == me and ep == top:
                 if end > self._st["chains"].get(w, 0):
                     self._st["chains"][w] = end     # future inserts append after
                     dirty = True
-            elif end != remote.setdefault(w, {}).get(u, 0):
-                remote[w][u] = end
+            elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
+                remote[f"{ep}|{w}"][u] = end
                 dirty = True
         if dirty:
             self._save()                     # cache only; losable, re-probable
 
         ut_map = {}
-        for (w, u), c in ends.items():
+        for (ep, w, u), c in ends.items():
             for i in range(1, c + 1):
-                ut_map[self._ut(k_ws[w], E, u, i)] = (k_ws[w], u, i)
+                ut_map[self._ut(k_ws[w], ep, u, i)] = (k_ws[w], ep, u, i)
         rids = set()
         for ut, blob in self._mget(list(ut_map)).items():
-            k_w, u, i = ut_map[ut]
+            k_w, ep, u, i = ut_map[ut]
             rid = bytes(x ^ y for x, y in zip(b64decode(blob),
-                                              self._mask(k_w, E, u, i)))
+                                              self._mask(k_w, ep, u, i)))
             rids.add(rid.hex())
         self.last_stats = {"cover": len(cover), "index_keys": len(ut_map),
                            "probe_rounds": getattr(self, "_probe_rounds", 0)}
         return rids
 
     # --------------------------------------------------------- compaction
-    def compact(self):
-        """Merge all writers' chains into single per-label streams under a new
-        epoch, dropping tombstoned entries, then delete the old epoch's keys.
-        Owner-driven maintenance: run while writers are QUIESCENT. Returns
-        {"labels": n, "entries": kept, "dropped": tombstoned_dropped}."""
-        E = self._refresh_epoch()
-        writers = self._refresh_writers()
-        tombs = self._refresh_tombs(writers)
-        me = self._st["writer"]
-        new_E = E + 1
-        puts, old_keys = [], []
-        new_chains = {}
-        kept = dropped = 0
-
-        for field, spec in self._st["schema"].items():
-            mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
-            frontier = [(1, 0), (1, 1)]
-            while frontier:
-                labels = [f"{field}|{lvl}|{idx}" for lvl, idx in frontier]
-                k_ws = {w: self._k_w(w) for w in labels}
-                spec_map = {(w, u): ((lambda i, k=k_ws[w], u=u:
-                                      self._ut(k, E, u, i)), 0)
-                            for w in labels for u in writers}
-                ends = self._discover_ends(spec_map)
-                ut_map = {}
-                for (w, u), c in ends.items():
-                    for i in range(1, c + 1):
-                        ut_map[self._ut(k_ws[w], E, u, i)] = (w, u, i)
-                got = self._mget(list(ut_map)) if ut_map else {}
-                per_label_rids = {w: [] for w in labels}
-                for ut, blob in got.items():
-                    w, u, i = ut_map[ut]
-                    rid = bytes(x ^ y for x, y in
-                                zip(b64decode(blob),
-                                    self._mask(k_ws[w], E, u, i)))
-                    per_label_rids[w].append(rid.hex())
-                    old_keys.append(ut)
-                nonempty = set()
-                for (lvl, idx), w in zip(frontier, labels):
-                    live = [r for r in per_label_rids[w] if r not in tombs]
-                    dropped += len(per_label_rids[w]) - len(live)
-                    if per_label_rids[w]:
-                        nonempty.add((lvl, idx))
-                    for n, rid_hex in enumerate(live, start=1):
-                        rid = bytes.fromhex(rid_hex)
-                        masked = bytes(x ^ y for x, y in
-                                       zip(rid, self._mask(k_ws[w], new_E,
-                                                           me, n)))
-                        puts.append((self._ut(k_ws[w], new_E, me, n),
-                                     b64encode(masked).decode()))
-                    if live:
-                        new_chains[w] = len(live)
-                        kept += len(live)
-                frontier = [(lvl + 1, c) for (lvl, idx) in nonempty
-                            if lvl + 1 <= mlvl
-                            for c in (idx * 2, idx * 2 + 1)]
-
-        # old tombstone chains are consumed by this rewrite
-        k_t = self._k_w(TOMB)
-        t_ends = self._discover_ends(
-            {u: ((lambda i, u=u: self._ut(k_t, E, u, i)), 0)
-             for u in writers}) if writers else {}
-        for u, c in t_ends.items():
-            old_keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
-
-        self._put(puts)
-        self._put_nx(self._sys_key(b"epoch", new_E),
-                     self._sys_encode(f"compacted-by:{me}"))
-        self._delete(old_keys)
-        self._st["epoch"] = new_E
-        self._st["chains"] = new_chains
-        self._st["remote"] = {}
-        self._st["tombs"] = {"counts": {}, "rids": []}
-        self._save()
-        return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
-
-    # ------------------------------------------------------------- repair
-    def repair(self):
-        """Anti-entropy sweep: walk everything reachable (system chains, the
-        whole label tree, tombstones, record blobs) and re-put each found key
-        to its CURRENT replica set. Heals cold data after ring churn — the
-        lazy read-repair only fixes what queries happen to touch. Owner-driven
-        maintenance; safe to run any time (writes are idempotent)."""
-        E = self._refresh_epoch()
-        writers = self._refresh_writers()
-        keys = [self._sys_key(b"epoch", i) for i in range(1, E + 1)]
-        keys += [self._sys_key(b"registry", i)
-                 for i in range(1, self._st["reg_len"] + 1)]
-
-        # tombstone chains
-        k_t = self._k_w(TOMB)
-        t_ends = self._discover_ends(
-            {u: ((lambda i, u=u: self._ut(k_t, E, u, i)), 0)
-             for u in writers}) if writers else {}
-        for u, c in t_ends.items():
-            keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
-
-        # full label-tree walk (empty intervals prune their subtrees)
-        rids = set()
+    def _walk_epoch(self, E, writers):
+        """One full pass over epoch E's label tree: gallop every reachable
+        chain, fetch entries, unmask. Returns (entries, old_keys) where
+        entries = {label: [rid_hex, ...]} and old_keys are the index keys."""
+        entries, old_keys = {}, []
         for field, spec in self._st["schema"].items():
             mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
             frontier = [(1, 0), (1, 1)]
@@ -700,13 +688,123 @@ class Owner:
                     rid = bytes(x ^ y for x, y in
                                 zip(b64decode(blob),
                                     self._mask(k_ws[w], E, u, i)))
-                    rids.add(rid.hex())
-                    lvl = int(w.split("|")[1])
-                    nonempty.add((lvl, int(w.split("|")[2])))
-                keys += list(ut_map)
+                    entries.setdefault(w, []).append(rid.hex())
+                    old_keys.append(ut)
+                    nonempty.add((int(w.split("|")[1]), int(w.split("|")[2])))
                 frontier = [(lvl + 1, c) for (lvl, idx) in nonempty
                             if lvl + 1 <= mlvl
                             for c in (idx * 2, idx * 2 + 1)]
+        for w in entries:
+            entries[w].sort()
+        return entries, old_keys
+
+    def compact(self):
+        """Merge all writers' chains into single per-label streams under a new
+        epoch, dropping tombstoned entries, then delete the old epoch's keys.
+
+        Safe under concurrent writes: it first announces "open:E+1" (writers
+        move to the new epoch within one operation — every insert re-checks
+        the epoch first), then DRAINS epoch E by re-walking it until two
+        consecutive passes see identical contents (catching in-flight
+        stragglers), merges, deletes E's keys, and announces "sealed:E".
+        Readers consult both epochs between open and sealed, so nothing is
+        ever invisible. One compactor at a time: the open marker is an
+        insert-if-absent slot, and losing that race aborts cleanly."""
+        import time as _time
+        E = self._refresh_epoch()
+        if len(self._epochs()) > 1:
+            raise RuntimeError("a compaction is already in flight")
+        writers = self._refresh_writers()
+        me = self._st["writer"]
+        new_E = E + 1
+
+        slot = self._st["epoch_len"] + 1
+        if not self._put_nx(self._sys_key(b"epoch", slot),
+                            self._sys_encode(f"open:{new_E}")):
+            self._refresh_epoch()
+            raise RuntimeError("another compaction won the epoch slot")
+        self._st["epoch_len"] = slot
+        self._st["epoch"] = new_E
+        self._st["chains"] = {}
+        self._save()
+
+        # drain epoch E: re-walk until a pass sees nothing new
+        entries, old_keys = self._walk_epoch(E, writers)
+        while True:
+            _time.sleep(0.3)
+            entries2, old_keys2 = self._walk_epoch(E, writers)
+            if entries2 == entries:
+                break
+            entries, old_keys = entries2, old_keys2
+
+        tombs = self._refresh_tombs(writers)         # includes epoch-E tombs
+        puts = []
+        new_chains = {}
+        kept = dropped = 0
+        for w, rid_list in entries.items():
+            live = [r for r in rid_list if r not in tombs]
+            dropped += len(rid_list) - len(live)
+            k_w = self._k_w(w)
+            for n, rid_hex in enumerate(live, start=1):
+                rid = bytes.fromhex(rid_hex)
+                masked = bytes(x ^ y for x, y in
+                               zip(rid, self._mask(k_w, new_E, me, n)))
+                puts.append((self._ut(k_w, new_E, me, n),
+                             b64encode(masked).decode()))
+            if live:
+                new_chains[w] = len(live)
+                kept += len(live)
+
+        # epoch-E tombstone chains are consumed by this rewrite
+        k_t = self._k_w(TOMB)
+        t_ends = self._discover_ends(
+            {u: ((lambda i, u=u: self._ut(k_t, E, u, i)), 0)
+             for u in writers}) if writers else {}
+        for u, c in t_ends.items():
+            old_keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
+
+        if puts:
+            self._put(puts)
+        self._delete(old_keys)
+        seal_slot = self._st["epoch_len"] + 1
+        self._put_nx(self._sys_key(b"epoch", seal_slot),
+                     self._sys_encode(f"sealed:{E}"))
+        self._st["epoch_len"] = seal_slot
+        self._st["sealed_max"] = max(self._st["sealed_max"], E)
+        for w, c in new_chains.items():
+            self._st["chains"][w] = max(self._st["chains"].get(w, 0), c)
+        self._st["remote"] = {}
+        self._st["tombs"] = {"counts": {}, "rids": []}
+        self._save()
+        return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
+
+
+    # ------------------------------------------------------------- repair
+    def repair(self):
+        """Anti-entropy sweep: walk everything reachable (system chains, the
+        whole label tree across readable epochs, tombstones, record blobs)
+        and re-put each found key to its CURRENT replica set. Nodes also do
+        this continuously among themselves in the background; this is the
+        owner-driven full pass. Idempotent, safe to run any time."""
+        self._refresh_epoch()
+        writers = self._refresh_writers()
+        keys = [self._sys_key(b"epoch", i)
+                for i in range(1, self._st["epoch_len"] + 1)]
+        keys += [self._sys_key(b"registry", i)
+                 for i in range(1, self._st["reg_len"] + 1)]
+
+        k_t = self._k_w(TOMB)
+        rids = set()
+        for E in self._epochs():
+            t_ends = self._discover_ends(
+                {u: ((lambda i, e=E, u=u: self._ut(k_t, e, u, i)), 0)
+                 for u in writers}) if writers else {}
+            for u, c in t_ends.items():
+                keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
+            entries, old_keys = self._walk_epoch(E, writers)
+            keys += old_keys
+            for rid_list in entries.values():
+                rids.update(rid_list)
         keys += ["R:" + r for r in rids]
 
         # fetch whatever exists and re-place it under the current ring
@@ -726,11 +824,14 @@ class Owner:
     def network(self):
         """Live nodes with their stats (for dashboards)."""
         out = []
-        for addr in (self.ring.addrs if self.ring else []):
+        for nid in (self.ring.addrs if self.ring else []):
+            addr = self._addr(nid)
+            if not addr:
+                continue
             try:
                 out.append(self._get(addr, "/stats"))
             except OSError:
-                out.append({"addr": addr, "down": True})
+                out.append({"addr": addr, "node_id": nid, "down": True})
         return out
 
     def intel(self, addr, limit=6):
