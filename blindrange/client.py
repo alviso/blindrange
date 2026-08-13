@@ -336,23 +336,26 @@ class Owner:
             _ok(j)
 
     def _mget(self, keys):
-        """Replica failover + read-repair: keys found on a fallback replica are
-        rewritten to the current primary, so data migrates as the ring changes.
-        Probes PROBE_EXTRA successors beyond the replica set, covering keys
-        written under an earlier ring whose holders have shifted out of it."""
+        """Replica lookup in two PARALLEL phases: the whole replica set at
+        once, then (only for keys still missing) the extended probe levels —
+        covering keys written under an earlier ring. Latency is 1 round trip
+        for hits and 2 for misses, regardless of replica count; the cost is
+        querying all replicas instead of stopping at the first hit, which is
+        the right trade when hops traverse relays. Read-repair: any found key
+        whose current primary did not answer is rewritten to that primary, so
+        data migrates as the ring changes."""
         PROBE_EXTRA = 3
+        R = self.ring.replicas
         route = {k: [self._addr(n) for n in
-                     self.ring.route(k, self.ring.replicas + PROBE_EXTRA)
-                     if self._addr(n)]
+                     self.ring.route(k, R + PROBE_EXTRA) if self._addr(n)]
                  for k in keys}
-        out, found_at = {}, {}
-        for level in range(self.ring.replicas + PROBE_EXTRA):
+        out, holders = {}, {}
+
+        def fan(lo, hi, pending):
             by_node = {}
-            for k, reps in route.items():
-                if k not in out and level < len(reps):
-                    by_node.setdefault(reps[level], []).append(k)
-            if not by_node:
-                break
+            for k in pending:
+                for a in route[k][lo:hi]:
+                    by_node.setdefault(a, []).append(k)
             jobs = {a: self.pool.submit(self._post, a, "/mget", {"keys": ks})
                     for a, ks in by_node.items()}
             for a, j in jobs.items():
@@ -360,15 +363,19 @@ class Owner:
                 if vals:
                     for k, v in vals["values"].items():
                         out[k] = v
-                        found_at[k] = level
-        repairs = [(k, out[k]) for k, lvl in found_at.items() if lvl > 0]
-        if repairs:
-            by_primary = {}
-            for k, v in repairs:
-                if route[k]:
-                    by_primary.setdefault(route[k][0], []).append([k, v])
-            for a, e in by_primary.items():
-                self.pool.submit(self._post, a, "/kv", {"entries": e})
+                        holders.setdefault(k, set()).add(a)
+
+        fan(0, R, list(keys))
+        missing = [k for k in keys if k not in out]
+        if missing:
+            fan(R, R + PROBE_EXTRA, missing)
+        by_primary = {}
+        for k, v in out.items():
+            primary = route[k][0] if route[k] else None
+            if primary and primary not in holders.get(k, ()):
+                by_primary.setdefault(primary, []).append([k, v])
+        for a, e in by_primary.items():
+            self.pool.submit(self._post, a, "/kv", {"entries": e})
         return out
 
     # -------------------------------------------- chain-length discovery
