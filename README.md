@@ -90,7 +90,17 @@ Three design decisions do the heavy lifting:
    query forever — resolves a value finer than the leaf* (measured in
    [prototype/bounded_demo.py](prototype/bounded_demo.py)). Set it per field at
    schema time; it cannot be overspent later, because finer tags don't exist.
-3. **Placement is a consistent-hash ring over gossip membership.** Virtual
+3. **Ordering is free, and the network still never sees it.** Dyadic leaves
+   are already in value order, and only the key holder knows that order, so
+   `query_stream(..., order=f)` walks leaves left to right and yields sorted
+   rows while the nodes still answer nothing but exact-match lookups on
+   opaque keys. Streaming also keeps memory at O(page) whatever the result
+   size, pages by cursor, and — for AND queries — drives off whichever
+   predicate has the fewest index entries, which chain lengths already tell
+   us. Honest limit: the client decrypts every row it returns and nodes
+   cannot compute on ciphertext, so there is no server-side aggregation.
+   This is a store for data you need unreadable, not a warehouse.
+4. **Placement is a consistent-hash ring over gossip membership.** Virtual
    nodes keep any number of nodes evenly loaded; replication (default 3) plus
    read-failover, extended ring probing, and read-repair keep data reachable
    through node death, joins, and churn. Payloads are AES-256-GCM; strings
@@ -257,6 +267,11 @@ owner.query_multi([                      # AND of predicates: record-id sets
     {"field": "amount", "lo": 25000, "hi": 50000},   # intersect BEFORE any
     {"field": "day", "lo": 100, "hi": 400}])         # ciphertext is fetched
 
+for row in owner.query_stream(               # bounded memory, any result size
+        [{"field": "amount", "lo": 0, "hi": 10 ** 6}],
+        limit=100, order="amount"):          # ordered — see below
+    ...                                      # row["_cursor"] resumes later
+
 rid = owner.query("amount", 25000, 50000)[0]["_rid"]
 owner.delete(rid)                        # tombstone + ciphertext removal
 owner.compact()                          # epoch rewrite: merges all writers'
@@ -312,10 +327,9 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Thirty tests. Ten cover the schema helpers and the client app (CSV inference,
+Thirty-four tests. Ten cover the schema helpers and the client app (CSV inference,
 value round-trips, the guarantee that any precision a user picks is a legal
-leaf width, and the browser API end to end against real nodes). Twenty are
-end-to-end against real gossip networks: membership
+leaf width, and the browser API end to end against real nodes). Twenty-four are end-to-end against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with

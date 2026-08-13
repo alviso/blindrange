@@ -399,6 +399,13 @@ function workspace(){
         <h2>Query — conditions combine with AND</h2>
         ${conds}
         <div class="row"><button class="pri" onclick="runQuery()">run</button>
+          <label class="dim" style="font-size:12px">sort by
+            <select id="orderby">
+              <option value="">(fastest, unsorted)</option>
+              ${fields.filter(([n,sp])=>sp.kind!=='text')
+                 .map(([n,sp])=>`<option value="${n}">${esc(sp.label||n)}</option>`)
+                 .join('')}
+            </select></label>
           <button onclick="view('add')">add a row</button>
           <button onclick="view('csvmore')">import CSV</button>
           <span id="qstats" class="stats"></span></div>
@@ -431,8 +438,10 @@ function workspace(){
   </div>`;
 }
 
-async function runQuery(){
-  const preds = [];
+let CURSOR = null, LASTPREDS = null;
+async function runQuery(append){
+  const preds = append ? LASTPREDS : [];
+  if (!append) {
   for (const [n,sp] of Object.entries(ST.schema)){
     if (!$('#use_'+n)?.checked) continue;
     if (sp.kind==='text'){
@@ -442,20 +451,28 @@ async function runQuery(){
       if (lo!=='' && hi!=='') preds.push({field:n, lo, hi});
     }
   }
-  $('#qstats').textContent = 'querying…';
+  LASTPREDS = preds; CURSOR = null;
+  }
+  $('#qstats').textContent = append ? 'fetching more…' : 'querying…';
   try {
-    const d = await api('/api/query', {predicates:preds});
-    LAST = d;
-    const cols = [...new Set(d.rows.flatMap(r=>Object.keys(r)))]
+    const order = $('#orderby').value || null;
+    const d = await api('/api/query', {predicates:preds, order,
+                                       after: append ? CURSOR : null});
+    CURSOR = d.cursor;
+    LAST = append ? {rows:[...LAST.rows, ...d.rows]} : d;
+    const rows = LAST.rows;
+    const cols = [...new Set(rows.flatMap(r=>Object.keys(r)))]
                  .filter(c=>c!=='_rid');
     $('#results').innerHTML = `<thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`)
       .join('')}<th></th></tr></thead><tbody>${
-      d.rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join('')}
+      rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join('')}
         <td><button class="danger" onclick="del('${r._rid}')">delete</button>
         </td></tr>`).join('')}</tbody>`;
     const s = d.stats||{};
-    $('#qstats').innerHTML = `<b>${d.total}</b> rows · <b>${s.index_keys||0}</b>
-      opaque lookups · <b>${s.rounds||0}</b> network rounds`;
+    $('#qstats').innerHTML = `<b>${rows.length}</b> rows${d.more?
+      ` <button onclick="runQuery(true)">load more</button>`:''} ·
+      streamed over <b>${s.units||0}</b> intervals in <b>${s.batches||0}</b>
+      batches${s.ordered?' · sorted client-side':''}`;
   } catch(e){ $('#qstats').textContent = e.message; }
 }
 async function del(rid){

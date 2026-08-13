@@ -166,9 +166,17 @@ def api_query(body):
                           "hi": S.to_stored(spec, p["hi"])})
     if not preds:
         raise ValueError("add at least one condition")
-    rows = owner.query_multi(preds)
-    return {"rows": rows_for_display(owner, rows)[:500],
-            "total": len(rows), "stats": owner.last_stats}
+    limit = max(1, min(int(body.get("limit", 200)), 2000))
+    order = body.get("order") or None
+    after = body.get("after") or None
+    # streamed: memory stays O(page) however large the result is
+    rows = list(owner.query_stream(preds, limit=limit + 1, order=order,
+                                   after=after))
+    more = len(rows) > limit
+    rows = rows[:limit]
+    cursor = rows[-1].get("_cursor") if rows else None
+    return {"rows": rows_for_display(owner, rows), "count": len(rows),
+            "more": more, "cursor": cursor, "stats": owner.last_stats}
 
 
 def api_delete(body):

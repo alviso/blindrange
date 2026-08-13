@@ -273,6 +273,47 @@ class TestE2E(unittest.TestCase):
         self.rows.append({"amount": 555_555, "day": 77, "name": "late",
                           "row": 30_000})
 
+    def test_12b_streaming_matches_materialised_query(self):
+        rows = self.owner.query("amount", 100_000, 600_000)
+        streamed = list(self.owner.query_stream(
+            [{"field": "amount", "lo": 100_000, "hi": 600_000}]))
+        self.assertGreater(len(rows), 0)             # never pass vacuously
+        self.assertEqual(sorted(r["row"] for r in streamed),
+                         sorted(r["row"] for r in rows))
+
+    def test_12c_streaming_orders_without_revealing_order(self):
+        got = list(self.owner.query_stream(
+            [{"field": "amount", "lo": 0, "hi": 900_000}], order="amount"))
+        amounts = [r["amount"] for r in got]
+        self.assertGreater(len(amounts), 10)
+        self.assertEqual(amounts, sorted(amounts))
+        self.assertTrue(self.owner.last_stats["ordered"])
+
+    def test_12d_cursor_pages_without_gaps_or_repeats(self):
+        preds = [{"field": "amount", "lo": 0, "hi": 900_000}]
+        everything = list(self.owner.query_stream(preds))
+        self.assertGreater(len(everything), 50)
+        seen, cursor = [], None
+        while len(seen) < len(everything):
+            page = list(self.owner.query_stream(preds, limit=17, after=cursor))
+            if not page:
+                break
+            seen += [r["row"] for r in page]
+            cursor = page[-1]["_cursor"]
+        self.assertEqual(sorted(seen), sorted(r["row"] for r in everything))
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_12e_and_query_drives_off_the_cheaper_predicate(self):
+        got = list(self.owner.query_stream([
+            {"field": "amount", "lo": 0, "hi": 900_000},
+            {"field": "day", "lo": 100, "hi": 120}]))
+        want = [r for r in self.rows
+                if 0 <= r["amount"] <= 900_000 and 100 <= r["day"] <= 120]
+        self.assertGreater(len(want), 0)
+        self.assertEqual(sorted(r["row"] for r in got),
+                         sorted(r["row"] for r in want))
+        self.assertEqual(self.owner.last_stats["driver"], "day")
+
     def test_13_unauthenticated_requests_rejected(self):
         import json as _json
         req = urllib.request.Request(

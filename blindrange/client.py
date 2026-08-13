@@ -687,6 +687,140 @@ class Owner:
     def query_prefix(self, field, prefix):
         return self.query_multi([{"field": field, "prefix": prefix}])
 
+    # --------------------------------------------------------- streaming
+    def _units(self, field, a, b, ordered):
+        """The index intervals to walk for [a,b], in value order.
+
+        Unordered: the minimal dyadic cover — fewest lookups.
+        Ordered: every leaf the range touches. Leaves ARE in value order and
+        only the key holder knows that order, so walking them left to right
+        yields sorted results without the network ever learning an ordering.
+        Costs one unit per leaf, so it is bounded by range/leaf_width."""
+        spec = self._st["schema"][field]
+        mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+        if not ordered:
+            cover = dyadic_cover(a, b, spec["bits"], mlvl)
+            width = lambda lvl: 1 << (spec["bits"] - lvl)      # noqa: E731
+            return sorted(cover, key=lambda li: li[1] * width(li[0]))
+        w = spec.get("leaf_width", 1)
+        return [(mlvl, idx) for idx in range(a // w, b // w + 1)]
+
+    def _unit_entries(self, field, units, writers):
+        """Gallop and fetch one batch of units; returns record ids found."""
+        spec = self._st["schema"][field]
+        k_ws = {}
+        gallop = {}
+        for lvl, idx in units:
+            w = f"{field}|{lvl}|{idx}"
+            k_ws[w] = self._k_w(w)
+            for ep in self._epochs():
+                for u in writers:
+                    gallop[(ep, w, u)] = (
+                        (lambda i, e=ep, k=k_ws[w], u=u: self._ut(k, e, u, i)),
+                        0)
+        ends = self._discover_ends(gallop) if gallop else {}
+        ut_map = {}
+        for (ep, w, u), c in ends.items():
+            for i in range(1, c + 1):
+                ut_map[self._ut(k_ws[w], ep, u, i)] = (k_ws[w], ep, u, i)
+        rids = []
+        for ut, blob in (self._mget(list(ut_map)) if ut_map else {}).items():
+            k_w, ep, u, i = ut_map[ut]
+            rid = bytes(x ^ y for x, y in zip(b64decode(blob),
+                                              self._mask(k_w, ep, u, i)))
+            rids.append(rid.hex())
+        return rids
+
+    def query_stream(self, predicates, limit=None, order=None, batch=24,
+                     after=None):
+        """Yield matching records incrementally, in O(batch) memory.
+
+        Walks ONE driving predicate's intervals — chosen as the most
+        selective, using chain lengths already known from probing — and
+        checks the other predicates after decryption, which the query path
+        does anyway. `order=<field>` yields rows sorted by that field.
+        `after` resumes from the cursor carried on a previously yielded row
+        (rec["_cursor"]); pass it back to page through a large result.
+
+        Use this for large or unbounded results; query_multi() is faster for
+        small ones because it intersects index sets before fetching.
+        """
+        self._refresh_epoch()
+        writers = self._refresh_writers()
+        tombs = self._refresh_tombs(writers)
+        bounds = []
+        for p in predicates:
+            spec = self._st["schema"][p["field"]]
+            if "prefix" in p:
+                lo, hi = prefix_range(p["prefix"], spec["chars"])
+            else:
+                lo, hi = (self._encode(p["field"], p["lo"]),
+                          self._encode(p["field"], p["hi"]))
+            bounds.append((p["field"], lo, hi))
+        if not bounds:
+            raise ValueError("no predicates")
+
+        driver = order or self._cheapest(bounds, writers)
+        d_field, d_lo, d_hi = next(b for b in bounds if b[0] == driver)
+        units = self._units(d_field, d_lo, d_hi, ordered=bool(order))
+        start_unit, seen_in_unit = (after or {}).get("u", 0), \
+            (after or {}).get("n", 0)
+
+        yielded = 0
+        stats = {"units": len(units), "batches": 0, "fetched": 0}
+        for base in range(start_unit, len(units), batch):
+            chunk = units[base:base + batch]
+            stats["batches"] += 1
+            rids = self._unit_entries(d_field, chunk, writers)
+            rids = [r for r in rids if r not in tombs]
+            blobs = self._mget(["R:" + r for r in rids]) if rids else {}
+            stats["fetched"] += len(blobs)
+            rows = []
+            for key, ct in blobs.items():
+                raw = b64decode(ct)
+                rec = json.loads(self._aes.decrypt(raw[:12], raw[12:], None))
+                if all(lo <= self._encode(f, rec[f]) <= hi
+                       for f, lo, hi in bounds if f in rec):
+                    rec["_rid"] = key[2:]
+                    rows.append(rec)
+            if order:
+                rows.sort(key=lambda r: self._encode(order, r[order]))
+            for n, rec in enumerate(rows):
+                if base == start_unit and n < seen_in_unit:
+                    continue                       # already delivered
+                rec["_cursor"] = {"u": base, "n": n + 1}
+                yield rec
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    self.last_stats = {**stats, "results": yielded,
+                                       "driver": d_field,
+                                       "ordered": bool(order)}
+                    return
+        self.last_stats = {**stats, "results": yielded, "driver": d_field,
+                           "ordered": bool(order), "exhausted": True}
+
+    def _cheapest(self, bounds, writers):
+        """Pick the predicate with the fewest index entries — chain lengths
+        are metadata we already have, so this costs one batched probe."""
+        if len(bounds) == 1:
+            return bounds[0][0]
+        totals = {}
+        for field, lo, hi in bounds:
+            spec = self._st["schema"][field]
+            mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+            gallop = {}
+            for lvl, idx in dyadic_cover(lo, hi, spec["bits"], mlvl):
+                w = f"{field}|{lvl}|{idx}"
+                k_w = self._k_w(w)
+                for ep in self._epochs():
+                    for u in writers:
+                        gallop[(ep, w, u)] = (
+                            (lambda i, e=ep, k=k_w, u=u: self._ut(k, e, u, i)),
+                            0)
+            ends = self._discover_ends(gallop) if gallop else {}
+            totals[field] = sum(ends.values())
+        return min(totals, key=totals.get)
+
     def query_multi(self, predicates, _retried=False):
         """AND of range/prefix predicates. Index phases run per predicate and
         intersect on record ids BEFORE any ciphertext is fetched.
