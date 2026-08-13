@@ -89,13 +89,15 @@ class Owner:
                 "schema": schema, "epoch": 0, "chains": {}, "remote": {},
                 "writers": [], "reg_len": 0,
                 "tombs": {"counts": {}, "rids": []},
-                "bootstrap": list(bootstrap)}
+                "secret": "", "bootstrap": list(bootstrap)}
 
     @classmethod
-    def create(cls, state_path, passphrase, schema, bootstrap):
+    def create(cls, state_path, passphrase, schema, bootstrap,
+               network_secret=""):
         if os.path.exists(state_path):
             raise FileExistsError(state_path)
         state = cls._new_state(os.urandom(32).hex(), schema, bootstrap)
+        state["secret"] = network_secret
         owner = cls(state_path, passphrase, state)
         owner._register_writer()
         owner._save()
@@ -106,6 +108,7 @@ class Owner:
         key — transmit it like key material, then discard it."""
         return b64encode(json.dumps(
             {"master": self._st["master"], "schema": self._st["schema"],
+             "secret": self._st.get("secret", ""),
              "bootstrap": self._st["bootstrap"]}).encode()).decode()
 
     @classmethod
@@ -116,6 +119,7 @@ class Owner:
         d = json.loads(b64decode(invite))
         state = cls._new_state(d["master"], d["schema"],
                                bootstrap or d["bootstrap"])
+        state["secret"] = d.get("secret", "")
         owner = cls(state_path, passphrase, state)
         owner._register_writer()
         owner._save()
@@ -157,8 +161,7 @@ class Owner:
         seen = {}
         for addr in contacts:
             try:
-                with urllib.request.urlopen(f"http://{addr}/peers", timeout=3) as r:
-                    ages = json.loads(r.read())["peers"]
+                ages = self._get(addr, "/peers")["peers"]
                 for a, age in ages.items():
                     if age <= PEER_LIVE_S:
                         seen[a] = True
@@ -210,11 +213,26 @@ class Owner:
             else int(value)
 
     # ---------------------------------------------------------- transport
+    def _sign(self, payload: bytes) -> dict:
+        secret = self._st.get("secret", "")
+        if not secret:
+            return {}
+        return {"X-BR-Auth": hmac.new(secret.encode(), payload,
+                                      hashlib.sha256).hexdigest()}
+
     def _post(self, addr, path, payload):
-        req = urllib.request.Request(f"http://{addr}{path}",
-                                     data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"})
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"http://{addr}{path}", data=body,
+            headers={"Content-Type": "application/json", **self._sign(body)})
         with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+
+    def _get(self, addr, path):
+        base = path.split("?")[0]
+        req = urllib.request.Request(f"http://{addr}{path}",
+                                     headers=self._sign(base.encode()))
+        with urllib.request.urlopen(req, timeout=3) as r:
             return json.loads(r.read())
 
     def _put(self, kv_pairs):
@@ -638,6 +656,68 @@ class Owner:
         self._save()
         return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
 
+    # ------------------------------------------------------------- repair
+    def repair(self):
+        """Anti-entropy sweep: walk everything reachable (system chains, the
+        whole label tree, tombstones, record blobs) and re-put each found key
+        to its CURRENT replica set. Heals cold data after ring churn — the
+        lazy read-repair only fixes what queries happen to touch. Owner-driven
+        maintenance; safe to run any time (writes are idempotent)."""
+        E = self._refresh_epoch()
+        writers = self._refresh_writers()
+        keys = [self._sys_key(b"epoch", i) for i in range(1, E + 1)]
+        keys += [self._sys_key(b"registry", i)
+                 for i in range(1, self._st["reg_len"] + 1)]
+
+        # tombstone chains
+        k_t = self._k_w(TOMB)
+        t_ends = self._discover_ends(
+            {u: ((lambda i, u=u: self._ut(k_t, E, u, i)), 0)
+             for u in writers}) if writers else {}
+        for u, c in t_ends.items():
+            keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
+
+        # full label-tree walk (empty intervals prune their subtrees)
+        rids = set()
+        for field, spec in self._st["schema"].items():
+            mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+            frontier = [(1, 0), (1, 1)]
+            while frontier:
+                labels = [f"{field}|{lvl}|{idx}" for lvl, idx in frontier]
+                k_ws = {w: self._k_w(w) for w in labels}
+                spec_map = {(w, u): ((lambda i, k=k_ws[w], u=u:
+                                      self._ut(k, E, u, i)), 0)
+                            for w in labels for u in writers}
+                ends = self._discover_ends(spec_map) if spec_map else {}
+                ut_map = {}
+                for (w, u), c in ends.items():
+                    for i in range(1, c + 1):
+                        ut_map[self._ut(k_ws[w], E, u, i)] = (w, u, i)
+                got = self._mget(list(ut_map)) if ut_map else {}
+                nonempty = set()
+                for ut, blob in got.items():
+                    w, u, i = ut_map[ut]
+                    rid = bytes(x ^ y for x, y in
+                                zip(b64decode(blob),
+                                    self._mask(k_ws[w], E, u, i)))
+                    rids.add(rid.hex())
+                    lvl = int(w.split("|")[1])
+                    nonempty.add((lvl, int(w.split("|")[2])))
+                keys += list(ut_map)
+                frontier = [(lvl + 1, c) for (lvl, idx) in nonempty
+                            if lvl + 1 <= mlvl
+                            for c in (idx * 2, idx * 2 + 1)]
+        keys += ["R:" + r for r in rids]
+
+        # fetch whatever exists and re-place it under the current ring
+        found = 0
+        for i in range(0, len(keys), 2000):
+            got = self._mget(keys[i:i + 2000])
+            if got:
+                self._put(list(got.items()))
+                found += len(got)
+        return {"checked": len(keys), "healed": found}
+
     # -------------------------------------------------------------- misc
     @property
     def schema(self):
@@ -648,11 +728,14 @@ class Owner:
         out = []
         for addr in (self.ring.addrs if self.ring else []):
             try:
-                with urllib.request.urlopen(f"http://{addr}/stats", timeout=3) as r:
-                    out.append(json.loads(r.read()))
+                out.append(self._get(addr, "/stats"))
             except OSError:
                 out.append({"addr": addr, "down": True})
         return out
+
+    def intel(self, addr, limit=6):
+        """A node's transparency dump (what its operator sees)."""
+        return self._get(addr, f"/intel?limit={limit}")
 
 
 def _ok(job):

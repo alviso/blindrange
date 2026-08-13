@@ -2,5 +2,5 @@
 from .client import Owner
 from .ring import Ring
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __all__ = ["Owner", "Ring", "__version__"]

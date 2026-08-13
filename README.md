@@ -64,11 +64,19 @@ Start a network — each node is one process, one directory, one port. The first
 node starts a new network; everyone else seeds off any live peer:
 
 ```bash
-blindrange-node --port 7501 --data ~/.blindrange/n1
-blindrange-node --port 7502 --data ~/.blindrange/n2 --seed 127.0.0.1:7501
-blindrange-node --port 7503 --data ~/.blindrange/n3 --seed 127.0.0.1:7502
+blindrange-node --port 7501 --data ~/.blindrange/n1 --secret <network-secret>
+blindrange-node --port 7502 --data ~/.blindrange/n2 --seed 127.0.0.1:7501 --secret <network-secret>
+blindrange-node --port 7503 --data ~/.blindrange/n3 --seed 127.0.0.1:7502 --secret <network-secret>
 # ... as many as you like, on as many machines as you like
 ```
+
+The `--secret` (or `BLINDRANGE_SECRET` env var) is a **network-membership
+credential**: every request is HMAC-signed with it, so outsiders can't write,
+delete, or probe your network. Be clear about what it is *not*: every node and
+client holds it, so it does nothing against a curious or malicious node —
+confidentiality never depends on it (that's the cryptography's job), and it is
+not transport encryption (run inside TLS/VPN/Tailscale for that). Omit it for
+an open playground network.
 
 Own a database (the only place keys ever exist):
 
@@ -95,6 +103,9 @@ owner.delete(rid)                        # tombstone + ciphertext removal
 owner.compact()                          # epoch rewrite: merges all writers'
                                          # chains, drops tombstoned entries
                                          # (real forgetting); run quiescent
+owner.repair()                           # anti-entropy sweep: re-places every
+                                         # reachable key on its current
+                                         # replica set (heals ring churn)
 ```
 
 `my.brdb` is a passphrase-encrypted state file (master key + writer identity +
@@ -140,14 +151,16 @@ Use `--bootstrap host:port` to point the same app at a real network instead.
 python3 -m unittest tests.test_e2e -v
 ```
 
-Twelve end-to-end tests against a real 6-node gossip network: membership
+CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
+Fourteen end-to-end tests against a real 6-node gossip network: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,
 node join with read-repair, owner reopen from the encrypted state file,
 wrong-passphrase rejection, two writers reading each other's data with
 interleaved same-value inserts, full recovery from an empty counter cache,
 two-field AND queries, deletes visible to fresh clients via tombstones, and
 compaction (correctness preserved, tombstoned entries dropped, late writers
-picking up the new epoch).
+picking up the new epoch), rejection of unauthenticated requests, and the
+anti-entropy repair sweep.
 
 ## Threat model — measured, not asserted
 
@@ -188,13 +201,12 @@ reveals nothing at all.
   privacy holds only after compaction.
 - `compact()` assumes quiescent writers — it is owner-driven maintenance, not
   a concurrent background process. Writes racing a compaction can be lost.
-- Read-repair re-homes data lazily on access; there is no background
-  anti-entropy sweep yet, so cold data on a churned ring is only healed when
-  read (an explicit repair scan is a planned `blindrange-node` subcommand).
-- No client↔node authentication or transport encryption yet — run it inside a
-  trusted transport (localhost, VPN, or a mesh like Tailscale) for now. Note
-  the *confidentiality* model never depends on transport: nodes are untrusted
-  by construction.
+- Read-repair heals what queries touch; `owner.repair()` sweeps everything
+  else, but it is owner-driven — nodes do not yet repair among themselves.
+- The network secret is shared membership auth (anti-vandalism), not
+  per-node identity, and transport is plaintext HTTP — run inside
+  TLS/VPN/Tailscale. The *confidentiality* model never depends on either:
+  nodes are untrusted by construction.
 - A malicious (not just curious) node can drop or serve stale blobs — AES-GCM
   makes forgery detectable, but availability attacks are only mitigated by
   replication, not proven impossible.

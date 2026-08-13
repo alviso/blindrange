@@ -33,10 +33,15 @@ def wait_http(addr, tries=60):
     raise RuntimeError(f"{addr} never came up")
 
 
-def wait_peers(addr, n, tries=120):
+def wait_peers(addr, n, secret, tries=120):
+    import hashlib
+    import hmac
     import json
+    sig = hmac.new(secret.encode(), b"/peers", hashlib.sha256).hexdigest()
     for _ in range(tries):
-        with urllib.request.urlopen(f"http://{addr}/peers", timeout=2) as r:
+        req = urllib.request.Request(f"http://{addr}/peers",
+                                     headers={"X-BR-Auth": sig})
+        with urllib.request.urlopen(req, timeout=2) as r:
             peers = json.loads(r.read())["peers"]
         if sum(1 for age in peers.values() if age <= 12) >= n:
             return
@@ -48,18 +53,19 @@ class TestE2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="blindrange_test_")
+        cls.secret = "testnet-secret"
         cls.procs = {}
         for i in range(6):                          # 6-node network, one seed
             port = BASE + i
             seed = [] if i == 0 else ["--seed", f"127.0.0.1:{BASE}"]
             cls.procs[port] = subprocess.Popen(
                 [sys.executable, "-m", "blindrange.node", "--port", str(port),
-                 "--data", f"{cls.tmp}/n{port}"] + seed,
+                 "--data", f"{cls.tmp}/n{port}", "--secret", cls.secret] + seed,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 cwd=str(Path(__file__).resolve().parents[1]))
         for port in cls.procs:
             wait_http(f"127.0.0.1:{port}")
-        wait_peers(f"127.0.0.1:{BASE}", 6)          # gossip converges
+        wait_peers(f"127.0.0.1:{BASE}", 6, cls.secret)   # gossip converges
 
         cls.schema = {
             "amount": {"type": "int", "bits": 20, "leaf_width": 256},
@@ -68,7 +74,8 @@ class TestE2E(unittest.TestCase):
         }
         cls.state = f"{cls.tmp}/owner.brdb"
         cls.owner = Owner.create(cls.state, "correct horse", cls.schema,
-                                 bootstrap=[f"127.0.0.1:{BASE}"])
+                                 bootstrap=[f"127.0.0.1:{BASE}"],
+                                 network_secret=cls.secret)
         rng = random.Random(21)
         names = ["acme", "apex", "birch", "cedar", "delta", "ember", "flint",
                  "gale", "harbor", "iris", "sable", "salt", "sand", "scout"]
@@ -121,11 +128,12 @@ class TestE2E(unittest.TestCase):
         port = BASE + 9
         self.procs[port] = subprocess.Popen(
             [sys.executable, "-m", "blindrange.node", "--port", str(port),
-             "--data", f"{self.tmp}/n{port}", "--seed", f"127.0.0.1:{BASE}"],
+             "--data", f"{self.tmp}/n{port}", "--seed", f"127.0.0.1:{BASE}",
+             "--secret", self.secret],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             cwd=str(Path(__file__).resolve().parents[1]))
         wait_http(f"127.0.0.1:{port}")
-        wait_peers(f"127.0.0.1:{port}", 5)          # new node learns the network
+        wait_peers(f"127.0.0.1:{port}", 5, self.secret)  # learns the network
         time.sleep(3)                               # let the dead pair expire
         addrs = self.owner.refresh_membership()
         self.assertIn(f"127.0.0.1:{port}", addrs)
@@ -231,6 +239,26 @@ class TestE2E(unittest.TestCase):
         self.assertEqual(rows, [30_000])
         self.rows.append({"amount": 555_555, "day": 77, "name": "late",
                           "row": 30_000})
+
+    def test_13_unauthenticated_requests_rejected(self):
+        import json as _json
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{BASE}/kv",
+            data=_json.dumps({"entries": [["X:junk", "vandalism"]]}).encode(),
+            headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=3)
+        self.assertEqual(ctx.exception.code, 401)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(f"http://127.0.0.1:{BASE}/peers", timeout=3)
+        self.assertEqual(ctx.exception.code, 401)
+
+    def test_14_repair_sweep(self):
+        stats = self.owner.repair()
+        self.assertGreater(stats["healed"], 0)
+        self.assertGreaterEqual(stats["checked"], stats["healed"])
+        self.assert_query("amount", 100_000, 300_000)
+        self.assert_query("day", 100, 200)
 
 
 if __name__ == "__main__":

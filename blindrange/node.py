@@ -12,6 +12,8 @@ else is discovered.
 Transparency: GET /intel shows a sample of everything this operator can see.
 """
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -115,7 +117,11 @@ class Peers:
         return [a for a, ts in self.snapshot().items() if now - ts <= PEER_TTL]
 
 
-def _gossip_loop(peers: Peers):
+def _sign(secret: str, payload: bytes) -> str:
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def _gossip_loop(peers: Peers, secret: str):
     while True:
         time.sleep(GOSSIP_EVERY + random.random() * 0.5)
         others = [a for a in peers.live() if a != peers.self_addr]
@@ -124,15 +130,18 @@ def _gossip_loop(peers: Peers):
         target = random.choice(others)
         try:
             body = json.dumps({"peers": peers.snapshot()}).encode()
+            headers = {"Content-Type": "application/json"}
+            if secret:
+                headers["X-BR-Auth"] = _sign(secret, body)
             req = urllib.request.Request(f"http://{target}/gossip", data=body,
-                                         headers={"Content-Type": "application/json"})
+                                         headers=headers)
             with urllib.request.urlopen(req, timeout=3) as r:
                 peers.merge(json.loads(r.read())["peers"])
         except OSError:
             pass                                       # peer down; TTL handles it
 
 
-def make_handler(store: Store, peers: Peers):
+def make_handler(store: Store, peers: Peers, secret: str = ""):
     class Handler(BaseHTTPRequestHandler):
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()
@@ -142,13 +151,24 @@ def make_handler(store: Store, peers: Peers):
             self.end_headers()
             self.wfile.write(body)
 
-        def _body(self):
-            n = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(n)) if n else {}
+        def _authed(self, payload: bytes) -> bool:
+            """Network-membership check: HMAC(secret, payload). Anti-vandalism
+            only — every node and client holds the same secret, so this keeps
+            outsiders out; it does not (and cannot) make nodes trustworthy.
+            Data confidentiality never depends on it."""
+            if not secret:
+                return True
+            given = self.headers.get("X-BR-Auth", "")
+            return hmac.compare_digest(given, _sign(secret, payload))
 
         def do_POST(self):
             path = urlparse(self.path).path
-            data = self._body()
+            n = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(n) if n else b""
+            if not self._authed(raw):
+                self._json({"error": "unauthorized"}, 401)
+                return
+            data = json.loads(raw) if raw else {}
             if path == "/kv":
                 entries = [(k, v) for k, v in data["entries"]]
                 if data.get("nx"):
@@ -170,6 +190,10 @@ def make_handler(store: Store, peers: Peers):
 
         def do_GET(self):
             url = urlparse(self.path)
+            if url.path in ("/peers", "/intel") and not self._authed(
+                    url.path.encode()):
+                self._json({"error": "unauthorized"}, 401)
+                return
             if url.path == "/peers":
                 now = time.time()
                 self._json({"peers": {a: round(now - ts, 1)
@@ -191,14 +215,16 @@ def make_handler(store: Store, peers: Peers):
     return Handler
 
 
-def run(host, port, data_dir, seeds):
+def run(host, port, data_dir, seeds, secret=""):
     addr = f"{host}:{port}"
     store = Store(os.path.join(data_dir, "kv.db"))
     peers = Peers(addr)
     if seeds:
         peers.merge({s: time.time() for s in seeds})
-    threading.Thread(target=_gossip_loop, args=(peers,), daemon=True).start()
-    server = ThreadingHTTPServer((host, port), make_handler(store, peers))
+    threading.Thread(target=_gossip_loop, args=(peers, secret),
+                     daemon=True).start()
+    server = ThreadingHTTPServer((host, port),
+                                 make_handler(store, peers, secret))
     server.serve_forever()
 
 
@@ -209,8 +235,11 @@ def main():
     ap.add_argument("--data", required=True, help="data directory for this node")
     ap.add_argument("--seed", action="append", default=[],
                     help="host:port of any live peer (repeatable; omit to start a new network)")
+    ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
+                    help="network-membership secret (or env BLINDRANGE_SECRET); "
+                         "empty runs an open network")
     a = ap.parse_args()
-    run(a.host, a.port, a.data, a.seed)
+    run(a.host, a.port, a.data, a.seed, a.secret)
 
 
 if __name__ == "__main__":

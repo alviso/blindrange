@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install cryptography
+      - name: End-to-end suite (real 6-node gossip network)
+        run: python -m unittest tests.test_e2e -v
+      - name: Prototype sanity (base scheme + structural privacy budget)
+        run: |
+          cd prototype
+          python demo.py > /dev/null
+          python bounded_demo.py > /dev/null

@@ -64,6 +64,9 @@ def sample_orders(n=1000, seed=4):
     return out
 
 
+DEMO_SECRET = "demo-network-secret"
+
+
 class Net:
     """Local node processes this app spawned (killable/spawnable from the UI)."""
 
@@ -79,7 +82,7 @@ class Net:
             seeds = [f"127.0.0.1:{p}" for p, pr in self.procs.items()
                      if pr.poll() is None][:2]
             args = [sys.executable, "-m", "blindrange.node", "--port", str(port),
-                    "--data", f"{self.tmp}/n{port}"]
+                    "--data", f"{self.tmp}/n{port}", "--secret", DEMO_SECRET]
             for s in seeds:
                 args += ["--seed", s]
             self.procs[port] = subprocess.Popen(args, cwd=str(ROOT),
@@ -144,9 +147,7 @@ def make_handler(owner: Owner, net):
             elif url.path == "/api/nodeview":
                 addr = q.get("addr", [None])[0] or owner.ring.addrs[0]
                 try:
-                    with urllib.request.urlopen(f"http://{addr}/intel?limit=6",
-                                                timeout=3) as r:
-                        self._json(json.loads(r.read()))
+                    self._json(owner.intel(addr))
                 except OSError:
                     self._json({"addr": addr, "down": True})
             elif url.path == "/api/kill" and net:
@@ -209,9 +210,15 @@ def main():
         for _ in range(a.nodes - 1):
             net.spawn()
         bootstrap = [first]
+        import hashlib
+        import hmac as _hmac
+        sig = _hmac.new(DEMO_SECRET.encode(), b"/peers",
+                        hashlib.sha256).hexdigest()
         for _ in range(120):                            # wait for gossip to converge
             try:
-                with urllib.request.urlopen(f"http://{first}/peers", timeout=2) as r:
+                req = urllib.request.Request(f"http://{first}/peers",
+                                             headers={"X-BR-Auth": sig})
+                with urllib.request.urlopen(req, timeout=2) as r:
                     live = sum(1 for age in json.loads(r.read())["peers"].values()
                                if age <= 12)
                 if live >= a.nodes:
@@ -229,7 +236,8 @@ def main():
             Path(state_path).unlink()
             print("old-format state file removed; reseeding")
     if not Path(state_path).exists():
-        owner = Owner.create(state_path, a.passphrase, SCHEMA, bootstrap)
+        owner = Owner.create(state_path, a.passphrase, SCHEMA, bootstrap,
+                             network_secret=DEMO_SECRET if net else "")
         orders = sample_orders(a.orders)
         t0 = time.time()
         for i in range(0, len(orders), 100):
