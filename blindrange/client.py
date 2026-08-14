@@ -509,14 +509,21 @@ class Owner:
             self._dialer = direct_mod.Dialer()
 
         def request_punch(observed):
-            env = {"to": nid, "id": os.urandom(8).hex(), "method": "POST",
-                   "path": "/punch",
-                   "body_b64": b64encode(json.dumps(
-                       {"udp": observed}).encode()).decode()}
-            raw = json.dumps(env).encode()
-            POOL.request(relay, "POST", "/relay/send", raw,
-                         {"Content-Type": "application/json",
-                          **self._sign(raw)}, timeout=15)
+            # Best effort by definition: if the relay cannot carry the punch
+            # request, the dial simply times out and we fall back to the
+            # relay path. Raising here only produced "Future exception was
+            # never retrieved" noise on a busy network.
+            try:
+                env = {"to": nid, "id": os.urandom(8).hex(), "method": "POST",
+                       "path": "/punch",
+                       "body_b64": b64encode(json.dumps(
+                           {"udp": observed}).encode()).decode()}
+                raw = json.dumps(env).encode()
+                POOL.request(relay, "POST", "/relay/send", raw,
+                             {"Content-Type": "application/json",
+                              **self._sign(raw)}, timeout=15)
+            except (OSError, ValueError):
+                pass
         for cand in cands:            # LAN candidate first, then public
             try:
                 path = self._dialer.dial(cand, relay, request_punch,
