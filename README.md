@@ -171,9 +171,21 @@ and the rows are encrypted and stored across the network. Then query by
 range, date, and prefix, add rows, delete them, and share the database with
 another device by invite.
 
+It opens on **your databases** — the client remembers which files you have
+(paths and field names only, never keys) so you don't have to. Once open,
+"show everything" browses without composing a query, and "count only"
+answers how many rows match while fetching none of them.
+
 Keys live in that local process — never in the browser, never on a server.
 The page is served over plain HTTP from `127.0.0.1`, which is also why it can
 talk to plain-HTTP nodes at all: a hosted HTTPS app could not.
+
+Your `.brdb` file stays passphrase-encrypted, deliberately: people back that
+file up, and often to exactly the kind of provider this project exists not to
+trust — a plaintext key file would mean the storage nodes can't read your
+data but your cloud backup can. Install the optional `keyring` package and
+you can let your OS keychain hold the passphrase per device, which is the
+same trade every other credential on your machine already makes.
 
 Prefer the terminal? `blindrange init` walks through the same schema
 questions and `blindrange info FILE` prints what an existing database
@@ -380,7 +392,7 @@ python3 -m unittest tests.test_e2e -v
 ```
 
 CI runs the suite on every push (GitHub Actions, Python 3.11 and 3.13).
-Thirty-eight tests. Ten cover the schema helpers and the client app (CSV inference,
+Thirty-nine tests. Ten cover the schema helpers and the client app (CSV inference,
 value round-trips, the guarantee that any precision a user picks is a legal
 leaf width, and the browser API end to end against real nodes). Twenty-four are end-to-end against real gossip networks: membership
 discovery, int/prefix query correctness vs plaintext ground truth, node death,

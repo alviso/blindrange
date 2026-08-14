@@ -8,7 +8,9 @@ hosted HTTPS app would hit.
   blindrange ui [--file my.brdb] [--port 8700]
 """
 import json
+import os
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +24,45 @@ PUBLIC_SECRET = "blindrange-public"
 
 STATE = {"owner": None, "file": None, "lock": threading.Lock()}
 UI_HTML = (Path(__file__).parent / "webui.html").read_text()
+
+# Known databases: PATHS ONLY, never keys. The .brdb stays passphrase-
+# encrypted because people back it up — to exactly the kind of provider this
+# project exists not to trust. Optional convenience: the OS keychain can hold
+# the passphrase if the user asks and `keyring` is installed.
+RECENT = Path(os.environ.get("BR_RECENT",
+                             Path.home() / ".blindrange" / "recent.json"))
+KEYRING_SERVICE = "blindrange"
+
+try:
+    import keyring as _keyring
+except Exception:
+    _keyring = None
+
+
+def recent_list():
+    try:
+        items = json.loads(RECENT.read_text())
+    except (OSError, ValueError):
+        return []
+    out = []
+    for it in items:
+        exists = Path(it["file"]).expanduser().exists()
+        out.append({**it, "exists": exists,
+                    "remembered": bool(_keyring) and bool(
+                        _keyring.get_password(KEYRING_SERVICE, it["file"]))})
+    return [it for it in out if it["exists"]]
+
+
+def remember_db(path, fields=None):
+    RECENT.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        items = json.loads(RECENT.read_text())
+    except (OSError, ValueError):
+        items = []
+    items = [it for it in items if it["file"] != path]
+    items.insert(0, {"file": path, "opened": int(time.time()),
+                     "fields": fields or []})
+    RECENT.write_text(json.dumps(items[:12], indent=1))
 
 
 # ------------------------------------------------------------- helpers
@@ -93,9 +134,18 @@ def record_from_raw(owner, raw):
 # -------------------------------------------------------------- actions
 
 def api_open(body):
-    owner = Owner.open(body["file"], body["passphrase"],
+    path = body["file"]
+    passphrase = body.get("passphrase") or ""
+    if not passphrase and _keyring:                  # unlocked by the OS
+        passphrase = _keyring.get_password(KEYRING_SERVICE, path) or ""
+    if not passphrase:
+        raise ValueError("passphrase required")
+    owner = Owner.open(path, passphrase,
                        bootstrap=[PUBLIC_SEED] if body.get("public") else None)
-    STATE["owner"], STATE["file"] = owner, body["file"]
+    STATE["owner"], STATE["file"] = owner, path
+    if body.get("remember") and _keyring:
+        _keyring.set_password(KEYRING_SERVICE, path, passphrase)
+    remember_db(path, list(owner.schema))
     return state_payload()
 
 
@@ -113,6 +163,10 @@ def api_create(body):
     owner = Owner.create(body["file"], body["passphrase"], schema, bootstrap,
                          network_secret=secret)
     STATE["owner"], STATE["file"] = owner, body["file"]
+    if body.get("remember") and _keyring:
+        _keyring.set_password(KEYRING_SERVICE, body["file"],
+                              body["passphrase"])
+    remember_db(body["file"], list(owner.schema))
     return state_payload()
 
 
@@ -179,6 +233,58 @@ def api_query(body):
             "more": more, "cursor": cursor, "stats": owner.last_stats}
 
 
+def api_close(_body):
+    """Close the open database. Keys are dropped from this process; nothing
+    on disk or on the network changes."""
+    STATE["owner"], STATE["file"] = None, None
+    return {"open": False}
+
+
+def api_forget(body):
+    """Drop a database from the list, and any remembered passphrase. The
+    file and the data are untouched."""
+    path = body["file"]
+    try:
+        items = [it for it in json.loads(RECENT.read_text())
+                 if it["file"] != path]
+        RECENT.write_text(json.dumps(items, indent=1))
+    except (OSError, ValueError):
+        pass
+    if _keyring:
+        try:
+            _keyring.delete_password(KEYRING_SERVICE, path)
+        except Exception:
+            pass
+    return {"forgotten": path}
+
+
+def api_browse(body):
+    """Everything in the database — no query to compose.
+
+    Walks whichever field can express "all values": a numeric or date field
+    covers its whole domain, and a text field is matched with the empty
+    prefix (an integer bound would be encoded as the literal string "0")."""
+    owner = need_owner()
+    schema = owner.schema
+    field = body.get("field") or next(
+        (n for n, sp in schema.items() if sp.get("kind") != "text"),
+        next(iter(schema)))
+    spec = schema[field]
+    if spec.get("kind") == "text" or spec["type"] == "str":
+        pred = {"field": field, "prefix": ""}
+    else:
+        pred = {"field": field, "lo": 0, "hi": (1 << spec["bits"]) - 1}
+    limit = max(1, min(int(body.get("limit", 200)), 2000))
+    rows = list(owner.query_stream([pred], limit=limit + 1,
+                                   order=body.get("order") or None,
+                                   after=body.get("after") or None))
+    more = len(rows) > limit
+    rows = rows[:limit]
+    return {"rows": rows_for_display(owner, rows), "count": len(rows),
+            "more": more, "cursor": rows[-1].get("_cursor") if rows else None,
+            "stats": owner.last_stats, "field": field}
+
+
 def api_aggregate(body):
     """Count and summarise a range without fetching or decrypting a row."""
     owner = need_owner()
@@ -210,6 +316,7 @@ def api_invite(_body):
 def api_accept(body):
     owner = Owner.accept(body["file"], body["passphrase"], body["invite"])
     STATE["owner"], STATE["file"] = owner, body["file"]
+    remember_db(body["file"], list(owner.schema))
     return state_payload()
 
 
@@ -227,7 +334,9 @@ ROUTES = {"/api/open": api_open, "/api/create": api_create,
           "/api/infer": api_infer, "/api/import": api_import,
           "/api/insert": api_insert, "/api/query": api_query,
           "/api/delete": api_delete, "/api/aggregate": api_aggregate, "/api/invite": api_invite,
-          "/api/accept": api_accept, "/api/maintain": api_maintain}
+          "/api/accept": api_accept, "/api/maintain": api_maintain,
+          "/api/forget": api_forget, "/api/browse": api_browse,
+          "/api/close": api_close}
 
 
 # --------------------------------------------------------------- server
@@ -247,7 +356,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(UI_HTML.encode(), ctype="text/html; charset=utf-8")
         elif path == "/api/state":
             with STATE["lock"]:
-                self._send(state_payload())
+                payload = state_payload()
+                payload["recent"] = recent_list()
+                payload["keyring"] = _keyring is not None
+                self._send(payload)
         else:
             self._send({"error": "not found"}, 404)
 

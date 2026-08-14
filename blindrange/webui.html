@@ -90,12 +90,38 @@ async function refresh(){ ST = await api('/api/state'); render(); }
 
 // ------------------------------------------------------------- welcome
 function welcome(err){
+  const mine = (ST.recent||[]).map(d=>`
+    <div class="field" style="display:flex;align-items:center;gap:10px">
+      <div style="flex:1;min-width:0">
+        <b>${esc(d.file.split('/').pop())}</b>
+        <span class="dim" style="font-size:12px"> ${esc(d.file)}</span>
+        <div class="dim" style="font-size:12px">${
+          (d.fields||[]).map(esc).join(' · ') || 'no indexed fields'}${
+          d.remembered?' · <span class="ok">unlocks on this device</span>':''}
+        </div>
+      </div>
+      ${d.remembered
+        ? `<button class="pri" onclick="quickOpen('${esc(d.file)}')">open</button>`
+        : `<input type="password" placeholder="passphrase" size="14"
+             id="pw_${esc(d.file)}"
+             onkeydown="if(event.key==='Enter')quickOpen('${esc(d.file)}')">
+           <button class="pri" onclick="quickOpen('${esc(d.file)}')">open</button>`}
+      <button onclick="forget('${esc(d.file)}')">forget</button>
+    </div>`).join('');
   return `
   <div class="center">
     <h1 class="big">blind<span>range</span></h1>
     <div class="sub">an encrypted database on machines that cannot read it —
       your keys stay in this process, on this computer</div>
     ${err?`<div class="err">${esc(err)}</div>`:''}
+    ${mine?`<h2 style="margin-bottom:8px">Your databases</h2>
+      <div class="panel">${mine}
+      <div class="dim" style="font-size:12px;margin-top:6px">
+        Only file paths are remembered here — never keys.${
+        ST.keyring?' Tick "remember" when opening to let your OS keychain hold the passphrase.'
+        :' Install the <code>keyring</code> package to unlock with your OS keychain.'}
+      </div></div>
+      <h2 style="margin:22px 0 8px">Or start something new</h2>`:''}
     <div class="cards">
       <div class="card" onclick="view('csv')">
         <h3>Start from a CSV →</h3>
@@ -159,13 +185,34 @@ function viewOpen(err){
     ${err?`<div class="err">${esc(err)}</div>`:''}
     <div class="panel">
       ${fileAndPass('my.brdb')}
+      <div class="row">${ST.keyring?`<label class="dim"
+        style="font-size:12px"><input type="checkbox" id="remember">
+        remember on this device (OS keychain)</label>`:''}</div>
       <div class="row"><button class="pri" onclick="doOpen()">open</button>
       <button onclick="view('welcome')">back</button></div>
     </div></div>`;
 }
+async function quickOpen(file){
+  const el = document.getElementById('pw_'+file);
+  try {
+    await api('/api/open', {file, passphrase: el ? el.value : ''});
+    await refresh();
+  } catch(e){ render(welcome(e.message)); }
+}
+async function closeDb(){
+  await api('/api/close', {});
+  CURSOR = null; LAST = {rows:[], stats:{}};
+  await refresh();
+}
+async function forget(file){
+  await api('/api/forget', {file});
+  await refresh();
+}
+
 async function doOpen(){
   try { await api('/api/open', {file:$('#file').value.trim(),
-                                passphrase:$('#pass').value});
+                                passphrase:$('#pass').value,
+                                remember: $('#remember')?.checked});
         await refresh(); }
   catch(e){ render(viewOpen(e.message)); }
 }
@@ -390,7 +437,9 @@ function workspace(){
     </div>`).join('') || '<div class="dim">no nodes reachable</div>';
   return `
   <h1>blind<span>range</span> <span class="dim"
-      style="font-size:13px">${esc(ST.file)}</span></h1>
+      style="font-size:13px">${esc(ST.file)}</span>
+    <button style="float:right;font-size:12px" onclick="closeDb()">switch
+      database</button></h1>
   <div class="sub">keys held here, in this process · data unreadable to every
     node storing it</div>
   <div class="grid">
@@ -406,6 +455,7 @@ function workspace(){
                  .map(([n,sp])=>`<option value="${n}">${esc(sp.label||n)}</option>`)
                  .join('')}
             </select></label>
+          <button onclick="browseAll()">show everything</button>
           <button onclick="runCount()">count only</button>
           <button onclick="view('add')">add a row</button>
           <button onclick="view('csvmore')">import CSV</button>
@@ -439,6 +489,30 @@ function workspace(){
   </div>`;
 }
 
+async function browseAll(append){
+  $('#qstats').textContent = append ? 'fetching more…' : 'loading…';
+  try {
+    const order = $('#orderby').value || null;
+    const d = await api('/api/browse', {order, after: append ? CURSOR : null});
+    CURSOR = d.cursor; LASTPREDS = null;
+    LAST = append ? {rows:[...LAST.rows, ...d.rows]} : d;
+    drawRows(LAST.rows);
+    $('#qstats').innerHTML = `everything in this database — <b>${
+      LAST.rows.length}</b> rows${d.more?
+      ` <button onclick="browseAll(true)">load more</button>`:''}`;
+  } catch(e){ $('#qstats').textContent = e.message; }
+}
+
+function drawRows(rows){
+  const cols = [...new Set(rows.flatMap(r=>Object.keys(r)))]
+               .filter(c=>c!=='_rid');
+  $('#results').innerHTML = `<thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`)
+    .join('')}<th></th></tr></thead><tbody>${
+    rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join('')}
+      <td><button class="danger" onclick="del('${r._rid}')">delete</button>
+      </td></tr>`).join('')}</tbody>`;
+}
+
 let CURSOR = null, LASTPREDS = null;
 async function runQuery(append){
   const preds = append ? LASTPREDS : [];
@@ -462,13 +536,7 @@ async function runQuery(append){
     CURSOR = d.cursor;
     LAST = append ? {rows:[...LAST.rows, ...d.rows]} : d;
     const rows = LAST.rows;
-    const cols = [...new Set(rows.flatMap(r=>Object.keys(r)))]
-                 .filter(c=>c!=='_rid');
-    $('#results').innerHTML = `<thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`)
-      .join('')}<th></th></tr></thead><tbody>${
-      rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join('')}
-        <td><button class="danger" onclick="del('${r._rid}')">delete</button>
-        </td></tr>`).join('')}</tbody>`;
+    drawRows(rows);
     const s = d.stats||{};
     $('#qstats').innerHTML = `<b>${rows.length}</b> rows${d.more?
       ` <button onclick="runQuery(true)">load more</button>`:''} ·

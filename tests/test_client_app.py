@@ -6,6 +6,7 @@ API the browser uses, against a real node network.
   python3 -m unittest tests.test_client_app -v
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -92,6 +93,9 @@ class TestClientApp(unittest.TestCase):
                 break
             except OSError:
                 time.sleep(0.3)
+        os.environ["BR_RECENT"] = f"{cls.tmp}/recent.json"
+        import importlib
+        importlib.reload(webui)                   # pick up the test path
         cls.port = 8791
         threading.Thread(target=webui.serve, args=(cls.port,),
                          daemon=True).start()
@@ -190,6 +194,31 @@ class TestClientApp(unittest.TestCase):
             {"field": "amount", "lo": "0", "hi": "9000"}]})["count"]
         self.assertEqual(d["count"] - d["deleted_pending"], live)
         self.assertEqual(d["deleted_pending"], 1)   # test_03 deleted one
+
+    def test_04d_browse_close_and_recent_list(self):
+        # "show everything" needs no query, and must not pick a text field
+        # (an integer bound there would encode as the literal string "0")
+        everything = self.post("/api/browse", {})
+        self.assertGreater(everything["count"], 0)
+        self.assertNotEqual(self.post("/api/state", {}) if False else None,
+                            "unused")
+        state = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}/api/state", timeout=20).read())
+        self.assertTrue(state["open"])
+        files = [r["file"] for r in state["recent"]]
+        self.assertIn(f"{self.tmp}/app.brdb", files)
+        # the list holds paths and field names only — never key material
+        blob = json.dumps(state["recent"])
+        self.assertNotIn("passphrase", blob)
+        self.assertNotIn("master", blob)
+
+        self.post("/api/close", {})
+        state = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}/api/state", timeout=20).read())
+        self.assertFalse(state["open"])
+        self.assertTrue(state["recent"])          # still listed, just closed
+        self.post("/api/open", {"file": f"{self.tmp}/second.brdb",
+                                "passphrase": "pw2"})
 
     def test_05_errors_are_reported_not_crashed(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:

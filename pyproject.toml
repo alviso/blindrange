@@ -10,6 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = ["cryptography>=41", "aioquic>=1.2"]
+optional-dependencies = { keychain = ["keyring>=24"] }
 keywords = ["encrypted-database", "searchable-encryption", "structured-encryption",
             "decentralized", "range-queries", "forward-privacy"]
 classifiers = [
