@@ -79,6 +79,9 @@ class Owner:
         self.pool = ThreadPoolExecutor(max_workers=32)
         self.ring = None
         self.last_stats = {}
+        self.write_acks = int(os.environ.get("BR_WRITE_ACKS", "2"))
+        self.max_inflight = int(os.environ.get("BR_MAX_INFLIGHT", "64"))
+        self._inflight = set()
         self._dialer = None                # lazy QUIC dialer thread
         self._direct = {}                  # node_id -> DirectPath
         self._no_direct_until = {}         # node_id -> retry-after ts
@@ -302,44 +305,79 @@ class Owner:
         return json.loads(b64decode(out["body_b64"]))
 
     def _put(self, kv_pairs):
-        """Replicated write with a durability floor: every key must be ACKed
-        by at least MIN_ACKS live nodes (or every reachable one, if fewer).
-        Keys that fall short — replicas dead, membership stale — are retried
-        on further ring successors, so a write never silently ends up as a
-        single copy on a node nobody else has discovered yet."""
-        MIN_ACKS = 2
+        """Replicated write that returns once each key has `write_acks`
+        confirmations, leaving the rest in flight (hedged writes).
+
+        Every replica is asked at once either way; the question is only how
+        many answers we wait for. Waiting for all of them means every batch
+        pays the slowest replica — brutal when some replicas are NAT'd and
+        reached over a relay. Waiting for one means a write lives on a single
+        node until background repair copies it, so an immediate death of that
+        node loses it: fine for logs, wrong for a ledger. Two is the default.
+
+        Never zero: galloping discovery assumes chains are dense (entry i
+        exists iff i <= end), so a key that landed nowhere would punch a hole
+        and hide every later entry in that chain. Keys short of quorum are
+        retried on further ring successors, and a key with no ack at all
+        raises rather than corrupting the chain.
+
+        Outstanding un-awaited writes are capped, otherwise returning early
+        just moves the bottleneck from the network into memory.
+        """
+        want = max(1, min(int(self.write_acks), self.ring.replicas))
         by_node = {}
         for k, v in kv_pairs:
             for nid in self.ring.route(k):
                 addr = self._addr(nid)
                 if addr:
                     by_node.setdefault(addr, []).append([k, v])
-        jobs = {a: self.pool.submit(self._post, a, "/kv", {"entries": e})
+        jobs = {self.pool.submit(self._post, a, "/kv", {"entries": e}): a
                 for a, e in by_node.items()}
         acks = {k: 0 for k, _ in kv_pairs}
-        for a, j in jobs.items():
-            if _ok(j):
-                for k, _v in by_node[a]:
-                    acks[k] += 1
+        pending = set(jobs)
+        for fut in as_completed(jobs):
+            pending.discard(fut)
+            if _ok(fut) is None:
+                continue
+            for k, _v in by_node[jobs[fut]]:
+                acks[k] += 1
+            if all(n >= want for n in acks.values()):
+                break                     # quorum reached; rest lands async
+        self._track(pending)
+
         vals = dict(kv_pairs)
-        need = min(MIN_ACKS, max(1, len(self._addr_of)))
-        weak = [k for k, n in acks.items() if n < need]
-        if weak:
-            for k in weak:
-                for nid in self.ring.route(k, self.ring.replicas + 3):
-                    if acks[k] >= need:
-                        break
-                    addr = self._addr(nid)
-                    if not addr or any(k == k2 for k2, _ in
-                                       by_node.get(addr, [])):
-                        continue
-                    try:
-                        self._post(addr, "/kv", {"entries": [[k, vals[k]]]})
-                        acks[k] += 1
-                    except OSError:
-                        continue
+        weak = [k for k, n in acks.items() if n < 1]
+        for k in weak:                    # nobody has it: must not leave a hole
+            for nid in self.ring.route(k, self.ring.replicas + 3):
+                addr = self._addr(nid)
+                if not addr:
+                    continue
+                try:
+                    self._post(addr, "/kv", {"entries": [[k, vals[k]]]})
+                    acks[k] += 1
+                    break
+                except OSError:
+                    continue
         if any(n == 0 for n in acks.values()):
             raise ConnectionError("write not durable: some keys got zero ACKs")
+
+    def _track(self, futures):
+        """Keep un-awaited writes bounded so early return cannot balloon."""
+        self._inflight = {f for f in getattr(self, "_inflight", set())
+                          if not f.done()} | set(futures)
+        if len(self._inflight) > self.max_inflight:
+            for fut in list(self._inflight):
+                _ok(fut)
+                self._inflight.discard(fut)
+                if len(self._inflight) <= self.max_inflight // 2:
+                    break
+
+    def drain(self):
+        """Wait for every outstanding background write. Call before you
+        measure durability, shut down, or assume full replication."""
+        for fut in list(getattr(self, "_inflight", set())):
+            _ok(fut)
+        self._inflight = set()
 
     def _put_nx(self, key, value):
         """Insert-if-absent on all replicas. False if any replica already had

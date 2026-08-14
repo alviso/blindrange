@@ -334,6 +334,38 @@ class TestE2E(unittest.TestCase):
         self.assertLessEqual(abs(est - sum(rows)), err,
                              "estimate escaped the leaf_width error bound")
 
+    def test_12h_write_quorum_never_leaves_holes(self):
+        """Returning before every replica acks must not break chain density:
+        galloping discovery assumes entry i exists iff i <= end, so a key
+        that landed nowhere would hide every later entry in its chain."""
+        fast = Owner.accept(f"{self.tmp}/quorum.brdb", "q pass",
+                            self.owner.invite())
+        fast.write_acks = 1                      # return on the first ack
+        rows = [{"amount": 700_000 + i, "day": 500, "name": "quor" + str(i),
+                 "row": 60_000 + i} for i in range(120)]
+        fast.insert_many(rows)
+        fast.drain()                             # let the rest land
+
+        got = sorted(r["row"] for r in fast.query("amount", 700_000, 700_200))
+        self.assertEqual(got, sorted(r["row"] for r in rows))
+        # and another writer sees the same chain, densely
+        also = sorted(r["row"] for r in
+                      self.owner.query("amount", 700_000, 700_200))
+        self.assertEqual(also, sorted(r["row"] for r in rows))
+        self.rows.extend(rows)
+
+    def test_12i_inflight_writes_stay_bounded(self):
+        fast = Owner.open(f"{self.tmp}/quorum.brdb", "q pass")
+        fast.write_acks, fast.max_inflight = 1, 8
+        for i in range(6):
+            fast.insert_many([{"amount": 800_000 + i, "day": 1, "name": "bnd",
+                               "row": 70_000 + i}])
+            self.assertLessEqual(len(fast._inflight), 8 + self.owner.ring.replicas)
+        fast.drain()
+        self.assertEqual(len(fast._inflight), 0)
+        self.rows.extend([{"amount": 800_000 + i, "day": 1, "name": "bnd",
+                           "row": 70_000 + i} for i in range(6)])
+
     def test_13_unauthenticated_requests_rejected(self):
         import json as _json
         req = urllib.request.Request(

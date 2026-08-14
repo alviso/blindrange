@@ -68,14 +68,25 @@ def main():
                     help="timestamp leaf_width in seconds (power of two); "
                          "4096 is about 68 minutes")
     ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--bootstrap", help="benchmark an existing network "
+                                        "instead of spawning local nodes")
+    ap.add_argument("--secret", default="bench")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep the database file (for a later delete run)")
+    ap.add_argument("--state", help="database file path")
     ap.add_argument("--lean", action="store_true",
                     help="index only the timestamp — the cheapest useful log "
                          "schema")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="blindrange_bench_")
-    secret = "bench"
-    procs, _ports = start_nodes(tmp, a.nodes, secret)
+    secret = a.secret
+    if a.bootstrap:
+        procs, bootstrap = [], a.bootstrap
+        print(f"\n  benchmarking the live network at {bootstrap}")
+    else:
+        procs, _ports = start_nodes(tmp, a.nodes, secret)
+        bootstrap = "127.0.0.1:7901"
     try:
         span = a.days * 86400
         bits = max(1, (span - 1).bit_length())
@@ -96,8 +107,10 @@ def main():
         print(f"  {'':14}" + " ".join(f"{n}={max_level(s['bits'], s['leaf_width'])}"
                                       for n, s in schema.items()))
 
-        owner = Owner.create(f"{tmp}/logs.brdb", "pw", schema,
-                             [f"127.0.0.1:7901"], network_secret=secret)
+        state = a.state or f"{tmp}/logs.brdb"
+        owner = Owner.create(state, "pw", schema, [bootstrap],
+                             network_secret=secret)
+        print(f"  database: {state}")
 
         rng = random.Random(7)
         rows = [{"ts": rng.randrange(span),
@@ -114,14 +127,17 @@ def main():
         for i in range(0, len(rows), a.batch):
             owner.insert_many(rows[i:i + a.batch])
             done += len(rows[i:i + a.batch])
-            if done % max(a.batch, a.records // 5) == 0 or done == len(rows):
+            step = max(a.batch, min(20000, a.records // 5))
+            if done % step == 0 or done == len(rows):
                 el = time.time() - t0
                 prev_done, prev_el = marks[-1] if marks else (0, 0.0)
                 marginal = (done - prev_done) / max(1e-9, el - prev_el)
                 marks.append((done, el))
-                print(f"    {done:>8,} records  {el:7.1f}s  "
+                eta = (len(rows) - done) / max(1e-9, marginal) / 60
+                print(f"    {done:>9,} records  {el:7.1f}s  "
                       f"avg {done / el:7,.0f} rec/s  "
-                      f"marginal {marginal:7,.0f} rec/s")
+                      f"marginal {marginal:7,.0f} rec/s  "
+                      f"eta {eta:5.1f} min", flush=True)
         total = time.time() - t0
         rate = a.records / total
 
@@ -174,7 +190,8 @@ def main():
             if p.poll() is None:
                 p.terminate()
             p.wait()
-        shutil.rmtree(tmp, ignore_errors=True)
+        if not a.keep:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
