@@ -95,7 +95,7 @@ def main():
     after_keys = network_keys(a.bootstrap)
     print(f"    {stats} in {comp_s:.1f}s")
     print(f"  node keys: {before_keys:,} -> {after_keys:,} "
-          f"({before_keys - after_keys:+,})")
+          f"({after_keys - before_keys:+,} reclaimed on one node)")
     print(f"\n  totals: enumerate {enum_s:.0f}s · delete {del_s:.0f}s · "
           f"compact {comp_s:.0f}s\n")
 
