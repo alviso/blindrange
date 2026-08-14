@@ -1273,6 +1273,42 @@ class Owner:
         return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
 
 
+    def drop(self, confirm=False):
+        """Remove every key of this database from the network.
+
+        The direct path for "I am finished with this dataset". Deleting the
+        rows and compacting would write a tombstone per record, rewrite the
+        whole index into a new epoch, and only then delete — far more work
+        than deriving every key this database owns and removing it. Nothing
+        else can be affected: the keys are PRFs of this master key.
+
+        The .brdb file is left alone; delete it yourself if you want the key
+        gone too — but drop first, or the keys stay on the nodes forever
+        with no way left to name them.
+        """
+        if not confirm:
+            raise ValueError("drop() erases everything; pass confirm=True")
+        writers = self._refresh_writers()
+        k_t = self._k_w(TOMB)
+        keys, rids = [], set()
+        for E in range(0, self._st["epoch"] + 1):
+            entries, index_keys = self._walk_epoch(E, writers)
+            keys += index_keys
+            for lst in entries.values():
+                rids.update(lst)
+            t_ends = self._discover_ends(
+                {u: ((lambda i, e=E, u=u: self._ut(k_t, e, u, i)), 0)
+                 for u in writers}) if writers else {}
+            for u, c in t_ends.items():
+                keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
+        keys += ["R:" + r for r in rids]
+        keys += [self._sys_key(b"epoch", i)
+                 for i in range(1, self._st["epoch_len"] + 1)]
+        keys += [self._sys_key(b"registry", i)
+                 for i in range(1, self._st["reg_len"] + 1)]
+        self._delete(keys)
+        return {"keys_removed": len(keys), "records": len(rids)}
+
     def purge_epochs(self, upto=None):
         """Delete leftover keys from epochs older than the current one.
 
