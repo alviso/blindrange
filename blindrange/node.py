@@ -779,6 +779,11 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
                  quic=None, public_status=False):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"      # keep-alive: reused connections
+        # Responses go out as headers-then-body, two small writes. With Nagle
+        # on, the second waits for an ACK of the first, so a request costs
+        # ~2 round trips instead of 1 — invisible on localhost, brutal across
+        # an ocean (measured 430ms against a 187ms RTT).
+        disable_nagle_algorithm = True
 
         def _json(self, obj, code=200):
             body = json.dumps(obj).encode()

@@ -10,6 +10,7 @@ connections.
 """
 import http.client
 import json
+import socket
 import threading
 from collections import defaultdict
 
@@ -44,7 +45,11 @@ class Pool:
             if fresh:
                 host, _, port = addr.rpartition(":")
                 conn = http.client.HTTPConnection(host, int(port),
-                                                 timeout=timeout)
+                                                  timeout=timeout)
+                conn.connect()
+                # same reasoning as the server side: small request writes
+                # must not wait on delayed ACKs
+                conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 if conn.sock is not None:
                     conn.sock.settimeout(timeout)
