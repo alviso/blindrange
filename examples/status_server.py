@@ -27,7 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from blindrange.node import status_html  # noqa: E402
 from blindrange import receipt  # noqa: E402
 
-# Anonymous audit reports, kept in memory only.
+# Anonymous audit reports. Held in memory and, if BR_REPORT_STATE is set,
+# checkpointed to disk so a deploy does not erase them (see _save/_load).
 #
 # What we deliberately do NOT keep: who sent a report, when beyond a coarse
 # bucket, or anything joinable across submissions. Reports carry no owner or
@@ -99,6 +100,51 @@ def _fresh_sig(sig, now):
     return True
 
 
+# Reports have to outlive a restart. They are evidence a node earned its
+# share, and this process restarts on every deploy — which silently reset
+# every node to "unproved, 0 per-mille" and made a routine deploy erase the
+# basis for paying people. Persisted state changes nothing about what is
+# kept: still no owner, no database, no submitter, just (timestamp, rate)
+# per node inside the same 6h expiry window, plus the spent signatures so
+# a restart cannot reopen a replay window.
+STATE_PATH = os.environ.get("BR_REPORT_STATE", "")     # empty = memory only
+
+
+def _save():
+    if not STATE_PATH:
+        return
+    try:
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"reports": {n: list(dq) for n, dq in REPORTS.items()},
+                       "sigs": list(SEEN_SIGS)}, f)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass                        # durability is best-effort, never fatal
+
+
+def _load():
+    if not STATE_PATH:
+        return
+    try:
+        with open(STATE_PATH) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    cutoff = time.time() - REPORT_MAX_AGE
+    with REPORT_LOCK:
+        for nid, rows in (saved.get("reports") or {}).items():
+            dq = REPORTS[nid]
+            for ts, rate in rows:
+                if ts >= cutoff:       # expiry still applies across restarts
+                    dq.append((ts, rate))
+            while len(dq) > REPORT_WINDOW:
+                dq.popleft()
+        for ts, sig in (saved.get("sigs") or []):
+            SEEN_SIGS.append((ts, sig))
+            SEEN_SET.add(sig)
+
+
 def score_groups(payload, now):
     """Turn a report into per-node rates, trusting only what nodes signed.
 
@@ -163,6 +209,7 @@ def record_report(payload):
             accepted += 1
     if not accepted:
         raise ValueError("no corroborated node receipts in report")
+    _save()
     return {"accepted": accepted}
 
 
@@ -321,6 +368,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     a = ap.parse_args()
+    _load()                               # survive deploys
     threading.Thread(target=_restart_on_new_code, daemon=True).start()
     threading.Thread(target=refresh_loop, args=(a.node,), daemon=True).start()
     time.sleep(1.5)                       # let the first snapshot land
