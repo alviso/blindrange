@@ -89,6 +89,56 @@ def possession():
         return out
 
 
+# The page must never do network I/O while a browser waits. Fetching node
+# stats can involve a relay round trip to a NAT'd tenant, so a request that
+# rendered inline stalled for seconds and sometimes timed out. A background
+# thread refreshes a snapshot; requests serve whatever is current, instantly.
+SNAPSHOT = {"at": 0.0, "data": None, "error": None}
+
+
+def refresh_loop(node_addr, every=15):
+    while True:
+        try:
+            with urllib.request.urlopen(
+                    f"http://{node_addr}/status.json", timeout=20) as r:
+                SNAPSHOT["data"] = json.loads(r.read())
+                SNAPSHOT["error"] = None
+        except Exception as e:                       # keep the last good one
+            SNAPSHOT["error"] = f"{type(e).__name__}: {e}"
+        SNAPSHOT["at"] = time.time()
+        time.sleep(every)
+
+
+def with_shares(data):
+    """Attach each node's share of a distribution pool, in per-mille.
+
+    Share = structural x quality. Structural is a node's position on the
+    ring, which is uniform today, so it need not be claimed by anyone.
+    Quality is proved possession from anonymous audits — a node with no
+    audits yet is marked unverified and earns nothing, since paying for
+    unproved storage is exactly what the audits exist to prevent.
+
+    Illustrative only: a share of a pool, not an entitlement, and not money.
+    """
+    seen = possession()
+    rows = data.get("nodes", [])
+    live = [r for r in rows if r.get("mode") != "down"]
+    weights = {}
+    for r in rows:
+        m = seen.get(r["id"])
+        r["measured"] = m
+        structural = 1.0 / max(1, len(live)) if r in live else 0.0
+        quality = m["rate"] if m else 0.0
+        weights[r["id"]] = structural * quality
+    total = sum(weights.values())
+    for r in rows:
+        r["share"] = (round(1000 * weights[r["id"]] / total)
+                      if total > 0 else None)
+    data["pool_covered"] = round(
+        100 * sum(1 for r in rows if r.get("measured")) / max(1, len(rows)))
+    return data
+
+
 def make_handler(node_addr):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -97,13 +147,11 @@ def make_handler(node_addr):
                             "/possession.json"):
                 self.send_error(404)
                 return
-            try:
-                with urllib.request.urlopen(
-                        f"http://{node_addr}/status.json", timeout=5) as r:
-                    data = json.loads(r.read())
-            except OSError:
-                self.send_error(502, "node unreachable")
+            data = SNAPSHOT["data"]
+            if data is None:
+                self.send_error(503, SNAPSHOT["error"] or "warming up")
                 return
+            data = with_shares(json.loads(json.dumps(data)))
             if path == "/possession.json":
                 body = json.dumps(possession()).encode()
                 self.send_response(200)
@@ -118,9 +166,6 @@ def make_handler(node_addr):
                 body = json.dumps(data).encode()
                 ctype = "application/json"
             else:
-                seen = possession()
-                for row in data["nodes"]:
-                    row["measured"] = seen.get(row["id"])
                 body = status_html(data["nodes"], data["keys"],
                                    node_addr).encode()
                 ctype = "text/html; charset=utf-8"
@@ -187,6 +232,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     a = ap.parse_args()
     threading.Thread(target=_restart_on_new_code, daemon=True).start()
+    threading.Thread(target=refresh_loop, args=(a.node,), daemon=True).start()
+    time.sleep(1.5)                       # let the first snapshot land
     ThreadingHTTPServer((a.host, a.port),
                         make_handler(a.node)).serve_forever()
 

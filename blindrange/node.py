@@ -574,7 +574,7 @@ th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--dim);font-weight:normal;font-size:12px;
 text-transform:uppercase;letter-spacing:.08em}
 td.id{color:var(--gold)}td.num{text-align:right;font-variant-numeric:tabular-nums}
-td.ver{color:var(--ok)}td.behind{color:#e0b060}
+td.ver{color:var(--ok)}td.behind{color:#e0b060}td.share{color:var(--acc)}
 .note{background:var(--panel);border:1px solid var(--line);border-radius:10px;
 padding:16px 18px;color:var(--dim);font-size:13.5px;margin-bottom:16px}
 .note b{color:var(--txt);font-weight:normal}
@@ -592,7 +592,9 @@ def status_html(rows, total, seed_addr):
         f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
         f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
         f"{' · behind' if r.get('behind') else ''}</td>"
-        f"<td class='num'>{r['age']}s</td></tr>" for r in rows)
+        f"<td class='num'>{r['age']}s</td>"
+        f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
+        f"</tr>" for r in rows)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>blindrange — public network status</title><style>{STATUS_CSS}</style>
@@ -602,7 +604,7 @@ def status_html(rows, total, seed_addr):
 <p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
 encrypted keys stored</p>
 <table><tr><th>node</th><th>reachability</th><th>keys (self-reported)</th>
-<th>possession (proved)</th><th>version</th><th>last seen</th></tr>
+<th>possession (proved)</th><th>version</th><th>last seen</th><th>share ‰</th></tr>
 {body}</table>
 <div class="note"><b>Key counts on this page are self-reported and
 unverified.</b> A node returns whatever number it likes; nothing here checks
@@ -620,6 +622,11 @@ what.</div>
 never configured for it — they diagnosed their own reachability and now
 receive traffic over an outbound connection, with direct QUIC paths punched
 when the networks allow.</div>
+<div class="note"><b>share ‰</b> is each node's slice of a distribution pool
+per thousand — 500 would be half of everything. It is structural position on
+the ring multiplied by <b>proved</b> possession, so a node with no audits yet
+earns nothing and a node that self-reports generously earns nothing extra.
+Illustrative: a share of a pool, not an entitlement, and not money.</div>
 <div class="foot">join with two commands ·
 <a href="https://blindrange.dev">blindrange.dev</a> ·
 <a href="https://github.com/alviso/blindrange">source</a><br>
