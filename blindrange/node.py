@@ -113,6 +113,7 @@ def _read_version():
 
 
 VERSION_STR, BUILD = _read_version()
+RUNNING_COMMIT = _git("rev-parse", "HEAD")   # the code THIS process imported
 
 
 def code_version():
@@ -134,9 +135,6 @@ def _update_loop(secret):
     while True:
         time.sleep(UPDATE_EVERY + random.random() * 30)   # stagger the fleet
         try:
-            before = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
-                                    capture_output=True, text=True,
-                                    timeout=20).stdout.strip()
             pull = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
                                   capture_output=True, text=True, timeout=120)
             if pull.returncode != 0:
@@ -144,8 +142,17 @@ def _update_loop(secret):
             after = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                                    capture_output=True, text=True,
                                    timeout=20).stdout.strip()
-            if after and after != before:
-                print(f"auto-update: {before[:8]} -> {after[:8]}, restarting",
+            # Compare against the code this PROCESS imported, not against HEAD
+            # before the pull. Those differ whenever the checkout moved by any
+            # other route — a maintainer committing locally, an operator
+            # running `git pull` by hand — and then the pull is a no-op,
+            # before == after, and the node serves stale code indefinitely
+            # while still reporting itself as merely 'behind'. A node stuck
+            # that way now proves nothing and earns nothing, so silently
+            # never restarting is expensive.
+            if after and RUNNING_COMMIT and after != RUNNING_COMMIT:
+                print(f"auto-update: {RUNNING_COMMIT[:8]} -> {after[:8]}, "
+                      f"restarting",
                       file=sys.stderr, flush=True)
                 # Re-exec rather than exit. Exiting only works under a
                 # supervisor, and a node started by hand in a terminal would
