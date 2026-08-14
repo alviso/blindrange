@@ -247,10 +247,17 @@ Privacy is the cheap option here; resolution is the thing that costs money.</p>
   </div>
 </div>
 
+<p class="dim">Where that lands, per GB of <em>your</em> data: about
+<b>$0.02</b> for 1 kB documents indexed coarsely (roughly S3), <b>$0.08</b>
+for hourly-resolution logs, <b>$0.17</b> if you index those logs to the
+minute. Object-storage prices at one end, database prices at the other, and
+your schema is what decides which — because fine resolution genuinely costs
+us more to hold.</p>
+
 <table>
   <tr><th>Plan</th><th>Network storage</th><th>Price</th></tr>
   <tr><td class="k">Free</td><td>first 10 GB</td><td>$0 — no card</td></tr>
-  <tr><td class="k">Beyond that</td><td>per GB-month</td><td>$0.02</td></tr>
+  <tr><td class="k">Beyond that</td><td>per GB-month</td><td>$0.005</td></tr>
   <tr><td class="k">Queries</td><td>unmetered</td><td>included</td></tr>
 </table>
 <p class="note"><b>Being straight about the free tier:</b> the network
@@ -352,7 +359,7 @@ privacy, and the attack literature it takes seriously
 
 <script>
 // Pricing knobs — change these two numbers and the whole page follows.
-const FREE_GB = 10, USD_PER_GB_MONTH = 0.02;
+const FREE_GB = 10, USD_PER_GB_MONTH = 0.005;
 // Storage model, fitted to a real 3-node network at 0.00% error and
 // independently derivable from the wire format.
 const RF = 3, INDEX_ENTRY_B = 46, KEY_PREFIX_B = 18, AEAD_OVERHEAD_B = 28;
@@ -456,7 +463,8 @@ function draw() {
     // Never round a real charge down to "$0.00" — on a page whose whole
     // claim is that the numbers are honest, showing free when it isn't is
     // the one rounding error that actually costs trust.
-    el.textContent = cost < 0.01 ? "under $0.01" : "$" + cost.toFixed(2);
+    el.textContent = (cost < 0.01 ? "$" + cost.toFixed(4)
+                              : "$" + cost.toFixed(2));
     el.className = "big paid";
   }
 
