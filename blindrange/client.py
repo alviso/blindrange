@@ -1273,6 +1273,40 @@ class Owner:
         return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
 
 
+    def purge_epochs(self, upto=None):
+        """Delete leftover keys from epochs older than the current one.
+
+        Compaction is supposed to remove the epoch it rewrote, but a failed
+        or interrupted delete leaves entries nothing points at: no chain
+        references them, no reader will ever fetch them, and they occupy
+        space forever. They are still findable, because keys are
+        deterministic — the same walk compaction used re-derives them, and
+        galloping rediscovers the chain lengths precisely because those
+        entries are still on the nodes.
+
+        Safe to run any time and safe to repeat: it only ever derives keys
+        of THIS database, never touches the current epoch, and finds nothing
+        once an epoch is clean.
+        """
+        self._refresh_epoch()
+        writers = self._refresh_writers()
+        current = self._st["epoch"]
+        last = current - 1 if upto is None else min(int(upto), current - 1)
+        k_t = self._k_w(TOMB)
+        removed, epochs = 0, []
+        for E in range(0, last + 1):
+            _entries, keys = self._walk_epoch(E, writers)
+            t_ends = self._discover_ends(
+                {u: ((lambda i, e=E, u=u: self._ut(k_t, e, u, i)), 0)
+                 for u in writers}) if writers else {}
+            for u, c in t_ends.items():
+                keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
+            if keys:
+                self._delete(keys)
+                removed += len(keys)
+                epochs.append(E)
+        return {"epochs_purged": epochs, "keys_removed": removed}
+
     # ------------------------------------------------------------- repair
     def repair(self):
         """Anti-entropy sweep: walk everything reachable (system chains, the
