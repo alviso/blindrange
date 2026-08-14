@@ -28,6 +28,33 @@ whether the profile fits your risk tolerance. It is **not** appropriate for
 healthcare data or high-stakes PII; it is aimed at ordinary business data on
 infrastructure you don't fully trust.
 
+## What it's for
+
+blindrange is not a faster or more capable database. If you are content to
+trust a provider, use Postgres or a managed service — exact aggregates,
+joins, transactions, decades of tooling, and none of the trade-offs on this
+page.
+
+It is a database that **survives not trusting anyone**. Every other property
+here follows from removing the trusted party:
+
+- **No operator to trust, so no compliance surface.** Nodes cannot read what
+  they store, so data residency, subprocessor review, insider access and
+  storage-layer breach exposure stop being questions you have to answer about
+  someone else's staff and hardware.
+- **Durability from machines you don't own.** Replication, self-healing and
+  survival of node death — provided by hardware whose operators learn nothing
+  from providing it.
+- **Nothing to revoke.** No account to suspend, no provider whose pricing
+  change, acquisition or shutdown takes your database with it.
+- **Storage from spare capacity.** Structurally cheaper than a hyperscaler's,
+  with no egress fees. Cost alone rarely justifies a migration; combined with
+  the above it can.
+
+The honest test: if you can name the party you would rather not have to
+trust, this is for you. If you can't, it isn't — and a managed database will
+serve you better.
+
 ## How it works
 
 ```mermaid
