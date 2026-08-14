@@ -1357,6 +1357,43 @@ class Owner:
                                if r["responsible"] else None)
         return {"sampled_records": len(rids), "nodes": report}
 
+    # Sample sizes are fixed, never chosen by the caller, so a report
+    # cannot encode how much data the reporter holds.
+    REPORT_SAMPLE = 100
+
+    def audit_report(self):
+        """A publishable audit result that reveals nothing about you.
+
+        Payouts and reputation need to know how well nodes hold data, but a
+        naive report — "owner A verified 40,312 keys on nodes X, Y, Z" —
+        hands an aggregator exactly the co-occurrence map this project
+        destroys. So a report carries:
+
+          * no owner or database identifier, and nothing derived from the
+            master key,
+          * a FIXED sample size, so the numbers cannot encode how much data
+            the reporter stores,
+          * rates only — verified out of sampled — never absolute counts.
+
+        What remains is which nodes were sampled, and that is not sensitive
+        here: placement is uniform, so any database of real size lands on
+        essentially every node. The answer is always "all of them".
+
+        Volume deliberately does not appear. A node's expected share is
+        structural — its position on the ring — so it never needs to claim
+        anything, and the most forgeable input to a payout simply does not
+        exist.
+        """
+        audit = self.audit(sample=self.REPORT_SAMPLE)
+        nodes = {}
+        for nid, v in audit["nodes"].items():
+            if not v["responsible"]:
+                continue
+            nodes[nid] = {"sampled": v["responsible"],
+                          "verified": v["verified"],
+                          "latency_ms": v["latency_ms"]}
+        return {"kind": "blindrange-audit", "v": 1, "nodes": nodes}
+
     def drop(self, confirm=False):
         """Remove every key of this database from the network.
 

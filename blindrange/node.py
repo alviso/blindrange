@@ -587,6 +587,8 @@ def status_html(rows, total, seed_addr):
     body = "".join(
         f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
         f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
+        f"<td class='{'ver' if (r.get('measured') or {}).get('rate', 0) >= 0.9 else 'behind'}'>"
+        f"{(str(int((r['measured']['rate']) * 100)) + '% · ' + str(r['measured']['reports']) + ' audits') if r.get('measured') else '—'}</td>"
         f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
         f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
         f"{' · behind' if r.get('behind') else ''}</td>"
@@ -600,7 +602,7 @@ def status_html(rows, total, seed_addr):
 <p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
 encrypted keys stored</p>
 <table><tr><th>node</th><th>reachability</th><th>keys (self-reported)</th>
-<th>version</th><th>last seen</th></tr>
+<th>possession (proved)</th><th>version</th><th>last seen</th></tr>
 {body}</table>
 <div class="note"><b>Key counts on this page are self-reported and
 unverified.</b> A node returns whatever number it likes; nothing here checks
