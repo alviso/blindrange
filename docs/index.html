@@ -197,11 +197,13 @@ crypto in the hot path.</p>
 
 <h2 id="pricing">Pricing</h2>
 <p>You are charged for what the network actually holds, not for the size of
-your JSON — and those differ by <b>20–35×</b>, because a record is one
-ciphertext blob <em>plus one index entry per dyadic level per indexed
-field</em>, all of it replicated three times. Hiding that behind a
-per-gigabyte-of-your-data price would mean guessing, so instead the formula
-is published and exact:</p>
+your JSON — and those differ by anywhere from <b>5× to 40×</b>, because a
+record is one ciphertext blob <em>plus one index entry per dyadic level per
+indexed field</em>, all of it replicated three times. Small records indexed
+finely are the expensive end; large records indexed coarsely are the cheap
+one. Hiding a spread that wide behind a per-gigabyte-of-your-data price
+would mean guessing on your behalf, so instead the formula is published and
+exact:</p>
 
 <pre>keys per record   = 3 × (1 + Σ levels)          <span class="c">levels = log2(domain ÷ leaf_width)</span>
 bytes per record  = 3 × (blob + 46 × Σ levels)  <span class="c">46 B per index entry, measured</span></pre>
@@ -214,7 +216,7 @@ Privacy is the cheap option here; resolution is the thing that costs money.</p>
 <div class="calc">
   <div class="row">
     <label for="recs">Records</label>
-    <input type="number" id="recs" value="5000000" min="0" step="100000">
+    <input type="number" id="recs" value="2000000" min="0" step="100000">
     <span class="note">rows you expect to store</span>
   </div>
   <div class="row">
@@ -447,13 +449,15 @@ function draw() {
     mine ? (netBytes / mine).toFixed(1) + "×" : "—";
 
   const el = document.getElementById("cost");
-  if (gb <= FREE_GB) {
+  if (billable <= 0) {
     el.textContent = "free";
     el.className = "big";
   } else {
-    el.textContent = "$" + cost.toFixed(2);
+    // Never round a real charge down to "$0.00" — on a page whose whole
+    // claim is that the numbers are honest, showing free when it isn't is
+    // the one rounding error that actually costs trust.
+    el.textContent = cost < 0.01 ? "under $0.01" : "$" + cost.toFixed(2);
     el.className = "big paid";
-    el.classList.add("paid");
   }
 
   const parts = fields.map(f =>
