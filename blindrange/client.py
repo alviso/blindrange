@@ -55,7 +55,7 @@ import os
 from .transport import POOL
 from . import direct as direct_mod
 from base64 import b64decode, b64encode
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -373,44 +373,63 @@ class Owner:
             _ok(j)
 
     def _mget(self, keys):
-        """Replica lookup in two PARALLEL phases: the whole replica set at
-        once, then (only for keys still missing) the extended probe levels —
-        covering keys written under an earlier ring. Latency is 1 round trip
-        for hits and 2 for misses, regardless of replica count; the cost is
-        querying all replicas instead of stopping at the first hit, which is
-        the right trade when hops traverse relays. Read-repair: any found key
-        whose current primary did not answer is rewritten to that primary, so
-        data migrates as the ring changes."""
+        """Replica lookup in two parallel phases, with hedged reads.
+
+        Every replica is asked at once, but we stop waiting the moment every
+        requested key has an answer — a slow or relayed replica can no longer
+        hold up a query, and it costs no extra requests because they were
+        already in flight. Keys nobody answers fall through to a second
+        parallel round over further ring successors, covering data written
+        under an earlier ring.
+
+        Absence still requires hearing from every replica (one node's "no"
+        could just be a node that has not been repaired yet), so existence
+        probes do not benefit — hits do, which is where query time goes.
+
+        Read-repair: a key found elsewhere while its current primary
+        *answered without it* is rewritten to that primary. A primary that
+        merely never replied is left alone, so hedging cannot cause spurious
+        repair writes.
+        """
         PROBE_EXTRA = 3
         R = self.ring.replicas
         route = {k: [self._addr(n) for n in
                      self.ring.route(k, R + PROBE_EXTRA) if self._addr(n)]
                  for k in keys}
-        out, holders = {}, {}
+        out, holders, replied = {}, {}, set()
 
         def fan(lo, hi, pending):
             by_node = {}
             for k in pending:
                 for a in route[k][lo:hi]:
                     by_node.setdefault(a, []).append(k)
-            jobs = {a: self.pool.submit(self._post, a, "/mget", {"keys": ks})
+            jobs = {self.pool.submit(self._post, a, "/mget", {"keys": ks}): a
                     for a, ks in by_node.items()}
-            for a, j in jobs.items():
-                vals = _ok(j)
-                if vals:
-                    for k, v in vals["values"].items():
-                        out[k] = v
-                        holders.setdefault(k, set()).add(a)
+            missing = set(pending)
+            for fut in as_completed(jobs):
+                addr = jobs[fut]
+                try:
+                    vals = fut.result()["values"]
+                except OSError:
+                    continue                     # replica down; others cover
+                replied.add(addr)
+                for k, v in vals.items():
+                    out[k] = v
+                    holders.setdefault(k, set()).add(addr)
+                missing -= set(vals)
+                if not missing:
+                    return set()                 # hedged: ignore stragglers
+            return missing
 
-        fan(0, R, list(keys))
-        missing = [k for k in keys if k not in out]
+        missing = fan(0, R, list(keys))
         if missing:
             fan(R, R + PROBE_EXTRA, missing)
         by_primary = {}
-        for k, v in out.items():
+        for k in out:
             primary = route[k][0] if route[k] else None
-            if primary and primary not in holders.get(k, ()):
-                by_primary.setdefault(primary, []).append([k, v])
+            if (primary and primary in replied
+                    and primary not in holders.get(k, ())):
+                by_primary.setdefault(primary, []).append([k, out[k]])
         for a, e in by_primary.items():
             self.pool.submit(self._post, a, "/kv", {"entries": e})
         return out
@@ -873,8 +892,14 @@ class Owner:
                        for f, lo, hi in bounds if f in rec):
                     rec["_rid"] = key[2:]
                     rows.append(rec)
+            # Deterministic order within a batch: cursors index into this
+            # list, and replies now arrive in whatever order the network
+            # returns them (hedged reads), so the sort must not depend on it.
             if order:
-                rows.sort(key=lambda r: self._encode(order, r[order]))
+                rows.sort(key=lambda r: (self._encode(order, r[order]),
+                                         r["_rid"]))
+            else:
+                rows.sort(key=lambda r: r["_rid"])
             for n, rec in enumerate(rows):
                 if base == start_unit and n < seen_in_unit:
                     continue                       # already delivered
