@@ -404,6 +404,23 @@ the marginal rate is the honest one to quote — and why rotating databases by
 period (one per day or week) is the right pattern for logs. Independent
 databases coexist invisibly on the same nodes, so rotation costs nothing.
 
+On the **public network** (client in Canada, seed in Germany, two nodes
+behind separate home NATs), ingesting the same log workload:
+
+| | rec/s | note |
+|---|---|---|
+| first run | 317 | network nearly empty |
+| after the fixes below | **1,009** | network already holding ~22M keys |
+
+Three things accounted for that, all found by measuring rather than guessing:
+responses were written as headers-then-body so **Nagle** added a round trip
+to every request (430ms against a 187ms RTT); writes waited for *every*
+replica, so each batch paid the one distant node (**hedged writes** return at
+quorum); and the client's liveness window was stricter than the node's own
+TTL, so under load it **dropped live nodes**, shrinking the ring until quorum
+had to wait on the far seed. The two NAT'd nodes are reached at 1ms and 13ms
+over punched QUIC paths — the far one is the slow one, not the hidden ones.
+
 **Reads do not degrade with size**, because a range collapses to a handful of
 intervals whatever the database holds:
 
