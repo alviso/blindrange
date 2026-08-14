@@ -75,20 +75,40 @@ CACHE_KB = int(os.environ.get("BR_CACHE_KB", "32000"))   # SQLite page cache
 UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "900"))   # 15 min
 
 
-def code_version():
-    """Package version plus the checkout's commit, when running from git."""
-    commit = ""
+def _git(*args):
     try:
         import subprocess
         repo = Path(__file__).resolve().parent.parent
-        out = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short",
-                              "HEAD"], capture_output=True, text=True,
-                             timeout=5)
-        if out.returncode == 0:
-            commit = out.stdout.strip()
+        out = subprocess.run(["git", "-C", str(repo), *args],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
-        pass
-    return f"{VERSION}+{commit}" if commit else VERSION
+        return ""
+
+
+def _read_version():
+    """Version of the code THIS PROCESS loaded.
+
+    Captured once at import, never re-read: the checkout can move under a
+    running process (that is exactly what auto-update does), and a node that
+    reports its working tree rather than its running code makes the whole
+    'who is behind' question useless.
+
+    build is the commit count — an integer that increases along a
+    fast-forward history. Commit hashes have no order, so comparing version
+    strings silently ranks a1b2c3 above 9f8e7d.
+    """
+    commit = _git("rev-parse", "--short", "HEAD")
+    count = _git("rev-list", "--count", "HEAD")
+    return (f"{VERSION}+{commit}" if commit else VERSION,
+            int(count) if count.isdigit() else 0)
+
+
+VERSION_STR, BUILD = _read_version()
+
+
+def code_version():
+    return VERSION_STR
 
 
 def _update_loop(secret):
@@ -495,19 +515,20 @@ def status_rows(store, peers, secret, hub):
         stats = (None if nid == me else
                  _peer_stats(nid, e, secret, hub, me))
         keys = store.count() if nid == me else (stats or {}).get("keys")
-        ver = (code_version() if nid == me
+        ver = (VERSION_STR if nid == me
                else (stats or {}).get("version") or "unknown")
+        build = BUILD if nid == me else (stats or {}).get("build", 0)
         if keys:
             total += keys
         rows.append({"id": nid, "mode": "relay tenant" if is_via(e["addr"])
                      else "directly reachable", "keys": keys, "version": ver,
+                     "build": build or 0,
                      "age": round(now - e["ts"] / 1000, 1)})
-    newest = max((r["version"] for r in rows
-                  if r["version"] != "unknown"), default="")
-    # a node that cannot report a version is running code older than the
-    # version field itself, so it is behind by definition
+    # compare commit COUNTS: hashes have no order, and a node too old to
+    # report one is behind by definition
+    newest = max((r["build"] for r in rows), default=0)
     for r in rows:
-        r["behind"] = r["version"] != newest
+        r["behind"] = r["build"] < newest
     STATUS_CACHE.update({"at": now, "rows": rows, "total": total})
     return rows, total
 
@@ -592,7 +613,7 @@ def service_get(store, peers, path, query, quic=None, status=None):
                      "peers": len(peers.live()),
                      "mode": "tenant" if is_via(peers.addr) else "direct",
                      "quic": quic is not None, "udp": peers.udp,
-                     "version": code_version()}
+                     "version": VERSION_STR, "build": BUILD}
     if path == "/intel":
         n = int(parse_qs(query).get("limit", ["4"])[0])
         return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
