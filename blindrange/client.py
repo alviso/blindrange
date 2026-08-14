@@ -55,6 +55,7 @@ import os
 import time
 from .transport import POOL
 from . import direct as direct_mod
+from . import receipt
 from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -250,6 +251,11 @@ class Owner:
                                       hashlib.sha256).hexdigest()}
 
     def _post(self, addr, path, payload):
+        if path == "/mget" and "nonce" not in payload:
+            # Every read asks to be signed, not just audits. The receipt is
+            # ignored on the ordinary path; what matters is that a node
+            # watching its traffic cannot pick the audits out of it.
+            payload = {**payload, "nonce": os.urandom(16).hex()}
         body = json.dumps(payload).encode()
         if addr.startswith("via:"):                    # relay-tenant node
             return self._relay(addr, "POST", path, body)
@@ -1320,31 +1326,55 @@ class Owner:
                            "returned": 0, "verified": 0, "latency_ms": None,
                            "claims": None}
         times = {nid: [] for nid in report}
+
+        # Group the sample by REPLICA SET, and ask every node in a group the
+        # identical batch under one shared nonce. Two reasons, and the second
+        # is the one that matters. It batches, so an audit is a handful of
+        # requests instead of one per key per replica. And it makes each
+        # group self-corroborating: nobody picks where a key lives, the ring
+        # does, so a made-up key cannot be aimed at a node without landing on
+        # its replicas too. A miss counts only when a peer given the same
+        # batch produced the data.
+        groups = {}
         for rid in rids:
             key = "R:" + rid
-            for nid in self.ring.route(key):
-                if nid not in report:
-                    continue
-                addr = self._addr(nid)
-                if not addr:
-                    continue
-                report[nid]["responsible"] += 1
+            holders = tuple(n for n in self.ring.route(key)
+                            if n in report and self._addr(n))
+            if holders:
+                groups.setdefault(holders, []).append(key)
+
+        proofs = []
+        for holders, keys in groups.items():
+            nonce = os.urandom(16).hex()
+            group = {}
+            for nid in holders:
+                report[nid]["responsible"] += len(keys)
                 t0 = time.time()
                 try:
-                    got = self._post(addr, "/mget", {"keys": [key]})["values"]
+                    out = self._post(self._addr(nid), "/mget",
+                                     {"keys": keys, "nonce": nonce})
                 except (OSError, ValueError, KeyError):
                     continue
-                times[nid].append((time.time() - t0) * 1000)
-                blob = got.get(key)
-                if blob is None:
-                    continue
-                report[nid]["returned"] += 1
-                try:                       # AEAD is the proof
-                    raw = b64decode(blob)
-                    self._aes.decrypt(raw[:12], raw[12:], None)
-                    report[nid]["verified"] += 1
-                except Exception:
-                    pass                   # returned something, but not ours
+                times[nid].append(((time.time() - t0) * 1000) / max(len(keys), 1))
+                got = out.get("values") or {}
+                verified = 0
+                for key in keys:
+                    blob = got.get(key)
+                    if blob is None:
+                        continue
+                    report[nid]["returned"] += 1
+                    try:                   # AEAD is the proof
+                        raw = b64decode(blob)
+                        self._aes.decrypt(raw[:12], raw[12:], None)
+                        verified += 1
+                    except Exception:
+                        pass               # returned something, but not ours
+                report[nid]["verified"] += verified
+                rec = out.get("receipt")
+                if rec and receipt.matches(rec, nonce, keys, got):
+                    group[nid] = {"verified": verified, "receipt": rec}
+            if len(group) > 1:             # a lone receipt corroborates nothing
+                proofs.append(group)
         for nid, r in report.items():
             ts = sorted(times[nid])
             if ts:
@@ -1355,7 +1385,8 @@ class Owner:
                 pass
             r["possession"] = (round(r["verified"] / r["responsible"], 4)
                                if r["responsible"] else None)
-        return {"sampled_records": len(rids), "nodes": report}
+        return {"sampled_records": len(rids), "nodes": report,
+                "proofs": proofs}
 
     # Sample sizes are fixed, never chosen by the caller, so a report
     # cannot encode how much data the reporter holds.
@@ -1383,6 +1414,15 @@ class Owner:
         structural — its position on the ring — so it never needs to claim
         anything, and the most forgeable input to a payout simply does not
         exist.
+
+        What makes the report cost something is the last two fields. Each
+        group carries the nodes' own signatures over what they were asked
+        and what they returned, so the numbers are theirs rather than the
+        reporter's; and `pow` is a hash puzzle bound to the exact body,
+        which charges the sender without asking who they are. Neither adds
+        an identifier, an account, or anything an aggregator could keep and
+        correlate later — which is the whole reason it is a puzzle and not
+        a login.
         """
         audit = self.audit(sample=self.REPORT_SAMPLE)
         nodes = {}
@@ -1392,7 +1432,10 @@ class Owner:
             nodes[nid] = {"sampled": v["responsible"],
                           "verified": v["verified"],
                           "latency_ms": v["latency_ms"]}
-        return {"kind": "blindrange-audit", "v": 1, "nodes": nodes}
+        out = {"kind": "blindrange-audit", "v": 1, "nodes": nodes,
+               "proofs": audit.get("proofs", [])}
+        out["pow"] = receipt.solve(out)
+        return out
 
     def drop(self, confirm=False):
         """Remove every key of this database from the network.

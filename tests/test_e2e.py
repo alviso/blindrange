@@ -7,6 +7,7 @@ passphrase-encrypted state file; wrong-passphrase rejection.
 
   python3 -m unittest tests.test_e2e -v
 """
+import os
 import random
 import shutil
 import subprocess
@@ -494,6 +495,194 @@ class TestAudit(unittest.TestCase):
                     p.terminate()
                 p.wait()
             _shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestReportCost(unittest.TestCase):
+    """Submitting an audit report must cost something, and every cheap lie
+    about a node must fail. Owns its nodes: the tests forge and tamper."""
+
+    PORTS = (7941, 7942, 7943)
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        cls.tmp = tempfile.mkdtemp(prefix="blindrange_cost_")
+        cls.secret, cls.procs = "costnet" + cls.__name__, []
+        for i, port in enumerate(cls.PORTS):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{cls.tmp}/n{port}",
+                    "--secret", cls.secret]
+            if i:
+                args += ["--seed", f"127.0.0.1:{cls.PORTS[0]}"]
+            cls.procs.append(subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=str(root)))
+        wait_http(f"127.0.0.1:{cls.PORTS[0]}")
+        wait_peers(f"127.0.0.1:{cls.PORTS[0]}", 3, cls.secret)
+
+        spec = importlib.util.spec_from_file_location(
+            "status_server", root / "examples" / "status_server.py")
+        cls.agg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.agg)
+        cls.agg.POW_BITS = 8               # keep the suite fast; logic is same
+
+        cls.owner = Owner.create(
+            f"{cls.tmp}/a.brdb", "pw",
+            {"ts": {"type": "int", "bits": 22, "leaf_width": 4096}},
+            bootstrap=[f"127.0.0.1:{cls.PORTS[0]}"], network_secret=cls.secret)
+        cls.owner.write_acks = 3           # every replica, so 1.0 is fair
+        rng = random.Random(21)
+        cls.owner.insert_many([{"ts": rng.randrange(2592000), "m": "x"}
+                               for _ in range(400)])
+        cls.owner.drain()
+
+    @classmethod
+    def tearDownClass(cls):
+        for p in cls.procs:
+            if p.poll() is None:
+                p.terminate()
+            p.wait()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.agg.REPORTS.clear()
+        self.agg.SEEN_SET.clear()
+        self.agg.SEEN_SIGS.clear()
+
+    def report(self):
+        from blindrange import receipt
+        rep = self.owner.audit_report()
+        rep["pow"] = receipt.solve(rep, self.agg.POW_BITS)
+        return rep
+
+    def test_honest_report_is_accepted_and_scores_every_node(self):
+        out = self.agg.record_report(self.report())
+        self.assertGreaterEqual(out["accepted"], 3)
+        for nid, v in self.agg.possession().items():
+            self.assertEqual(v["rate"], 1.0, f"{nid} should be intact")
+
+    def test_reads_are_all_signed_so_an_audit_is_indistinguishable(self):
+        """A node that could spot an audit could serve those and drop the
+        rest, so an ordinary read must look exactly like an audited one."""
+        from blindrange import receipt
+        addr = self.owner._addr(next(iter(self.owner.ring.addrs)))
+        nonce = "ab" * 16
+        out = self.owner._post(addr, "/mget",
+                               {"keys": ["R:nope"], "nonce": nonce})
+        self.assertIn("receipt", out, "plain read went unsigned")
+        self.assertTrue(receipt.verify(out["receipt"], time.time()))
+
+    def test_report_without_proof_of_work_is_refused(self):
+        rep = self.report()
+        rep.pop("pow")
+        with self.assertRaises(ValueError) as e:
+            self.agg.record_report(rep)
+        self.assertIn("proof of work", str(e.exception))
+
+    def test_proof_of_work_does_not_transfer_to_another_report(self):
+        rep = self.report()
+        rep["nodes"] = {"deadbeefdeadbeef": {"sampled": 1, "verified": 1}}
+        with self.assertRaises(ValueError) as e:
+            self.agg.record_report(rep)
+        self.assertIn("proof of work", str(e.exception))
+
+    def test_fabricated_report_with_no_receipts_is_refused(self):
+        """The original attack: arbitrary JSON, no exchange behind it."""
+        from blindrange import receipt
+        rep = {"kind": "blindrange-audit", "v": 1, "proofs": [],
+               "nodes": {"f" * 16: {"sampled": 100, "verified": 100},
+                         "e" * 16: {"sampled": 100, "verified": 0}}}
+        rep["pow"] = receipt.solve(rep, self.agg.POW_BITS)
+        with self.assertRaises(ValueError) as e:
+            self.agg.record_report(rep)
+        self.assertIn("corroborated", str(e.exception))
+
+    def test_slander_with_invented_keys_earns_no_evidence(self):
+        """Ask a node for keys that never existed and it will honestly sign
+        that it returned none of them. That must not read as data loss."""
+        from blindrange import receipt
+        keys = [f"R:{i:040x}" for i in range(20)]      # nothing ever wrote these
+        nonce = os.urandom(16).hex()
+        group = {}
+        for nid in self.owner.ring.route(keys[0]):
+            addr = self.owner._addr(nid)
+            if not addr:
+                continue
+            out = self.owner._post(addr, "/mget",
+                                   {"keys": keys, "nonce": nonce})
+            group[nid] = {"verified": 0, "receipt": out["receipt"]}
+        self.assertGreaterEqual(len(group), 2, "need a group to slander")
+        rep = {"kind": "blindrange-audit", "v": 1, "nodes": {},
+               "proofs": [group]}
+        rep["pow"] = receipt.solve(rep, self.agg.POW_BITS)
+        with self.assertRaises(ValueError):
+            self.agg.record_report(rep)
+        self.assertEqual(self.agg.possession(), {},
+                         "invented keys were counted against real nodes")
+
+    def test_replaying_a_report_does_not_stack_evidence(self):
+        rep = self.report()
+        self.agg.record_report(rep)
+        with self.assertRaises(ValueError):
+            self.agg.record_report(rep)
+        for v in self.agg.possession().values():
+            self.assertEqual(v["reports"], 1, "replay counted twice")
+
+    def test_verified_cannot_exceed_what_the_node_signed_for(self):
+        """The sender's own numbers are a hint; the node's signature is the
+        ceiling. Inflating past it must be clamped, not believed."""
+        from blindrange import receipt
+        rep = self.report()
+        for group in rep["proofs"]:
+            for v in group.values():
+                v["verified"] = 10 ** 6
+        rep["pow"] = receipt.solve(rep, self.agg.POW_BITS)
+        self.agg.record_report(rep)
+        for nid, v in self.agg.possession().items():
+            self.assertEqual(v["rate"], 1.0)          # clamped to served
+        self.assertTrue(self.agg.possession())
+
+    def test_a_tampered_receipt_is_thrown_away(self):
+        from blindrange import receipt
+        rep = self.report()
+        for group in rep["proofs"]:
+            for v in group.values():
+                v["receipt"]["served"] = int(v["receipt"]["served"]) + 5
+        rep["pow"] = receipt.solve(rep, self.agg.POW_BITS)
+        with self.assertRaises(ValueError):
+            self.agg.record_report(rep)
+
+class TestReportCostUnderLoss(TestReportCost):
+    """The destructive half, on its own nodes. Folded into the shared class
+    it ran first (alphabetically) and every later test then scored a network
+    it had already damaged — which is precisely the 'healthy node reads 0.33'
+    confusion this separation exists to prevent."""
+
+    PORTS = (7951, 7952, 7953)
+
+    def test_zz_a_node_that_discards_data_scores_below_its_replicas(self):
+        import sqlite3
+        self.agg.record_report(self.report())
+        victim = next(iter(self.agg.possession()))
+        port = int(self.owner._addr(victim).split(":")[1])
+        db = sqlite3.connect(f"{self.tmp}/n{port}/kv.db")
+        blobs = [r[0] for r in db.execute(
+            "SELECT k FROM kv WHERE k LIKE 'R:%'").fetchall()]
+        for k in blobs[:int(len(blobs) * 0.7)]:
+            db.execute("DELETE FROM kv WHERE k=?", (k,))
+        db.commit()
+        db.close()
+
+        self.setUp()                        # score the damaged network fresh
+        self.agg.record_report(self.report())
+        scores = self.agg.possession()
+        self.assertLess(scores[victim]["rate"], 0.6,
+                        "silent loss went unnoticed")
+        for nid, v in scores.items():
+            if nid != victim:
+                self.assertEqual(v["rate"], 1.0,
+                                 "healthy peer was dragged down")
 
 
 class TestNodeBackgroundRepair(unittest.TestCase):

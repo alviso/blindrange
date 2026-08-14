@@ -59,6 +59,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from .ring import Ring
 from . import direct as direct_mod
+from . import receipt
 from . import __version__ as VERSION
 
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
@@ -460,7 +461,21 @@ def service_post(store, peers, hub, secret, path, data, quic=None):
         store.put(entries)
         return 200, {"stored": len(entries)}
     if path == "/mget":
-        return 200, {"values": store.mget(data["keys"])}
+        keys = data["keys"]
+        values = store.mget(keys)
+        out = {"values": values}
+        nonce = data.get("nonce")
+        # Signed on EVERY read that carries a nonce, never only on audits:
+        # a node that could recognise an audit could serve those and drop
+        # the rest, so the signature has to be worthless as a signal.
+        if isinstance(nonce, str) and len(nonce) == 32:
+            try:
+                out["receipt"] = receipt.sign(
+                    peers.ident.priv, peers.ident.node_id,
+                    peers.ident.pub_raw, nonce, keys, values, time.time())
+            except (ValueError, TypeError):
+                pass
+        return 200, out
     if path == "/delete":
         return 200, {"deleted": store.delete(data["keys"])}
     if path == "/gossip":

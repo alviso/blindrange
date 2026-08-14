@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from blindrange.node import status_html  # noqa: E402
+from blindrange import receipt  # noqa: E402
 
 # Anonymous audit reports, kept in memory only.
 #
@@ -44,35 +45,124 @@ from blindrange.node import status_html  # noqa: E402
 # evidence of present failure, which is how a small flood first flipped a
 # median here from 0.43 to 1.00.
 #
-# This is mitigation, not a solution: an attacker willing to submit enough
-# reports still wins. Making that expensive needs a cost to submit, and
-# every cheap way to impose one leaks who is submitting.
+# The quantile alone was mitigation, not a defence — enough fabricated
+# reports still won. Three things now make one cost something, none of them
+# asking who is submitting:
+#
+#   1. RECEIPTS. Every figure comes from a group of node signatures, and a
+#      node id is a hash of its own public key, so each verifies here with
+#      no roster to maintain and nobody to trust for it. Inventing a report
+#      about a node now needs that node's private key.
+#   2. CORROBORATION. A signature by itself proves only that some exchange
+#      happened, and asking a node for keys that never existed gets an
+#      honestly signed miss — perfect slander, free. So a group is scored
+#      only against its own members, who were asked the identical batch
+#      under one nonce (they committed to the same kdigest). Since the ring
+#      picks a key's replicas, a fabricated key cannot be aimed at one node
+#      while sparing the others, and a group where nobody held anything is
+#      discarded rather than counted against everyone in it.
+#   3. PROOF OF WORK, bound to the exact body, plus single-use signatures
+#      inside a freshness window. Replay is out, and volume now has a price.
+#
+# What is still open, stated plainly: someone running real nodes with real
+# data can still submit honest-looking reports about themselves. That buys
+# little, because scoring is relative and honest nodes already score 1.0 —
+# to gain, a cheat must push others down, which needs their signatures.
+# The unsolved one is the ring itself: identities are cheap, so an attacker
+# minting many nodes gets a larger STRUCTURAL share regardless of any of
+# this. That is Sybil resistance on placement, a separate problem.
 REPORTS = collections.defaultdict(collections.deque)   # node_id -> (ts, rate)
 REPORT_WINDOW = 500
 REPORT_MAX_AGE = float(os.environ.get("BR_REPORT_MAX_AGE", "21600"))  # 6h
 REPORT_QUANTILE = 0.25
+REPORT_MIN_GROUP = 2       # a receipt nobody corroborates proves nothing
+POW_BITS = int(os.environ.get("BR_REPORT_POW_BITS", str(receipt.POW_BITS)))
+SEEN_SIGS = collections.deque()        # (ts, sig-prefix) — anti-replay only
+SEEN_SET = set()
 REPORT_LOCK = threading.Lock()
+
+
+def _fresh_sig(sig, now):
+    """Single-use signatures, kept only as long as a receipt stays fresh.
+
+    Deliberately not a log: a signature prefix is dropped the moment the
+    beacon it was signed under stops being accepted, so this can never grow
+    into a record of who submitted what.
+    """
+    horizon = now - receipt.BEACON_PERIOD * (receipt.BEACON_SLACK + 2)
+    while SEEN_SIGS and SEEN_SIGS[0][0] < horizon:
+        SEEN_SET.discard(SEEN_SIGS.popleft()[1])
+    if sig in SEEN_SET:
+        return False
+    SEEN_SET.add(sig)
+    SEEN_SIGS.append((now, sig))
+    return True
+
+
+def score_groups(payload, now):
+    """Turn a report into per-node rates, trusting only what nodes signed.
+
+    Everything the sender claims is treated as a hint and re-derived from
+    the receipts: how many keys a node was asked for and how many it served
+    are its own signed statements, and `verified` is only ever believed down
+    to that ceiling. A group is scored relative to its best member, so the
+    output says "this node held less than its replicas did", which is the
+    only comparison a group can honestly support.
+    """
+    out = collections.defaultdict(list)
+    for group in payload.get("proofs") or []:
+        if not isinstance(group, dict) or len(group) < REPORT_MIN_GROUP:
+            continue
+        rows, sigs, kdigest, asked, ok = {}, [], None, None, True
+        for nid, v in group.items():
+            r = (v or {}).get("receipt") or {}
+            if r.get("node_id") != nid or not receipt.verify(r, now):
+                ok = False
+                break
+            # Same batch, same nonce, or these nodes are not comparable and
+            # the group is exactly the slander vector we are closing.
+            if kdigest is None:
+                kdigest, asked = r["kdigest"], int(r["asked"])
+            elif r["kdigest"] != kdigest or int(r["asked"]) != asked:
+                ok = False
+                break
+            sigs.append(r["sig"][:32])
+            rows[nid] = min(int((v or {}).get("verified", 0)),
+                            int(r["served"]))
+        if not ok or not asked or len(rows) < REPORT_MIN_GROUP:
+            continue
+        # Spend the signatures only once the group is known good, or a
+        # rejected group would burn them and make an honest resubmission of
+        # the same audit fail as a replay.
+        if len(set(sigs)) != len(sigs) or not all(_fresh_sig(s, now)
+                                                  for s in sigs):
+            continue
+        best = max(rows.values())
+        if best <= 0:
+            continue          # nobody held it: a bad batch, not a bad node
+        for nid, held in rows.items():
+            out[nid].append(held / best)
+    return out
 
 
 def record_report(payload):
     if payload.get("kind") != "blindrange-audit":
         raise ValueError("not an audit report")
-    nodes = payload.get("nodes") or {}
-    if len(nodes) > 256:
+    if not receipt.check(payload, POW_BITS):
+        raise ValueError("insufficient proof of work")
+    if len(payload.get("proofs") or []) > 256:
         raise ValueError("implausible report")
+    now = time.time()
     accepted = 0
     with REPORT_LOCK:
-        for nid, v in nodes.items():
-            if not isinstance(nid, str) or len(nid) > 64:
-                continue
-            sampled, verified = int(v.get("sampled", 0)), int(v.get("verified", 0))
-            if sampled <= 0 or not 0 <= verified <= sampled:
-                continue
+        for nid, rates in score_groups(payload, now).items():
             dq = REPORTS[nid]
-            dq.append((time.time(), verified / sampled))
+            dq.append((now, sum(rates) / len(rates)))
             while len(dq) > REPORT_WINDOW:
                 dq.popleft()
             accepted += 1
+    if not accepted:
+        raise ValueError("no corroborated node receipts in report")
     return {"accepted": accepted}
 
 
