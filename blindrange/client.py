@@ -52,10 +52,13 @@ import hmac
 import json
 import math
 import os
+import threading
 import time
+import urllib.request
 from .transport import POOL
 from . import direct as direct_mod
 from . import receipt
+from . import token as token_mod
 from base64 import b64decode, b64encode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -84,6 +87,10 @@ class Owner:
         self._data_key = hmac.new(self._master, b"data", hashlib.sha256).digest()
         self._aes = AESGCM(self._data_key)
         self.pool = ThreadPoolExecutor(max_workers=32)
+        # Writes fan out across the pool, so the wallet is touched
+        # concurrently; without this two threads can hand the same token to
+        # two different nodes and the second one is refused as spent.
+        self._wallet_lock = threading.Lock()
         self.ring = None
         self.last_stats = {}
         self.write_acks = int(os.environ.get("BR_WRITE_ACKS", "2"))
@@ -168,6 +175,131 @@ class Owner:
                        "ct": ct.hex()}, f)
         os.replace(tmp, self._path)
 
+    # -------------------------------------------------------------- tokens
+    # A wallet of blind tokens lives in the encrypted state file, for the
+    # same reason the master key does: they are bearer instruments, and
+    # anyone holding one can spend it. Nothing here identifies the owner —
+    # that is the point of the scheme — so a stolen wallet costs capacity,
+    # never privacy.
+
+    def configure_tokens(self, issuer, account):
+        self._st["issuer"] = issuer.rstrip("/")
+        self._st["account"] = account
+        self._st.setdefault("wallet", [])
+        self._save()
+
+    # The state file is passphrase-derived (scrypt), so writing it costs
+    # ~21 ms. Persisting on every spend put that inside the write path,
+    # under a lock shared by all threads — measured at ~48 batches/second
+    # against ingest that already runs at a thousand records a second. The
+    # wallet therefore lives in memory and is checkpointed lazily.
+    #
+    # Crash exposure is one flush interval of tokens, and it fails in the
+    # safe direction: the file can only be STALER than reality, so a lost
+    # flush means re-presenting tokens already spent, which nodes refuse.
+    # Capacity is lost, never double-charged, and never silently reused.
+    WALLET_FLUSH_S = 5.0
+
+    @property
+    def _wallet(self):
+        if getattr(self, "_wal", None) is None:
+            self._wal = token_mod.Wallet(self._st.get("wallet") or [])
+            self._wal_dirty = False
+            self._wal_flushed = 0.0
+        return self._wal
+
+    def _store_wallet(self, wallet, force=False):
+        self._wal = wallet
+        self._wal_dirty = True
+        now = time.time()
+        if force or now - getattr(self, "_wal_flushed", 0.0) >= self.WALLET_FLUSH_S:
+            self._st["wallet"] = wallet.tokens
+            self._save()
+            self._wal_dirty = False
+            self._wal_flushed = now
+
+    def flush_wallet(self):
+        """Checkpoint unspent tokens now. Called on drain() so a clean
+        shutdown never loses capacity."""
+        with self._wallet_lock:
+            if getattr(self, "_wal", None) is not None and self._wal_dirty:
+                self._store_wallet(self._wal, force=True)
+
+    def token_balance(self):
+        """Keys of write capacity currently held."""
+        return self._wallet.balance()
+
+    def _spend_token(self, n_entries):
+        """Tokens covering this request, buying more if the wallet is short.
+
+        Returns a LIST: the client batches a whole node's share of a write
+        into one request — tens of thousands of keys is routine — so a
+        request is paid with a set of tokens rather than one. Splitting
+        writes to match denominations instead would cost throughput and
+        hand the node a batch structure it has no business seeing.
+        """
+        if not self._st.get("issuer"):
+            return None                      # unmetered network
+        with self._wallet_lock:
+            w = self._wallet
+            need = max(n_entries, 1)
+            if w.balance() < need and self._st.get("account"):
+                try:
+                    self._fetch_tokens(w, need)
+                except Exception:
+                    pass                     # let the node report the refusal
+            toks = w.take_for(need)
+            self._store_wallet(w)
+            return toks
+
+    def _refund_token(self, toks):
+        with self._wallet_lock:
+            w = self._wallet
+            w.add(toks)
+            self._store_wallet(w)
+
+    def _issuer_keys(self):
+        with urllib.request.urlopen(
+                self._st["issuer"] + "/keys", timeout=15) as r:
+            body = json.loads(r.read())
+        return {kid: {"n": int(k["n"]), "e": int(k["e"])}
+                for kid, k in (body.get("keys") or {}).items()}
+
+    def _issuer_post(self, _addr, path, payload):
+        req = urllib.request.Request(
+            self._st["issuer"] + path, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def top_up(self, denom=1000, count=32):
+        """Buy write capacity. Blinding happens here, so the issuer sees
+        only uniformly random values and cannot connect what it signs to
+        anything this database later writes."""
+        with self._wallet_lock:
+            w = self._wallet
+            n = self._fetch_tokens(w, 0, denom=denom, count=count)
+            self._store_wallet(w, force=True)     # just paid for these
+            return n
+
+    def _fetch_tokens(self, wallet, need, denom=None, count=None):
+        pubkeys = self._issuer_keys()
+        if denom is None:
+            offered = sorted({token_mod.parse_key_id(k)[1] for k in pubkeys})
+            denom = next((d for d in offered if d >= max(need, 1)),
+                         offered[-1] if offered else 1000)
+        if count is None:
+            # cover the shortfall plus headroom, in ONE issuance round trip;
+            # topping up per request turned a 12,000 rec/s ingest into 5.
+            short = max(need - wallet.balance(), 0)
+            count = min(token_mod.MAX_ISSUE_BATCH,
+                        max(8, -(-short // denom) * 2))
+        tokens, _ = token_mod.request_tokens(
+            self._issuer_post, None, self._st["account"], denom, count,
+            pubkeys)
+        wallet.add(tokens)
+        return len(tokens)
+
     # ---------------------------------------------------------- membership
     def refresh_membership(self):
         """Discover live nodes by asking any known node for its peer table.
@@ -251,6 +383,24 @@ class Owner:
                                       hashlib.sha256).hexdigest()}
 
     def _post(self, addr, path, payload):
+        if path == "/kv" and "tokens" not in payload:
+            tok = self._spend_token(len(payload.get("entries") or []))
+            if tok:
+                payload = {**payload, "tokens": tok}
+                try:
+                    return self._post_inner(addr, path, payload)
+                except Exception:
+                    # The write did not land, so the token was probably not
+                    # redeemed either — put it back rather than burning
+                    # paid-for capacity on a network blip. If the node did
+                    # spend it and only the reply was lost, the retry is
+                    # refused as already-spent, which costs one token and
+                    # never double-charges.
+                    self._refund_token(tok)
+                    raise
+        return self._post_inner(addr, path, payload)
+
+    def _post_inner(self, addr, path, payload):
         if path == "/mget" and "nonce" not in payload:
             # Every read asks to be signed, not just audits. The receipt is
             # ignored on the ordinary path; what matters is that a node
@@ -390,6 +540,7 @@ class Owner:
         for fut in list(getattr(self, "_inflight", set())):
             _ok(fut)
         self._inflight = set()
+        self.flush_wallet()
 
     def _put_nx(self, key, value):
         """Insert-if-absent on all replicas. False if any replica already had

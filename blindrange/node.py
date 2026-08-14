@@ -49,6 +49,7 @@ from base64 import b64decode, b64encode
 from collections import deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.request
 from urllib.parse import parse_qs, urlparse
 
 from .transport import POOL
@@ -60,6 +61,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from .ring import Ring
 from . import direct as direct_mod
 from . import receipt
+from . import token as tok_mod
 from . import __version__ as VERSION
 
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
@@ -246,6 +248,110 @@ def verify_poll_token(tok):
         return False
 
 
+class TokenGate:
+    """Decides whether a write is paid for, learning nothing about who paid.
+
+    A node holds only the issuer's PUBLIC keys, so it can tell that a token
+    is genuine and what it is worth, and can tell nothing else — not the
+    account, not the grant, not whether two tokens came from the same
+    wallet. Verification is local arithmetic; the issuer is contacted for
+    key material and never for a spend.
+
+    Two exemptions, both necessary and both bounded. Node-to-node repair is
+    exempt, because the network heals itself continuously and charging a
+    node to hold up its own replicas would make replication a billable
+    event; that path is authenticated by the writing node's Ed25519
+    identity, not by anything a client can mint. And a node with no issuer
+    configured charges nothing at all, which is what keeps a private
+    network private and a test network cheap.
+    """
+
+    def __init__(self, issuer_url, store):
+        self.issuer = issuer_url.rstrip("/")
+        self.store = store
+        self.lock = threading.Lock()
+        self.pubkeys = {}
+        self.epochs = set()
+        self.redeemed = 0          # tokens accepted since start, for /stats
+
+    def refresh(self):
+        try:
+            with urllib.request.urlopen(self.issuer + "/keys", timeout=10) as r:
+                body = json.loads(r.read())
+        except (OSError, ValueError):
+            return False
+        keys = {}
+        for kid, k in (body.get("keys") or {}).items():
+            try:
+                keys[kid] = {"n": int(k["n"]), "e": int(k["e"])}
+            except (KeyError, ValueError, TypeError):
+                continue
+        if not keys:
+            return False
+        with self.lock:
+            self.pubkeys = keys
+            self.epochs = {tok_mod.parse_key_id(k)[0] for k in keys}
+        # Anything signed under a key we no longer accept can never be
+        # spent again, so its spend records are dead weight. This is the
+        # whole reason keys rotate by epoch.
+        self.store.forget_epochs(self.epochs)
+        return True
+
+    def check(self, data, n_entries):
+        """(ok, http_status, reason)."""
+        node_tok = data.get("node_token")
+        if isinstance(node_tok, dict) and verify_poll_token(node_tok):
+            return True, 200, "repair"
+        with self.lock:
+            pubkeys = dict(self.pubkeys)
+        if not pubkeys:
+            # Fail OPEN when key material is missing. A node that cannot
+            # reach the issuer is not evidence that a write is unpaid, and
+            # refusing writes would turn a billing outage into a data
+            # outage — the wrong failure for the party who did nothing
+            # wrong.
+            return True, 200, "no issuer keys"
+        toks = data.get("tokens")
+        if isinstance(data.get("token"), dict):     # single-token form
+            toks = [data["token"]]
+        if not isinstance(toks, list) or not toks:
+            return False, 402, "write requires a token"
+        if len(toks) > 512:
+            return False, 402, "too many tokens"
+        # Verify everything BEFORE spending anything: a batch that is going
+        # to be refused should not burn the tokens that were valid.
+        value = 0
+        for t in toks:
+            if not isinstance(t, dict):
+                return False, 402, "malformed token"
+            denom = tok_mod.verify_token(t, pubkeys)
+            if denom is None:
+                return False, 402, "token invalid or unknown denomination"
+            value += denom
+        if value < n_entries:
+            return False, 402, (f"tokens cover {value} keys, "
+                                f"batch has {n_entries}")
+        refs = {tok_mod.token_ref(t) for t in toks}
+        if len(refs) != len(toks):
+            return False, 402, "duplicate token in one request"
+        for t in toks:
+            epoch = tok_mod.parse_key_id(t.get("kid", ""))[0]
+            if not self.store.spend(tok_mod.token_ref(t), epoch):
+                return False, 402, "token already spent"
+        with self.lock:
+            self.redeemed += len(toks)
+        return True, 200, "paid"
+
+
+def _token_key_loop(gate):
+    while True:
+        gate.refresh()
+        time.sleep(300 + random.random() * 60)
+
+
+GATE = None          # set at startup when --issuer is configured
+
+
 class Store:
     def __init__(self, path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -266,8 +372,43 @@ class Store:
         # and stay perfectly readable.
         self.db.execute("CREATE TABLE IF NOT EXISTS kv "
                         "(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")
+        # Spent blind tokens. Holds a hash of the token, never the token, so
+        # a leaked spent-set is not a bag of bearer instruments. Rows are
+        # dropped wholesale once their key epoch stops verifying, which is
+        # the only reason epochs exist.
+        self.db.execute("CREATE TABLE IF NOT EXISTS spent "
+                        "(ref TEXT PRIMARY KEY, epoch TEXT, ts INT) "
+                        "WITHOUT ROWID")
         self.db.commit()
         self.read_batches = 0
+
+    def spend(self, ref, epoch):
+        """Record a token as spent. False if it already was.
+
+        The uniqueness constraint does the work, so two concurrent requests
+        presenting one token cannot both win — INSERT either lands or it
+        does not, with no read-then-write gap to race through.
+        """
+        with self.lock:
+            try:
+                self.db.execute("INSERT INTO spent VALUES (?,?,?)",
+                                (ref, epoch, int(time.time())))
+                self.db.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def forget_epochs(self, keep):
+        with self.lock:
+            qs = ",".join("?" * len(keep)) or "''"
+            cur = self.db.execute(
+                f"DELETE FROM spent WHERE epoch NOT IN ({qs})", tuple(keep))
+            self.db.commit()
+            return cur.rowcount
+
+    def spent_count(self):
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM spent").fetchone()[0]
 
     def put(self, entries):
         with self.lock:
@@ -461,6 +602,10 @@ def post_any(addr, path, payload: bytes, secret: str, timeout=5):
 def service_post(store, peers, hub, secret, path, data, quic=None):
     if path == "/kv":
         entries = [(k, v) for k, v in data["entries"]]
+        if GATE is not None:
+            ok, code, why = GATE.check(data, len(entries))
+            if not ok:
+                return code, {"error": why}
         if data.get("nx"):
             existed = store.put_nx(entries)
             return 200, {"stored": len(entries) - len(existed),
@@ -735,7 +880,9 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
         for addr, entries in by_addr.items():
             try:
                 post_any(addr, "/kv",
-                         json.dumps({"entries": entries}).encode(), secret)
+                         json.dumps({"entries": entries,
+                                     "node_token": peers.ident.poll_token()
+                                     }).encode(), secret)
             except OSError:
                 pass
 
@@ -932,13 +1079,23 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
 
 
 def run(host, port, data_dir, seeds, secret="", advertise=None,
-        quic_host="0.0.0.0", public_status=False, auto_update=False):
+        quic_host="0.0.0.0", public_status=False, auto_update=False,
+        issuer=""):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
     ident = Identity(data_dir)
     store = Store(os.path.join(data_dir, "kv.db"))
     peers = Peers(ident, addr)
     peers.contacts.update(seeds)
+    if issuer:
+        global GATE
+        GATE = TokenGate(issuer, store)
+        if not GATE.refresh():
+            print(f"warning: could not reach issuer {issuer}; writes are "
+                  f"unmetered until its keys are available",
+                  file=sys.stderr, flush=True)
+        threading.Thread(target=_token_key_loop, args=(GATE,),
+                         daemon=True).start()
     hub = RelayHub()
     quic = None
     if not direct_mod.DISABLED:
@@ -994,6 +1151,9 @@ def main():
                     help="bind address for the QUIC/UDP socket used by direct "
                          "paths (default all interfaces — hole punching needs "
                          "internet reachability even when HTTP is local)")
+    ap.add_argument("--issuer", default=os.environ.get("BR_ISSUER", ""),
+                    help="token issuer URL; writes require a blind token "
+                         "when set (nodes hold only its public keys)")
     ap.add_argument("--advertise", default=None,
                     help="host:port other machines should reach this node at "
                          "(defaults to --host:--port; set it when binding 0.0.0.0). "
@@ -1001,7 +1161,7 @@ def main():
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
     run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host,
-        a.public_status, a.auto_update)
+        a.public_status, a.auto_update, a.issuer)
 
 
 if __name__ == "__main__":
