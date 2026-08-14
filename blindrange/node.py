@@ -42,10 +42,12 @@ import json
 import os
 import random
 import sqlite3
+import sys
 import threading
 import time
 from base64 import b64decode, b64encode
 from collections import deque
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -57,6 +59,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from .ring import Ring
 from . import direct as direct_mod
+from . import __version__ as VERSION
 
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
 PEER_TTL = 15.0           # drop peers silent for this long
@@ -69,6 +72,56 @@ POLL_WAIT = 20.0          # relay parks a tenant's poll this long
 SEND_WAIT = 15.0          # relay waits this long for a tenant's reply
 TENANT_FRESH = 45.0       # tenant counts as connected if polled this recently
 CACHE_KB = int(os.environ.get("BR_CACHE_KB", "32000"))   # SQLite page cache
+UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "900"))   # 15 min
+
+
+def code_version():
+    """Package version plus the checkout's commit, when running from git."""
+    commit = ""
+    try:
+        import subprocess
+        repo = Path(__file__).resolve().parent.parent
+        out = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short",
+                              "HEAD"], capture_output=True, text=True,
+                             timeout=5)
+        if out.returncode == 0:
+            commit = out.stdout.strip()
+    except Exception:
+        pass
+    return f"{VERSION}+{commit}" if commit else VERSION
+
+
+def _update_loop(secret):
+    """Opt-in self-update: fast-forward this checkout and exit so the
+    supervisor restarts on the new code.
+
+    This is a real trust decision, not a convenience: a node running with
+    --auto-update will run whatever the configured remote publishes next.
+    That is reasonable for a network whose operator also maintains the code
+    (our public demo network) and unreasonable for volunteers who don't know
+    the maintainer. Hence: opt-in, never a default.
+    """
+    import subprocess
+    repo = str(Path(__file__).resolve().parent.parent)
+    while True:
+        time.sleep(UPDATE_EVERY + random.random() * 30)   # stagger the fleet
+        try:
+            before = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                                    capture_output=True, text=True,
+                                    timeout=20).stdout.strip()
+            pull = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
+                                  capture_output=True, text=True, timeout=120)
+            if pull.returncode != 0:
+                continue                       # dirty tree or diverged: leave it
+            after = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True,
+                                   timeout=20).stdout.strip()
+            if after and after != before:
+                print(f"auto-update: {before[:8]} -> {after[:8]}, restarting",
+                      file=sys.stderr, flush=True)
+                os._exit(0)                    # supervisor restarts us
+        except Exception:
+            continue
 
 
 def is_via(addr: str) -> bool:
@@ -415,8 +468,8 @@ STATUS_CACHE = {"at": 0.0, "rows": [], "total": 0}
 
 
 def _peer_stats(nid, e, secret, hub, self_id):
-    """Best-effort key count for one peer. Tenants are reached over the relay
-    connection they already hold with us (we are their relay)."""
+    """Best-effort /stats for one peer (key count and version). Tenants are
+    reached over the relay connection they already hold with us."""
     try:
         if is_via(e["addr"]):
             _relay, tenant = parse_via(e["addr"])
@@ -424,9 +477,9 @@ def _peer_stats(nid, e, secret, hub, self_id):
                                     "path": "/stats", "body_b64": ""})
             if not out or out.get("status") != 200:
                 return None
-            return json.loads(b64decode(out["body_b64"])).get("keys")
+            return json.loads(b64decode(out["body_b64"]))
         status, raw = POOL.request(e["addr"], "GET", "/stats", timeout=2)
-        return json.loads(raw).get("keys") if status == 200 else None
+        return json.loads(raw) if status == 200 else None
     except (OSError, ValueError, KeyError):
         return None
 
@@ -439,13 +492,21 @@ def status_rows(store, peers, secret, hub):
     rows, total = [], 0
     me = peers.ident.node_id
     for nid, e in sorted(peers.live().items()):
-        keys = store.count() if nid == me else _peer_stats(nid, e, secret,
-                                                           hub, me)
+        stats = (None if nid == me else
+                 _peer_stats(nid, e, secret, hub, me))
+        keys = store.count() if nid == me else (stats or {}).get("keys")
+        ver = (code_version() if nid == me
+               else (stats or {}).get("version") or "unknown")
         if keys:
             total += keys
         rows.append({"id": nid, "mode": "relay tenant" if is_via(e["addr"])
-                     else "directly reachable", "keys": keys,
+                     else "directly reachable", "keys": keys, "version": ver,
                      "age": round(now - e["ts"] / 1000, 1)})
+    newest = max((r["version"] for r in rows
+                  if r["version"] != "unknown"), default="")
+    for r in rows:
+        r["behind"] = (r["version"] != newest
+                       and r["version"] != "unknown")
     STATUS_CACHE.update({"at": now, "rows": rows, "total": total})
     return rows, total
 
@@ -466,6 +527,7 @@ th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--dim);font-weight:normal;font-size:12px;
 text-transform:uppercase;letter-spacing:.08em}
 td.id{color:var(--gold)}td.num{text-align:right;font-variant-numeric:tabular-nums}
+td.ver{color:var(--ok)}td.behind{color:#e0b060}
 .note{background:var(--panel);border:1px solid var(--line);border-radius:10px;
 padding:16px 18px;color:var(--dim);font-size:13.5px;margin-bottom:16px}
 .note b{color:var(--txt);font-weight:normal}
@@ -478,6 +540,9 @@ def status_html(rows, total, seed_addr):
     body = "".join(
         f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
         f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
+        f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
+        f"{r.get('version', '?')}"
+        f"{' · behind' if r.get('behind') else ''}</td>"
         f"<td class='num'>{r['age']}s</td></tr>" for r in rows)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -487,7 +552,8 @@ def status_html(rows, total, seed_addr):
 <div class="sub">live status, served by the network itself</div>
 <p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
 encrypted keys stored</p>
-<table><tr><th>node</th><th>reachability</th><th>keys</th><th>last seen</th></tr>
+<table><tr><th>node</th><th>reachability</th><th>keys</th><th>version</th>
+<th>last seen</th></tr>
 {body}</table>
 <div class="note">Membership is public within a network — this page is
 everything an operator can publish about it. <b>Contents are not.</b> Every
@@ -524,7 +590,8 @@ def service_get(store, peers, path, query, quic=None, status=None):
                      "read_batches": store.read_batches,
                      "peers": len(peers.live()),
                      "mode": "tenant" if is_via(peers.addr) else "direct",
-                     "quic": quic is not None, "udp": peers.udp}
+                     "quic": quic is not None, "udp": peers.udp,
+                     "version": code_version()}
     if path == "/intel":
         n = int(parse_qs(query).get("limit", ["4"])[0])
         return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
@@ -770,7 +837,7 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
 
 
 def run(host, port, data_dir, seeds, secret="", advertise=None,
-        quic_host="0.0.0.0", public_status=False):
+        quic_host="0.0.0.0", public_status=False, auto_update=False):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
     ident = Identity(data_dir)
@@ -789,6 +856,9 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
             print(f"quic disabled: {type(e).__name__}: {e}", file=_sys.stderr)
             quic = None
     _tenant_loop.quic = quic
+    if auto_update:
+        threading.Thread(target=_update_loop, args=(secret,),
+                         daemon=True).start()
     threading.Thread(target=_gossip_loop, args=(peers, secret),
                      daemon=True).start()
     threading.Thread(target=_repair_loop, args=(store, peers, secret),
@@ -814,6 +884,12 @@ def main():
     ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
                     help="network-membership secret (or env BLINDRANGE_SECRET); "
                          "empty runs an open network")
+    ap.add_argument("--auto-update", action="store_true",
+                    default=os.environ.get("BR_AUTO_UPDATE") == "1",
+                    help="periodically fast-forward this git checkout and "
+                         "restart on new commits. You are trusting whoever "
+                         "controls the remote to run code on your machine — "
+                         "off unless you ask for it")
     ap.add_argument("--public-status", action="store_true",
                     help="serve an unauthenticated status page at / listing "
                          "live nodes and key counts (off by default: on a "
@@ -830,7 +906,7 @@ def main():
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
     run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host,
-        a.public_status)
+        a.public_status, a.auto_update)
 
 
 if __name__ == "__main__":
