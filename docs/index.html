@@ -4,16 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>blindrange — range queries over encrypted data on blind nodes</title>
-<meta name="description" content="An open-source encrypted database distributed across nodes that cannot read it. Range queries without order leakage, forward privacy at HMAC speed, and every leak measured and disclosed.">
+<meta name="description" content="An open-source encrypted database distributed across nodes that cannot read it. Range queries without order leakage, a privacy budget you set, and a storage market that pays on proved possession.">
 <meta property="og:title" content="blindrange — a database that can't read its own data">
-<meta property="og:description" content="Range queries on encrypted data, served by machines that cannot read it. No central infrastructure, no trusted component, and every leak measured and published.">
+<meta property="og:description" content="Range queries on encrypted data, served by machines that cannot read it. Store data nobody can be subpoenaed for, or run a node and earn a share of what the network earns.">
 <meta property="og:image" content="https://blindrange.dev/header.png">
 <meta property="og:url" content="https://blindrange.dev/">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
-          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c;
+          --earn:#9ad08c; }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--txt);
          font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -24,6 +25,7 @@
   .tag b { color:var(--txt); font-weight:normal; }
   h2 { font-size:15px; text-transform:uppercase; letter-spacing:.12em;
        color:var(--acc); margin:48px 0 14px; }
+  h2.e { color:var(--earn); }
   p { margin:0 0 14px; color:var(--txt); }
   p.dim, li.dim { color:var(--dim); }
   a { color:var(--acc); text-decoration:none; }
@@ -53,6 +55,56 @@
   .card p { font-size:13.5px; color:var(--dim); margin:0; }
   .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
           color:var(--dim); font-size:13px; }
+
+  /* the two doors */
+  .doors { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
+           gap:16px; margin:34px 0 8px; }
+  .door { background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; padding:22px 22px 20px; display:flex;
+          flex-direction:column; }
+  .door.store { border-color:#2b4658; }
+  .door.earn  { border-color:#38512f; }
+  .door .eyebrow { font-size:12px; letter-spacing:.1em; text-transform:uppercase;
+                   color:var(--dim); margin-bottom:10px; }
+  .door h3 { font-size:22px; letter-spacing:-.3px; margin-bottom:10px; }
+  .door.store h3 { color:var(--acc); }
+  .door.earn  h3 { color:var(--earn); }
+  .door p { font-size:14px; color:var(--dim); margin-bottom:12px; }
+  .door .go { margin-top:auto; font-size:14px; }
+  .door.earn .go a { color:var(--earn); }
+
+  /* calculator */
+  .calc { background:var(--panel); border:1px solid var(--line);
+          border-radius:12px; padding:20px 22px; margin:0 0 14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+         margin-bottom:12px; }
+  .row label { font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+               color:var(--dim); min-width:132px; }
+  input[type=number], select {
+      background:#10131a; color:var(--txt); border:1px solid var(--line);
+      border-radius:7px; padding:7px 10px; font:14px ui-monospace,Menlo,monospace; }
+  input[type=number] { width:150px; }
+  input:focus, select:focus { outline:none; border-color:var(--acc); }
+  .fieldrow { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+              margin-bottom:8px; }
+  .fieldrow .lv { color:var(--warn); font-size:13px; min-width:74px; }
+  .xbtn { background:none; border:1px solid var(--line); color:var(--dim);
+          border-radius:6px; padding:5px 9px; cursor:pointer;
+          font:13px ui-monospace,Menlo,monospace; }
+  .xbtn:hover { border-color:var(--acc); color:var(--acc); }
+  .out { border-top:1px solid var(--line); margin-top:16px; padding-top:16px; }
+  .out dl { display:grid; grid-template-columns:1fr auto; gap:7px 16px;
+            font-size:14px; margin:0 0 14px; }
+  .out dt { color:var(--dim); }
+  .out dd { margin:0; text-align:right; color:var(--txt); }
+  .out dd.big { font-size:20px; color:var(--ok); }
+  .out dd.paid { color:var(--warn); }
+  .privacy { background:#12161d; border:1px solid var(--line);
+             border-left:3px solid var(--acc); border-radius:8px;
+             padding:12px 14px; font-size:13.5px; color:var(--dim); }
+  .privacy b { color:var(--txt); font-weight:normal; }
+  .note { font-size:13px; color:var(--dim); }
+  @media (max-width:560px) { .row label { min-width:100%; } }
 </style>
 </head>
 <body>
@@ -64,11 +116,57 @@
 infrastructure, no trusted component, and — unusually — <b>every leak
 measured and published</b>.</div>
 
+<div class="doors">
+  <div class="door store">
+    <div class="eyebrow">If you have data</div>
+    <h3>Store it where no one can be made to hand it over</h3>
+    <p>Every other encrypted database has an operator — the party you
+    subpoena, breach, or serve a warrant to. This one doesn't. Your keys
+    never leave your machine, the nodes hold pseudorandom pairs they cannot
+    link or decrypt, and you can still run <code>BETWEEN</code> and
+    <code>LIKE 'ac%'</code> over the result.</p>
+    <div class="go">→ <a href="#store">Why store here</a> ·
+       <a href="#pricing">Pricing &amp; calculator</a></div>
+  </div>
+  <div class="door earn">
+    <div class="eyebrow">If you have a spare disk</div>
+    <h3>Run a node and earn a share of what the network earns</h3>
+    <p>Two commands, from behind any home router, no port forwarding. You
+    store bytes you cannot read and never become liable for. Payouts follow
+    <b>cryptographically proved possession</b> — never a number a node
+    reports about itself.</p>
+    <div class="go">→ <a href="#node">Run a node</a> ·
+       <a href="#earn">How earning works</a></div>
+  </div>
+</div>
+
 <div class="btns">
   <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
+  <a class="btn" href="https://status.blindrange.dev/">Live network</a>
   <a class="btn" href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">Threat model</a>
-  <a class="btn" href="https://github.com/alviso/blindrange/tree/main/prototype">The measurements</a>
 </div>
+
+<h2 id="store">Why store here</h2>
+<p>The honest qualifying question first: <b>if you can't name a party you'd
+rather not have to trust, use Postgres.</b> It is faster, it sorts, and it
+has thirty years on us. blindrange is for when you can name that party — a
+cloud provider, a hosting company, a jurisdiction, a future owner of your
+vendor, or your own ops team.</p>
+<table>
+  <tr><th>What you get</th><th>Why it's different</th></tr>
+  <tr><td class="k">Nothing to subpoena</td><td>There is no operator holding
+  your plaintext, because there is no operator. Not us, not the node hosts,
+  not all of them colluding.</td></tr>
+  <tr><td class="k">No breach surface</td><td>A full snapshot of every disk
+  in the network is unlinkable pseudorandom pairs. There is no database to
+  leak, so there is no breach to disclose.</td></tr>
+  <tr><td class="k">Still queryable</td><td>Range filters, prefix matches
+  and AND across fields — the thing client-side-encrypted blob storage
+  cannot do.</td></tr>
+  <tr><td class="k">A privacy budget you set</td><td><code>leaf_width</code>
+  is a dial. Whatever you choose, <b>no observer ever resolves finer than a
+  leaf</b> — not after watching every query you ever run.</td></tr>
+</table>
 
 <h2>The trick</h2>
 <p>Order-preserving encryption — the classic way to run <code>BETWEEN</code>
@@ -95,35 +193,128 @@ R:b59b23f85755164b                  →  eDF7iT+qCl4K2/LuQDdJv6…
 <span class="g">no keys · no order · no equality · no co-occurrence · forward private</span></pre>
 <p class="dim">Because the owner walks the index (nodes never receive a label
 key), forward privacy comes from plain HMAC counter chains — no public-key
-crypto in the hot path. A full snapshot of every disk in the network is
-unlinkable pseudorandom pairs.</p>
+crypto in the hot path.</p>
 
-<h2>A network anyone can run</h2>
-<div class="cards">
-  <div class="card"><h3>No central anything</h3><p>Membership is gossip;
-  joining — as a node or a client — takes the address of any one live peer.
-  Ed25519 identities make heartbeats unforgeable, and placement follows
-  stable node ids, not addresses.</p></div>
-  <div class="card"><h3>Self-healing</h3><p>Nodes continuously re-push their
-  keys to each key's current replica set. Data migrates to newcomers and
-  replication recovers from churn with no owner involvement — proven by
-  tests that kill every original holder.</p></div>
-  <div class="card"><h3>Multi-writer, no coordination</h3><p>Per-writer
-  append-only chains make the index a grow-only CRDT. Sync is galloping
-  probes against the network itself; counters are a cache, never a single
-  point of failure.</p></div>
-  <div class="card"><h3>Safe maintenance</h3><p>LSM-style compaction merges
-  streams, drops deleted entries for real, and is safe under concurrent
-  writes via an open/drain/seal epoch protocol.</p></div>
-  <div class="card"><h3>No port forwarding, ever</h3><p>A node that isn't
-  reachable diagnoses that itself and becomes a relay tenant of a peer.
-  Every reachable node is a relay, so the bridge for unconnectable nodes
-  is the network — not a special server.</p></div>
-  <div class="card"><h3>Direct paths when possible</h3><p>Tenants advertise
-  LAN and public candidates; clients punch a QUIC path straight to them,
-  falling back to the relay transparently. Measured on real home networks:
-  <b>1.7s → 0.7s</b> for the same query.</p></div>
+<h2 id="pricing">Pricing</h2>
+<p>You are charged for what the network actually holds, not for the size of
+your JSON — and those differ by <b>20–35×</b>, because a record is one
+ciphertext blob <em>plus one index entry per dyadic level per indexed
+field</em>, all of it replicated three times. Hiding that behind a
+per-gigabyte-of-your-data price would mean guessing, so instead the formula
+is published and exact:</p>
+
+<pre>keys per record   = 3 × (1 + Σ levels)          <span class="c">levels = log2(domain ÷ leaf_width)</span>
+bytes per record  = 3 × (blob + 46 × Σ levels)  <span class="c">46 B per index entry, measured</span></pre>
+
+<p class="dim">The calculator below is that formula, and it is accurate to
+0.00% against a real three-node network — not an estimate. Note what it does
+to the incentives: <b>coarser precision is both cheaper and more private.</b>
+Privacy is the cheap option here; resolution is the thing that costs money.</p>
+
+<div class="calc">
+  <div class="row">
+    <label for="recs">Records</label>
+    <input type="number" id="recs" value="5000000" min="0" step="100000">
+    <span class="note">rows you expect to store</span>
+  </div>
+  <div class="row">
+    <label for="size">Avg record</label>
+    <input type="number" id="size" value="120" min="1" step="10">
+    <span class="note">bytes of your plaintext JSON</span>
+  </div>
+  <div class="row" style="align-items:flex-start">
+    <label>Indexed fields</label>
+    <div style="flex:1;min-width:280px">
+      <div id="fields"></div>
+      <button class="xbtn" id="add">+ add field</button>
+      <span class="note" style="margin-left:8px">unindexed fields are free —
+        they ride inside the blob</span>
+    </div>
+  </div>
+
+  <div class="out">
+    <dl>
+      <dt>Keys per record (× 3 replicas)</dt><dd id="kpr">—</dd>
+      <dt>Keys on the network</dt><dd id="keys">—</dd>
+      <dt>Your data</dt><dd id="mine">—</dd>
+      <dt>Network storage (what you pay for)</dt><dd id="net">—</dd>
+      <dt>Amplification</dt><dd id="amp">—</dd>
+      <dt>Per month</dt><dd id="cost" class="big">—</dd>
+    </dl>
+    <div class="privacy" id="priv">—</div>
+  </div>
 </div>
+
+<table>
+  <tr><th>Plan</th><th>Network storage</th><th>Price</th></tr>
+  <tr><td class="k">Free</td><td>first 10 GB</td><td>$0 — no card</td></tr>
+  <tr><td class="k">Beyond that</td><td>per GB-month</td><td>$0.02</td></tr>
+  <tr><td class="k">Queries</td><td>unmetered</td><td>included</td></tr>
+</table>
+<p class="note"><b>Being straight about the free tier:</b> the network
+cannot tell whose data is whose — that is the entire point — so today
+quotas are on the honour system. Metering will be blind-signed write tokens
+(Privacy&nbsp;Pass shaped): you get a quota grant, your client spends
+unlinkable tokens, and nodes verify them without learning whose they are.
+We would know how much you were granted and never which bytes were yours.
+Until that ships, the number above is a guideline, not a gate.</p>
+
+<h2 id="node" class="e">Run a node</h2>
+<p>Two commands. It works from behind a home router with no port forwarding
+and no configuration: if your node isn't reachable it diagnoses that itself
+and becomes a relay tenant of a peer, then clients punch a direct QUIC path
+to you when they can.</p>
+<pre>pip install -e .
+blindrange-node --port 7501 --data ~/.br/n1 \
+    --seed seed.blindrange.dev:7501 --secret blindrange-public</pre>
+<p class="dim">That "secret" is published deliberately: on an open network it
+only turns away drive-by scanners and carries no security role —
+confidentiality comes from keys that never leave the owner's machine.</p>
+
+<div class="cards">
+  <div class="card"><h3>You can't read it, so you can't be liable for it</h3>
+  <p>You hold pseudorandom keys and AEAD blobs. You cannot tell what you
+  store, whose it is, or how many customers you serve — which is the point,
+  and also your protection.</p></div>
+  <div class="card"><h3>Spare capacity, not a rig</h3><p>An always-on machine
+  with a disk that isn't full. No GPU, no stake, no token, no chain.</p></div>
+  <div class="card"><h3>It heals itself</h3><p>Nodes re-push their keys to
+  each key's current replica set, so data migrates to you after you join and
+  survives you leaving. Nothing to administer.</p></div>
+</div>
+
+<h2 id="earn" class="e">How earning works</h2>
+<p><b>70% of storage revenue goes to node hosts; we keep 30%</b> for the
+seed, the aggregator and the work. Your share is <code>structural ×
+proved</code> — your position on the hash ring, multiplied by possession you
+have actually <em>proved</em>. Shares are shown live, in per-mille, on the
+<a href="https://status.blindrange.dev/">network status page</a>.</p>
+
+<p>The measurement deliberately assumes nodes cheat, so nothing a node says
+about itself can raise its earnings:</p>
+<ul>
+  <li class="dim">Owners sample their own records and check the AES-GCM tag.
+  A node cannot fabricate a hit — it cannot derive the key or forge the
+  ciphertext.</li>
+  <li class="dim">Nodes sign <em>every</em> read, not audited ones, so a node
+  cannot recognise an audit and serve those while dropping the rest.</li>
+  <li class="dim">Audits are scored per replica group against peers given the
+  identical batch, so a fabricated key can't be aimed at one node to slander
+  it, and a node with no audits yet earns nothing rather than being
+  trusted.</li>
+</ul>
+
+<p class="note"><b>And the part most networks won't print:</b> the pool is
+whatever the network actually earns. Today that is <b>$0</b> — there are no
+paying customers yet. We will not pay hosts out of revenue that hasn't come
+in, and we won't quote you a per-terabyte rate that implies otherwise. Run a
+node now because you want this to exist; the economics start when the
+customers do.</p>
+<p class="note">One more, unsolved and worth knowing before you join:
+ring placement has <b>no Sybil resistance</b>. Identities are cheap, so
+someone minting many nodes gets a larger structural share regardless of the
+possession proofs. We know, it's in the code comments, and it needs solving
+before real money moves.</p>
 
 <h2>Honesty as the design principle</h2>
 <p>Every queryable-encryption scheme leaks something. Most products bury
@@ -143,30 +334,11 @@ design and prints the numbers:</p>
   can reconstruct a column's values over time —
   <b>bounded structurally</b> by each field's <code>leaf_width</code>: no
   observer ever resolves finer than the leaf, no matter how long it
-  watches. A privacy budget you cannot accidentally overspend.</td></tr>
+  watches.</td></tr>
   <tr><td class="k">Who it's for</td><td>Not healthcare, not high-stakes
   PII. Ordinary business data on infrastructure you don't fully trust —
   with the trade-offs in front of you, not in a footnote.</td></tr>
 </table>
-
-<h2>Join the live network</h2>
-<p>There is a public demo network. Two commands make your machine a node —
-from behind any router, no configuration:</p>
-<pre>pip install -e .
-blindrange-node --port 7501 --data ~/.br/n1 \
-    --seed seed.blindrange.dev:7501 --secret blindrange-public</pre>
-<p class="dim">That "secret" is published deliberately: on an open demo
-network it only turns away drive-by scanners and carries no security role —
-confidentiality comes from keys that never leave your machine. It's a demo
-network with no durability promises; run your own for anything real.</p>
-
-<pre><span class="c"># your own network: as many nodes as you like, anywhere</span>
-blindrange-node --port 7501 --data ~/.br/n1 --secret &lt;your-secret&gt;
-blindrange-node --port 7502 --data ~/.br/n2 --seed &lt;host&gt;:7501 --secret &lt;your-secret&gt;
-
-<span class="c"># or the sample app: encrypted orders, live network panel,</span>
-<span class="c"># kill-a-node buttons, and a window into what nodes actually see</span>
-python3 examples/webdemo/app.py     <span class="g"># → http://127.0.0.1:8600</span></pre>
 
 <div class="foot">MIT-licensed research prototype. Built on structured
 encryption (Kamara–Moataz, MongoDB QE lineage), Sophos-style forward
@@ -175,5 +347,132 @@ privacy, and the attack literature it takes seriously
 <a href="https://github.com/alviso/blindrange">github.com/alviso/blindrange</a></div>
 
 </div>
+
+<script>
+// Pricing knobs — change these two numbers and the whole page follows.
+const FREE_GB = 10, USD_PER_GB_MONTH = 0.02;
+// Storage model, fitted to a real 3-node network at 0.00% error and
+// independently derivable from the wire format.
+const RF = 3, INDEX_ENTRY_B = 46, KEY_PREFIX_B = 18, AEAD_OVERHEAD_B = 28;
+
+const KINDS = {
+  time: { label: "Timestamp",
+    spans: [["1 day", 17], ["30 days", 22], ["1 year", 25], ["10 years", 29]],
+    res:   [["1 second", 0], ["1 minute", 6], ["1 hour", 12], ["1 day", 17]] },
+  num: { label: "Number",
+    spans: [["0–1 thousand", 10], ["0–1 million", 20], ["0–1 billion", 30]],
+    res:   [["exact", 0], ["nearest 100", 7], ["nearest 10,000", 14]] },
+  text: { label: "Text prefix",
+    spans: [["2 characters", 10], ["3 characters", 15], ["4 characters", 20]],
+    res:   [["exact", 0], ["group of 16", 4], ["group of 256", 8]] },
+};
+
+let fields = [{ kind: "time", span: 22, res: 12 }];
+
+function levelsOf(f) { return Math.max(0, f.span - f.res); }
+
+function resLabel(f) {
+  const r = KINDS[f.kind].res.find(x => x[1] === f.res);
+  return r ? r[0] : "—";
+}
+
+function drawFields() {
+  const host = document.getElementById("fields");
+  host.innerHTML = "";
+  fields.forEach((f, i) => {
+    const row = document.createElement("div");
+    row.className = "fieldrow";
+    const kind = sel(Object.keys(KINDS).map(k => [KINDS[k].label, k]), f.kind,
+      v => { fields[i].kind = v;
+             fields[i].span = KINDS[v].spans[Math.min(1, KINDS[v].spans.length - 1)][1];
+             fields[i].res = KINDS[v].res[0][1]; draw(); });
+    const span = sel(KINDS[f.kind].spans, f.span,
+      v => { fields[i].span = +v; draw(); });
+    const res = sel(KINDS[f.kind].res, f.res,
+      v => { fields[i].res = +v; draw(); });
+    const lv = document.createElement("span");
+    lv.className = "lv";
+    lv.textContent = levelsOf(f) + " levels";
+    row.append(kind, span, document.createTextNode("→"), res, lv);
+    if (fields.length > 1) {
+      const x = document.createElement("button");
+      x.className = "xbtn"; x.textContent = "×";
+      x.onclick = () => { fields.splice(i, 1); draw(); };
+      row.append(x);
+    }
+    host.append(row);
+  });
+}
+
+function sel(opts, value, onchange) {
+  const s = document.createElement("select");
+  opts.forEach(([label, v]) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = label;
+    if (v === value) o.selected = true;
+    s.append(o);
+  });
+  s.onchange = e => onchange(e.target.value);
+  return s;
+}
+
+const fmt = n => n.toLocaleString("en-US");
+function bytes(b) {
+  if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB";
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+  if (b >= 1e3) return (b / 1e3).toFixed(1) + " kB";
+  return Math.round(b) + " B";
+}
+
+function draw() {
+  drawFields();
+  const recs = Math.max(0, +document.getElementById("recs").value || 0);
+  const size = Math.max(1, +document.getElementById("size").value || 1);
+  const levels = fields.reduce((a, f) => a + levelsOf(f), 0);
+
+  const blob = KEY_PREFIX_B + Math.ceil((size + AEAD_OVERHEAD_B) * 4 / 3);
+  const perRecord = RF * (blob + INDEX_ENTRY_B * levels);
+  const netBytes = recs * perRecord;
+  const mine = recs * size;
+  const gb = netBytes / 1e9;
+  const billable = Math.max(0, gb - FREE_GB);
+  const cost = billable * USD_PER_GB_MONTH;
+
+  document.getElementById("kpr").textContent =
+    fmt(RF * (1 + levels)) + "  (" + (1 + levels) + " × " + RF + ")";
+  document.getElementById("keys").textContent = fmt(recs * RF * (1 + levels));
+  document.getElementById("mine").textContent = bytes(mine);
+  document.getElementById("net").textContent = bytes(netBytes);
+  document.getElementById("amp").textContent =
+    mine ? (netBytes / mine).toFixed(1) + "×" : "—";
+
+  const el = document.getElementById("cost");
+  if (gb <= FREE_GB) {
+    el.textContent = "free";
+    el.className = "big";
+  } else {
+    el.textContent = "$" + cost.toFixed(2);
+    el.className = "big paid";
+    el.classList.add("paid");
+  }
+
+  const parts = fields.map(f =>
+    KINDS[f.kind].label.toLowerCase() + " finer than " + resLabel(f));
+  document.getElementById("priv").innerHTML = levels === 0
+    ? "With no indexed fields there is nothing to watch: the network sees "
+      + "opaque blobs and answers no range queries at all."
+    : "<b>Privacy you're buying:</b> an adversary logging every query you "
+      + "ever run, forever, never resolves your " + parts.join(", or your ")
+      + ". That bound is structural — not a policy, and not something more "
+      + "observation can erode.";
+}
+
+document.getElementById("add").onclick = () => {
+  fields.push({ kind: "num", span: 20, res: 7 }); draw();
+};
+document.getElementById("recs").oninput = draw;
+document.getElementById("size").oninput = draw;
+draw();
+</script>
 </body>
 </html>
