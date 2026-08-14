@@ -110,7 +110,15 @@ def _read_version():
     """
     commit = _git("rev-parse", "--short", "HEAD")
     count = _git("rev-list", "--count", "HEAD")
-    return (f"{VERSION}+{commit}" if commit else VERSION,
+    # A commit hash describes the checkout, not necessarily the code that
+    # got imported: start a node with edits in the working tree and it
+    # reports the last commit while running something else entirely. That
+    # is exactly how a node appeared to be missing a fix it actually had.
+    # Tracked files only — an untracked data directory next to the source
+    # is normal and says nothing about which code is running.
+    dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
+    ver = f"{VERSION}+{commit}" if commit else VERSION
+    return (ver + ("+dirty" if dirty else ""),
             int(count) if count.isdigit() else 0)
 
 
@@ -761,7 +769,9 @@ def status_html(rows, total, seed_addr):
         f"{(str(int((r['measured']['rate']) * 100)) + '% · ' + str(r['measured']['reports']) + ' audits') if r.get('measured') else '—'}</td>"
         f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
         f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
-        f"{' · behind' if r.get('behind') else ''}</td>"
+        f"{' · behind' if r.get('behind') else ''}"
+        f"{' · modified' if str(r.get('version', '')).endswith('+dirty') else ''}"
+        f"</td>"
         f"<td class='num'>{r['age']}s</td>"
         f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
         f"</tr>" for r in rows)
