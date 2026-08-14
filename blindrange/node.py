@@ -599,9 +599,15 @@ def status_html(rows, total, seed_addr):
 <div class="sub">live status, served by the network itself</div>
 <p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
 encrypted keys stored</p>
-<table><tr><th>node</th><th>reachability</th><th>keys</th><th>version</th>
-<th>last seen</th></tr>
+<table><tr><th>node</th><th>reachability</th><th>keys (self-reported)</th>
+<th>version</th><th>last seen</th></tr>
 {body}</table>
+<div class="note"><b>Key counts on this page are self-reported and
+unverified.</b> A node returns whatever number it likes; nothing here checks
+it. What can be proved is possession: a data owner can ask the node
+responsible for a record to produce it and verify the AES-GCM tag, which a
+node cannot fake — it can neither derive the key nor forge the ciphertext.
+Reachability and last-seen are measured, not claimed.</div>
 <div class="note">Membership is public within a network — this page is
 everything an operator can publish about it. <b>Contents are not.</b> Every
 database here is encrypted under its own master key, so records and index

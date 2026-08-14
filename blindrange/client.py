@@ -52,6 +52,7 @@ import hmac
 import json
 import math
 import os
+import time
 from .transport import POOL
 from . import direct as direct_mod
 from base64 import b64decode, b64encode
@@ -1279,6 +1280,82 @@ class Owner:
         self._save()
         return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
 
+
+    # ------------------------------------------------------------- audit
+    def audit(self, sample=200, timeout=8):
+        """Verify what each node ACTUALLY holds, without asking it.
+
+        A node's /stats key count is self-reported and worth nothing the
+        moment anything depends on it. This proves possession instead: pick
+        records at random, ask each node the ring holds responsible for them
+        — that node alone, not the usual replica fan-out — and check the
+        answer. Record blobs are AES-GCM, so a returned value either
+        decrypts and authenticates or it does not. A node cannot fabricate a
+        hit: it cannot derive the key (a PRF of a master key it never sees)
+        and it cannot forge the ciphertext.
+
+        Returns per node: how many sampled keys it was responsible for, how
+        many it returned, how many verified, its median latency, and what it
+        claims to hold — so a claim far above what proofs support is visible.
+
+        Honest limits. This measures only keys THIS database can name, so it
+        says nothing about a node's total utilisation; that is only
+        estimable by aggregating audits from many owners. And a node that
+        fetches a blob from a replica on demand would pass — proving
+        possession over time needs repeated audits, not one.
+        """
+        field = next((n for n, sp in self._st["schema"].items()
+                      if sp.get("kind") != "text"), None)
+        spec = self._st["schema"][field or next(iter(self._st["schema"]))]
+        if field is None:
+            field = next(iter(self._st["schema"]))
+            pred = {"field": field, "prefix": ""}
+        else:
+            pred = {"field": field, "lo": 0, "hi": (1 << spec["bits"]) - 1}
+        rids = [r["_rid"] for r in self.query_stream([pred], limit=sample)]
+
+        report = {}
+        for nid in self.ring.addrs:
+            report[nid] = {"addr": self._addr(nid), "responsible": 0,
+                           "returned": 0, "verified": 0, "latency_ms": None,
+                           "claims": None}
+        times = {nid: [] for nid in report}
+        for rid in rids:
+            key = "R:" + rid
+            for nid in self.ring.route(key):
+                if nid not in report:
+                    continue
+                addr = self._addr(nid)
+                if not addr:
+                    continue
+                report[nid]["responsible"] += 1
+                t0 = time.time()
+                try:
+                    got = self._post(addr, "/mget", {"keys": [key]})["values"]
+                except (OSError, ValueError, KeyError):
+                    continue
+                times[nid].append((time.time() - t0) * 1000)
+                blob = got.get(key)
+                if blob is None:
+                    continue
+                report[nid]["returned"] += 1
+                try:                       # AEAD is the proof
+                    raw = b64decode(blob)
+                    self._aes.decrypt(raw[:12], raw[12:], None)
+                    report[nid]["verified"] += 1
+                except Exception:
+                    pass                   # returned something, but not ours
+        for nid, r in report.items():
+            ts = sorted(times[nid])
+            if ts:
+                r["latency_ms"] = round(ts[len(ts) // 2], 1)
+            try:
+                r["claims"] = self._get(r["addr"], "/stats").get("keys")
+            except (OSError, ValueError):
+                pass
+            r["possession"] = (round(r["verified"] / r["responsible"], 4)
+                               if r["responsible"] else None)
+        return {"sampled_records": len(rids), "nodes": report}
 
     def drop(self, confirm=False):
         """Remove every key of this database from the network.

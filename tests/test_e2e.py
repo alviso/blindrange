@@ -366,6 +366,25 @@ class TestE2E(unittest.TestCase):
         self.rows.extend([{"amount": 800_000 + i, "day": 1, "name": "bnd",
                            "row": 70_000 + i} for i in range(6)])
 
+    def test_12j_audit_measures_possession(self):
+        """A node's key count is self-reported; possession is not. Auditing
+        fetches records from the node the ring holds responsible and checks
+        AES-GCM, which a node cannot fake — it can neither derive the key
+        nor forge the ciphertext. Non-destructive; loss detection lives in
+        TestAudit, which owns its own nodes."""
+        self.owner.drain()
+        report = self.owner.audit(sample=40)
+        self.assertGreater(report["sampled_records"], 0)
+        checked = [v for v in report["nodes"].values() if v["responsible"]]
+        self.assertTrue(checked)
+        # A spread is normal and honest: a third replica holds nothing until
+        # repair reaches it (write_acks is below the replica count), and a
+        # freshly joined node holds nothing at all. Possession is a rate,
+        # not a verdict — which matters a great deal if it ever feeds payouts.
+        best = max(checked, key=lambda v: v["possession"] or 0)
+        self.assertGreater(best["possession"], 0.5)
+        self.assertIsNotNone(best["claims"])     # self-report, for contrast
+
     def test_13_unauthenticated_requests_rejected(self):
         import json as _json
         req = urllib.request.Request(
@@ -414,6 +433,67 @@ class TestE2E(unittest.TestCase):
         got = self._got(self.owner.query("amount", 888_000, 888_100))
         self.assertEqual(got, sorted(r["row"] for r in raced))
         self.assert_query("amount", 100_000, 300_000)   # older data intact
+
+
+class TestAudit(unittest.TestCase):
+    """Silent data loss is invisible in self-reported stats and obvious to an
+    audit. Owns its nodes: the test destroys data deliberately."""
+
+    def test_audit_catches_a_node_that_discards_data(self):
+        import shutil as _shutil
+        import sqlite3
+        tmp = tempfile.mkdtemp(prefix="blindrange_audit_")
+        secret, root = "audnet", str(Path(__file__).resolve().parents[1])
+        procs = []
+        try:
+            for i, port in enumerate((7931, 7932, 7933)):
+                args = [sys.executable, "-m", "blindrange.node", "--port",
+                        str(port), "--data", f"{tmp}/n{port}",
+                        "--secret", secret]
+                if i:
+                    args += ["--seed", "127.0.0.1:7931"]
+                procs.append(subprocess.Popen(
+                    args, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, cwd=root))
+            wait_http("127.0.0.1:7931")
+            wait_peers("127.0.0.1:7931", 3, secret)
+
+            owner = Owner.create(f"{tmp}/a.brdb", "pw",
+                                 {"ts": {"type": "int", "bits": 22,
+                                         "leaf_width": 4096}},
+                                 bootstrap=["127.0.0.1:7931"],
+                                 network_secret=secret)
+            owner.write_acks = 3                # all replicas, so 1.0 is fair
+            rng = random.Random(6)
+            owner.insert_many([{"ts": rng.randrange(2592000), "m": "x"}
+                               for _ in range(600)])
+            owner.drain()
+
+            before = owner.audit(sample=40)["nodes"]
+            for v in before.values():
+                if v["responsible"]:
+                    self.assertEqual(v["possession"], 1.0)
+
+            victim = max(before, key=lambda n: before[n]["possession"] or 0)
+            port = int(before[victim]["addr"].split(":")[1])
+            db = sqlite3.connect(f"{tmp}/n{port}/kv.db")
+            blobs = [r[0] for r in db.execute(
+                "SELECT k FROM kv WHERE k LIKE 'R:%'").fetchall()]
+            for k in blobs[:len(blobs) // 2]:
+                db.execute("DELETE FROM kv WHERE k=?", (k,))
+            db.commit()
+            db.close()
+
+            after = owner.audit(sample=60)["nodes"][victim]
+            self.assertLess(after["possession"], 0.8,
+                            "audit missed silently discarded data")
+            self.assertIsNotNone(after["claims"])   # still reports a number
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            _shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestNodeBackgroundRepair(unittest.TestCase):
