@@ -110,6 +110,9 @@ def _fresh_sig(sig, now):
 STATE_PATH = os.environ.get("BR_REPORT_STATE", "")     # empty = memory only
 
 
+_SAVE_BROKEN = [False]
+
+
 def _save():
     if not STATE_PATH:
         return
@@ -119,8 +122,19 @@ def _save():
             json.dump({"reports": {n: list(dq) for n, dq in REPORTS.items()},
                        "sigs": list(SEEN_SIGS)}, f)
         os.replace(tmp, STATE_PATH)
-    except OSError:
-        pass                        # durability is best-effort, never fatal
+        _SAVE_BROKEN[0] = False
+    except OSError as e:
+        # Never fatal — the page must keep serving — but never silent
+        # either. Swallowing this hid a systemd ProtectSystem=strict mount
+        # that made every write fail while the page went on presenting
+        # shares as durable evidence. Storage that quietly does nothing is
+        # worse than none, so say so once, loudly, and again if it recovers
+        # and breaks anew.
+        if not _SAVE_BROKEN[0]:
+            _SAVE_BROKEN[0] = True
+            print(f"WARNING: cannot persist audit reports to {STATE_PATH}: "
+                  f"{e}. Shares will reset on restart.",
+                  file=sys.stderr, flush=True)
 
 
 def _load():
