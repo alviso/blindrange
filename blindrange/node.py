@@ -504,9 +504,10 @@ def status_rows(store, peers, secret, hub):
                      "age": round(now - e["ts"] / 1000, 1)})
     newest = max((r["version"] for r in rows
                   if r["version"] != "unknown"), default="")
+    # a node that cannot report a version is running code older than the
+    # version field itself, so it is behind by definition
     for r in rows:
-        r["behind"] = (r["version"] != newest
-                       and r["version"] != "unknown")
+        r["behind"] = r["version"] != newest
     STATUS_CACHE.update({"at": now, "rows": rows, "total": total})
     return rows, total
 
@@ -541,7 +542,7 @@ def status_html(rows, total, seed_addr):
         f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
         f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
         f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
-        f"{r.get('version', '?')}"
+        f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
         f"{' · behind' if r.get('behind') else ''}</td>"
         f"<td class='num'>{r['age']}s</td></tr>" for r in rows)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
