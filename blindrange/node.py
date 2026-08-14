@@ -64,7 +64,14 @@ from . import __version__ as VERSION
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
 PEER_TTL = 15.0           # drop peers silent for this long
 REPAIR_EVERY = float(os.environ.get("BR_REPAIR_EVERY", "5"))
-REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "200"))
+REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "0"))   # 0 = adaptive
+# A fixed batch size silently stops being repair once a store is large: 200
+# keys every 5s is a full sweep in minutes at test scale and in *days* at
+# nine million keys, so a node that falls behind never catches up. Size the
+# batch from the store instead, targeting a complete sweep in this many
+# hours.
+REPAIR_SWEEP_H = float(os.environ.get("BR_REPAIR_SWEEP_H", "3"))
+REPAIR_BATCH_MAX = int(os.environ.get("BR_REPAIR_BATCH_MAX", "20000"))
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
 DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
@@ -662,7 +669,13 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
             continue
         ring = Ring(sorted(live), replicas=3)
         addr_of = {nid: e["addr"] for nid, e in live.items()}
-        batch = store.batch_after(cursor, REPAIR_BATCH)
+        if REPAIR_BATCH:
+            size = REPAIR_BATCH
+        else:
+            rounds = max(1.0, REPAIR_SWEEP_H * 3600 / max(0.1, REPAIR_EVERY))
+            size = int(min(REPAIR_BATCH_MAX,
+                           max(200, store.count() / rounds)))
+        batch = store.batch_after(cursor, size)
         if not batch:
             cursor = ""
             continue
