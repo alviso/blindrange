@@ -265,7 +265,7 @@ class Owner:
     # outright by Cloudflare's bot rules (measured: 403 for
     # "Python-urllib/3.13", 200 for anything else), so an unnamed client
     # fails against any CDN-fronted issuer — including ours.
-    USER_AGENT = f"blindrange/{VERSION} (+https://blindrange.dev)"
+    USER_AGENT = token_mod.USER_AGENT
 
     def _issuer_open(self, req, timeout):
         """The issuer is the client's only HTTPS dependency — nodes speak

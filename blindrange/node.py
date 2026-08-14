@@ -276,9 +276,16 @@ class TokenGate:
 
     def refresh(self):
         try:
-            with urllib.request.urlopen(self.issuer + "/keys", timeout=10) as r:
+            req = urllib.request.Request(
+                self.issuer + "/keys",
+                headers={"User-Agent": tok_mod.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as r:
                 body = json.loads(r.read())
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            # Worth a line in the log: a node that cannot fetch keys fails
+            # OPEN, so this is the difference between metered and not.
+            print(f"issuer key fetch failed ({self.issuer}): {e}",
+                  file=sys.stderr, flush=True)
             return False
         keys = {}
         for kid, k in (body.get("keys") or {}).items():

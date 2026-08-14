@@ -55,6 +55,17 @@ import math
 import secrets
 from base64 import b64decode, b64encode
 
+from . import __version__ as VERSION
+
+# Identify ourselves on every outbound HTTPS call. urllib's default is
+# blocked outright by Cloudflare's bot rules (measured against the live
+# issuer: 403 for "Python-urllib/3.13", 200 for anything named), so an
+# anonymous client cannot talk to a CDN-fronted issuer at all. This lives
+# here rather than in the client because the NODE fetches issuer keys too —
+# and having fixed only the client, the first metered node came up silently
+# unmetered.
+USER_AGENT = f"blindrange/{VERSION} (+https://blindrange.dev)"
+
 PUBLIC_EXPONENT = 65537
 KEY_BITS = 2048
 NONCE_BYTES = 32
