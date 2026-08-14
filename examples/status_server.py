@@ -13,6 +13,9 @@ no network secret.
 """
 import argparse
 import json
+import os
+import threading
+import time
 import sys
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +62,28 @@ def make_handler(node_addr):
     return Handler
 
 
+def _restart_on_new_code():
+    """Exit when the checkout moves, so the supervisor restarts us on the new
+    renderer. Without this the status page keeps serving whatever it imported
+    at boot, while the node it reports on self-updates underneath it."""
+    import subprocess
+    repo = str(Path(__file__).resolve().parents[1])
+
+    def head():
+        try:
+            return subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                                  capture_output=True, text=True,
+                                  timeout=15).stdout.strip()
+        except Exception:
+            return ""
+    start = head()
+    while True:
+        time.sleep(60)
+        now = head()
+        if now and start and now != start:
+            os._exit(0)
+
+
 def main():
     ap = argparse.ArgumentParser(description="blindrange public status server")
     ap.add_argument("--node", default="127.0.0.1:7501",
@@ -66,6 +91,7 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
     a = ap.parse_args()
+    threading.Thread(target=_restart_on_new_code, daemon=True).start()
     ThreadingHTTPServer((a.host, a.port),
                         make_handler(a.node)).serve_forever()
 
