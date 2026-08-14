@@ -139,7 +139,15 @@ def _update_loop(secret):
             if after and after != before:
                 print(f"auto-update: {before[:8]} -> {after[:8]}, restarting",
                       file=sys.stderr, flush=True)
-                os._exit(0)                    # supervisor restarts us
+                # Re-exec rather than exit. Exiting only works under a
+                # supervisor, and a node started by hand in a terminal would
+                # simply vanish — which is how a live network lost two of
+                # three nodes mid-benchmark. execv replaces this process
+                # with a fresh one on the new code, keeping the same command
+                # line, and works identically under systemd.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception:
             continue
 
