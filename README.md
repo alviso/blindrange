@@ -385,6 +385,35 @@ mid-demo and queries keep answering), and **node view** (a live `/intel` dump of
 what a node operator actually sees: opaque keys, opaque blobs, nothing else).
 Use `--bootstrap host:port` to point the same app at a real network instead.
 
+## Performance, measured
+
+`examples/bench_logs.py` runs a log-ingest workload and reports where the
+time goes. Numbers below: 100k log lines, 9 nodes and the client all on one
+laptop — a deliberately unfair setup, since real nodes don't share a CPU.
+
+| | full schema (29 keys/record) | timestamp only (11 keys/record) |
+|---|---|---|
+| ingest, start | ~4,000 rec/s | ~9,300 rec/s |
+| ingest, marginal at 100k | ~1,600 rec/s | ~4,500 rec/s |
+
+**The lever is index depth, not record count.** Each indexed field costs
+`bits - log2(leaf_width)` keys per record, so a coarser bucket or one fewer
+indexed field buys throughput directly. Write rate also declines as a
+database grows (pseudorandom keys are worst-case for a B-tree), which is why
+the marginal rate is the honest one to quote — and why rotating databases by
+period (one per day or week) is the right pattern for logs. Independent
+databases coexist invisibly on the same nodes, so rotation costs nothing.
+
+**Reads do not degrade with size**, because a range collapses to a handful of
+intervals whatever the database holds:
+
+| query | rows | time |
+|---|---|---|
+| 1-hour window | 134 | 0.02s |
+| 6-hour window | 770 | 0.03s |
+| 1-day window | 3,214 | 0.08s |
+| `count()` over everything | 100,000 | 0.03s, zero records fetched |
+
 ## Testing
 
 ```bash
