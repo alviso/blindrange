@@ -152,6 +152,43 @@ def issue(account, kid, blinded):
 AVG_KEY_BYTES = 46
 
 
+# Self-serve signup. Without it, turning metering on closes the front door:
+# nodes would demand tokens that no visitor has any way to obtain.
+#
+# There is no email verification, so this does not stop someone minting
+# accounts with invented addresses. Rate limiting by IP raises the cost of
+# doing it at scale and nothing more. That is a deliberate, disclosed
+# trade — the alternative is a verification flow that would learn more
+# about people than the rest of the system is willing to know.
+SIGNUP_PER_IP_PER_HOUR = 3
+SIGNUP_LOG = {}          # ip -> [timestamps]  (in memory, never persisted)
+
+
+def signup_allowed(ip):
+    now = time.time()
+    with LOCK:
+        seen = [t for t in SIGNUP_LOG.get(ip, []) if now - t < 3600]
+        if len(seen) >= SIGNUP_PER_IP_PER_HOUR:
+            SIGNUP_LOG[ip] = seen
+            return False
+        seen.append(now)
+        SIGNUP_LOG[ip] = seen
+        return True
+
+
+def signup(email, ip):
+    email = (email or "").strip().lower()
+    if "@" not in email or len(email) > 200 or " " in email:
+        raise ValueError("a valid email address is required")
+    if not signup_allowed(ip):
+        raise PermissionError("too many signups from this address; try later")
+    with LOCK:
+        for key, acct in STATE["accounts"].items():
+            if acct.get("email") == email:
+                raise ValueError("that address already has an account")
+    return grant(email, FREE_GRANT)
+
+
 def make_handler(admin_token):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -195,6 +232,22 @@ def make_handler(admin_token):
                     return self._send(402, {"error": str(e)})
                 except (ValueError, TypeError) as e:
                     return self._send(400, {"error": str(e)})
+
+            if path == "/signup":
+                try:
+                    key = signup(data.get("email", ""),
+                                 self.headers.get("X-Forwarded-For",
+                                                  self.client_address[0]
+                                                  ).split(",")[0].strip())
+                except PermissionError as e:
+                    return self._send(429, {"error": str(e)})
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
+                return self._send(200, {
+                    "account": key, "granted_bytes": FREE_GRANT,
+                    "note": "Free tier. Keep this key: it is the only thing "
+                            "that identifies your account, and it is not "
+                            "recoverable."})
 
             if path == "/grant":
                 if not admin_token or data.get("admin") != admin_token:
