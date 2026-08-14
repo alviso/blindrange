@@ -401,19 +401,31 @@ class Owner:
                 continue
         return won
 
+    CHUNK = 4000          # keys per request; see _delete
+
     def _delete(self, keys):
-        """Best-effort removal from every node that might hold the keys."""
+        """Best-effort removal from every node that might hold the keys.
+
+        Chunked, because compaction hands this every key of an epoch at once:
+        a million keys is a ~34MB request that simply times out, and since
+        deletion is best-effort the failure is swallowed and the space is
+        never reclaimed. That is invisible in a small test and total at
+        scale — measured on a live network, a compaction reporting 1,000,000
+        entries dropped freed nothing at all.
+        """
         PROBE_EXTRA = 3
-        by_node = {}
-        for k in keys:
-            for nid in self.ring.route(k, self.ring.replicas + PROBE_EXTRA):
-                addr = self._addr(nid)
-                if addr:
-                    by_node.setdefault(addr, []).append(k)
-        jobs = [self.pool.submit(self._post, a, "/delete", {"keys": ks})
-                for a, ks in by_node.items()]
-        for j in jobs:
-            _ok(j)
+        keys = list(keys)
+        for start in range(0, len(keys), self.CHUNK):
+            by_node = {}
+            for k in keys[start:start + self.CHUNK]:
+                for nid in self.ring.route(k, self.ring.replicas + PROBE_EXTRA):
+                    addr = self._addr(nid)
+                    if addr:
+                        by_node.setdefault(addr, []).append(k)
+            jobs = [self.pool.submit(self._post, a, "/delete", {"keys": ks})
+                    for a, ks in by_node.items()]
+            for j in jobs:
+                _ok(j)
 
     def _mget(self, keys):
         """Replica lookup in two parallel phases, with hedged reads.
@@ -1245,8 +1257,8 @@ class Owner:
         for u, c in t_ends.items():
             old_keys += [self._ut(k_t, E, u, i) for i in range(1, c + 1)]
 
-        if puts:
-            self._put(puts)
+        for start in range(0, len(puts), self.CHUNK):
+            self._put(puts[start:start + self.CHUNK])
         self._delete(old_keys)
         seal_slot = self._st["epoch_len"] + 1
         self._put_nx(self._sys_key(b"epoch", seal_slot),
