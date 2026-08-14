@@ -52,11 +52,14 @@ import hmac
 import json
 import math
 import os
+import ssl
 import threading
 import time
+import urllib.error
 import urllib.request
 from .transport import POOL
 from . import direct as direct_mod
+from . import __version__ as VERSION
 from . import receipt
 from . import token as token_mod
 from base64 import b64decode, b64encode
@@ -258,9 +261,45 @@ class Owner:
             w.add(toks)
             self._store_wallet(w)
 
+    # Identify the client honestly. urllib's default User-Agent is blocked
+    # outright by Cloudflare's bot rules (measured: 403 for
+    # "Python-urllib/3.13", 200 for anything else), so an unnamed client
+    # fails against any CDN-fronted issuer — including ours.
+    USER_AGENT = f"blindrange/{VERSION} (+https://blindrange.dev)"
+
+    def _issuer_open(self, req, timeout):
+        """The issuer is the client's only HTTPS dependency — nodes speak
+        plain HTTP — so this is where a missing CA bundle first bites.
+
+        python.org builds on macOS ship with no trust store at all until
+        Install Certificates.command has been run, which turns a working
+        setup into an opaque handshake failure. Fall back to certifi when
+        the default store is empty, and if verification still fails, say
+        what to do instead of surfacing the raw OpenSSL error.
+        """
+        ctx = ssl.create_default_context()
+        if ssl.get_default_verify_paths().cafile is None:
+            try:
+                import certifi
+                ctx.load_verify_locations(certifi.where())
+            except Exception:
+                pass
+        if isinstance(req, str):
+            req = urllib.request.Request(req)
+        req.add_header("User-Agent", self.USER_AGENT)
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+                raise ConnectionError(
+                    f"cannot verify TLS for {self._st['issuer']}: no usable CA "
+                    f"bundle. On a python.org build run "
+                    f"'Install Certificates.command', or `pip install certifi`."
+                ) from e
+            raise
+
     def _issuer_keys(self):
-        with urllib.request.urlopen(
-                self._st["issuer"] + "/keys", timeout=15) as r:
+        with self._issuer_open(self._st["issuer"] + "/keys", 15) as r:
             body = json.loads(r.read())
         return {kid: {"n": int(k["n"]), "e": int(k["e"])}
                 for kid, k in (body.get("keys") or {}).items()}
@@ -269,7 +308,7 @@ class Owner:
         req = urllib.request.Request(
             self._st["issuer"] + path, data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with self._issuer_open(req, 30) as r:
             return json.loads(r.read())
 
     def top_up(self, denom=1000, count=32):
