@@ -51,9 +51,31 @@ here follows from removing the trusted party:
   with no egress fees. Cost alone rarely justifies a migration; combined with
   the above it can.
 
-The honest test: if you can name the party you would rather not have to
-trust, this is for you. If you can't, it isn't — and a managed database will
-serve you better.
+**The qualifying question:** *right now, who can technically read your data
+that you would rather couldn't?* If a name comes out immediately — a
+provider, a jurisdiction, a subprocessor, an admin, a stranger running a
+node — that name is the reason to be here. If nothing comes out, your trust
+is free, and a managed database will serve you better.
+
+Note that "would rather not trust" is not "believe to be malicious". It
+includes parties you trust perfectly well but whose trust is expensive to
+maintain: the provider you audit annually, the subprocessor you disclose in
+every enterprise deal, the admin whose access you review each quarter.
+Compliance is the industry of proving that trust was warranted. Nodes that
+cannot read anything make most of that proof unnecessary.
+
+### The inversion
+
+Conventional security narrows *who holds* the data. blindrange makes holding
+it irrelevant, so the data can be handed to thousands of strangers on
+purpose. There is no readable database anywhere — the familiar headline, *"N
+million records exposed"*, has no mechanism here, because no node ever holds
+a record.
+
+The risk does not disappear, though; it moves, and concentrates. Lose your
+master key and the data is gone permanently, by design, with no provider to
+call. You trade a large, shared, continuously-defended attack surface for one
+small secret that is entirely your problem.
 
 ## How it works
 
