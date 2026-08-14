@@ -267,49 +267,14 @@ class Owner:
     # fails against any CDN-fronted issuer — including ours.
     USER_AGENT = token_mod.USER_AGENT
 
-    def _issuer_open(self, req, timeout):
-        """The issuer is the client's only HTTPS dependency — nodes speak
-        plain HTTP — so this is where a missing CA bundle first bites.
-
-        python.org builds on macOS ship with no trust store at all until
-        Install Certificates.command has been run, which turns a working
-        setup into an opaque handshake failure. Fall back to certifi when
-        the default store is empty, and if verification still fails, say
-        what to do instead of surfacing the raw OpenSSL error.
-        """
-        ctx = ssl.create_default_context()
-        if ssl.get_default_verify_paths().cafile is None:
-            try:
-                import certifi
-                ctx.load_verify_locations(certifi.where())
-            except Exception:
-                pass
-        if isinstance(req, str):
-            req = urllib.request.Request(req)
-        req.add_header("User-Agent", self.USER_AGENT)
-        try:
-            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
-        except urllib.error.URLError as e:
-            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
-                raise ConnectionError(
-                    f"cannot verify TLS for {self._st['issuer']}: no usable CA "
-                    f"bundle. On a python.org build run "
-                    f"'Install Certificates.command', or `pip install certifi`."
-                ) from e
-            raise
-
     def _issuer_keys(self):
-        with self._issuer_open(self._st["issuer"] + "/keys", 15) as r:
-            body = json.loads(r.read())
+        body = token_mod.fetch_json(self._st["issuer"] + "/keys", timeout=15)
         return {kid: {"n": int(k["n"]), "e": int(k["e"])}
                 for kid, k in (body.get("keys") or {}).items()}
 
     def _issuer_post(self, _addr, path, payload):
-        req = urllib.request.Request(
-            self._st["issuer"] + path, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
-        with self._issuer_open(req, 30) as r:
-            return json.loads(r.read())
+        return token_mod.fetch_json(self._st["issuer"] + path, payload,
+                                    timeout=30)
 
     def top_up(self, denom=1000, count=32):
         """Buy write capacity. Blinding happens here, so the issuer sees

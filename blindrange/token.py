@@ -53,6 +53,9 @@ import hashlib
 import json
 import math
 import secrets
+import ssl
+import urllib.error
+import urllib.request
 from base64 import b64decode, b64encode
 
 from . import __version__ as VERSION
@@ -65,6 +68,52 @@ from . import __version__ as VERSION
 # and having fixed only the client, the first metered node came up silently
 # unmetered.
 USER_AGENT = f"blindrange/{VERSION} (+https://blindrange.dev)"
+
+
+def _ssl_context():
+    """A context that works on machines with no trust store.
+
+    python.org builds on macOS ship without one until Install
+    Certificates.command has been run, which turns a correct setup into an
+    opaque handshake failure.
+    """
+    ctx = ssl.create_default_context()
+    if ssl.get_default_verify_paths().cafile is None:
+        try:
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except Exception:
+            pass
+    return ctx
+
+
+def fetch_json(url, payload=None, timeout=15):
+    """The single way anything in blindrange talks to the issuer.
+
+    Both callers reach it over a CDN from arbitrary machines, and both hit
+    the same two failures — a blocked User-Agent and a missing CA bundle.
+    Fixing those per-caller is how the first metered node came up silently
+    unmetered, so there is exactly one implementation and both use it.
+
+    HTTPError propagates untouched: the issuer answers 402 for an exhausted
+    quota and callers need to see that as itself, not as a transport error.
+    """
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"User-Agent": USER_AGENT}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_ssl_context()) as r:
+            return json.loads(r.read())
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+            raise ConnectionError(
+                f"cannot verify TLS for {url}: no usable CA bundle. On a "
+                f"python.org build run 'Install Certificates.command', or "
+                f"`pip install certifi`.") from e
+        raise
 
 PUBLIC_EXPONENT = 65537
 KEY_BITS = 2048

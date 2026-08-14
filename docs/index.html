@@ -260,13 +260,28 @@ us more to hold.</p>
   <tr><td class="k">Beyond that</td><td>per GB-month</td><td>$0.005</td></tr>
   <tr><td class="k">Queries</td><td>unmetered</td><td>included</td></tr>
 </table>
-<p class="note"><b>Being straight about the free tier:</b> the network
-cannot tell whose data is whose — that is the entire point — so today
-quotas are on the honour system. Metering will be blind-signed write tokens
-(Privacy&nbsp;Pass shaped): you get a quota grant, your client spends
-unlinkable tokens, and nodes verify them without learning whose they are.
-We would know how much you were granted and never which bytes were yours.
-Until that ships, the number above is a guideline, not a gate.</p>
+<p class="note"><b>How metering works, and exactly what it costs you in
+privacy:</b> quotas are enforced with <b>blind-signed write tokens</b>.
+Issuance is identified — you sign up, and we know what you were granted.
+Redemption is anonymous: your client blinds every token before we sign it,
+so the signatures we produce are over values we have never seen, and a
+token arriving at a node cannot be matched back to your account by us, by
+the node, or by the two of us together. What we do still learn is how much
+capacity you drew and when. Volume and timing — never linkage.</p>
+
+<pre><span class="c"># a free-tier key, no card</span>
+curl -X POST https://tokens.blindrange.dev/signup \
+     -H 'Content-Type: application/json' -d '{"email":"you@example.com"}'
+
+<span class="c"># point a database at it; the client buys and spends tokens for you</span>
+owner.configure_tokens("https://tokens.blindrange.dev", "&lt;your-key&gt;")</pre>
+
+<p class="note">Two caveats worth stating rather than burying. There is
+<b>no email verification</b>, so nothing prevents someone minting accounts
+with invented addresses — signup is rate-limited per IP and that is the
+whole defence. And your key is the only thing identifying your account:
+keep it, because it cannot be recovered, and anyone holding it can spend
+your quota.</p>
 
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding
