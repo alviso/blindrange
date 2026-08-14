@@ -154,7 +154,17 @@ def _update_loop(secret):
                 # line, and works identically under systemd.
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                # Preserve HOW we were started. Under `python -m pkg.mod`,
+                # sys.argv[0] is the module's file path, so re-execing it
+                # directly runs the file as a top-level script and every
+                # relative import fails. __main__.__spec__ carries the module
+                # name precisely for this.
+                spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+                if spec is not None:
+                    args = [sys.executable, "-m", spec.name] + sys.argv[1:]
+                else:
+                    args = [sys.executable] + sys.argv
+                os.execv(sys.executable, args)
         except Exception:
             continue
 
