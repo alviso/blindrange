@@ -63,7 +63,12 @@ from .dyadic import (dyadic_cover, encode_str, levels_for, max_level,
                      prefix_range)
 from .ring import Ring
 
-PEER_LIVE_S = 12.0
+# A node applies its own TTL (15s) before serving /peers, so the client
+# re-filtering more strictly than that just discards nodes the network still
+# considers live. Under write load a busy node's heartbeat can lag several
+# seconds; dropping it then shrinks the ring, which makes quorum wait on
+# whatever slow node remains — the opposite of what you want under load.
+PEER_LIVE_S = 40.0
 TOMB = "@tomb"                     # reserved label for tombstone chains
 
 
