@@ -48,6 +48,7 @@ import hmac
 import json
 import os
 import random
+import shutil
 import sqlite3
 import sys
 import threading
@@ -99,6 +100,45 @@ UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "300"))   # 5 min
 # busy node will never produce.
 UPDATE_IDLE_SAMPLES = int(os.environ.get("BR_UPDATE_IDLE_SAMPLES", "2"))
 BIND_RETRY_S = int(os.environ.get("BR_BIND_RETRY_S", "15"))
+VACUUM_EVERY = float(os.environ.get("BR_VACUUM_EVERY", "300"))
+# Reclaim in slices. A full VACUUM rewrites the file and locks the database
+# for as long as that takes, which on a gigabyte store is tens of seconds of
+# a node being unavailable. Incremental gives the space back a few thousand
+# pages at a time without ever blocking a request for long.
+VACUUM_PAGES = int(os.environ.get("BR_VACUUM_PAGES", "2000"))
+
+
+def parse_size(spec, total=None):
+    """'10GB', '500M', '5%' -> bytes. None/'' means no limit.
+
+    Percentages are of the filesystem the data lives on, because that is how
+    someone donating spare capacity actually thinks about it — "you can have
+    a tenth of this disk", not "you can have 43 GB".
+    """
+    if not spec:
+        return None
+    t = str(spec).strip().upper().replace(" ", "")
+    if t.endswith("%"):
+        if not total:
+            raise ValueError("percentage needs a filesystem to measure")
+        return int(total * float(t[:-1]) / 100)
+    mult = 1
+    for suffix, m in (("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20),
+                      ("KB", 1 << 10), ("T", 1 << 40), ("G", 1 << 30),
+                      ("M", 1 << 20), ("K", 1 << 10), ("B", 1)):
+        if t.endswith(suffix):
+            t, mult = t[:-len(suffix)], m
+            break
+    return int(float(t) * mult)
+
+
+def human_size(n):
+    if n is None:
+        return "unlimited"
+    for unit, div in (("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{n / 1024:.0f} KB"
 UPDATE_MAX_DEFER = float(os.environ.get("BR_UPDATE_MAX_DEFER", "3600"))
 
 
@@ -473,10 +513,18 @@ GATE = None          # set at startup when --issuer is configured
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, cap_bytes=None):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.path = path
+        self.cap_bytes = cap_bytes
         self.lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
+        # INCREMENTAL before any table exists, so a NEW store can hand space
+        # back without a rewrite. Measured on a live node before this: 81% of
+        # a 1 GB file was free pages SQLite would reuse but never release, so
+        # the operator's disk showed five times the live data — which makes
+        # any disk cap they set wrong by the same factor.
+        self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.db.execute("PRAGMA journal_mode=WAL")
         # Keys are pseudorandom, so writes land all over the B-tree — the
         # page cache is what keeps that from degrading as the table grows
@@ -511,6 +559,60 @@ class Store:
         self.read_batches = 0
         self.writes = 0
         self.deletes = 0
+
+    def disk_used(self):
+        """Bytes this node occupies, as the operator's disk reports it —
+        the database plus its write-ahead log, not the logical key size."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
+
+    def is_full(self):
+        return self.cap_bytes is not None and self.disk_used() >= self.cap_bytes
+
+    def vacuum_step(self, pages=VACUUM_PAGES):
+        """Give a slice of free space back. Returns bytes released."""
+        with self.lock:
+            mode = self.db.execute("PRAGMA auto_vacuum").fetchone()[0]
+            if mode != 2:                    # 2 == INCREMENTAL
+                return 0                     # pre-existing store, see convert()
+            before = self.disk_used()
+            # Two things that look optional and are not. The pragma does its
+            # work one page per STEP, so an undrained cursor frees exactly
+            # one page — measured: 1004 free pages went to 1003. And in WAL
+            # mode the main file only shrinks at a checkpoint, so without one
+            # the space comes back to SQLite but never to the operator's
+            # disk, which is the number the cap is measured against.
+            self.db.execute(f"PRAGMA incremental_vacuum({int(pages)})").fetchall()
+            self.db.commit()
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            return max(0, before - self.disk_used())
+
+    def free_fraction(self):
+        with self.lock:
+            q = lambda s: self.db.execute(s).fetchone()[0]
+            count = q("PRAGMA page_count") or 1
+            return (q("PRAGMA freelist_count") or 0) / count
+
+    def convert_to_incremental(self):
+        """One-time rewrite for a store created before incremental vacuum.
+
+        Expensive and blocking, so it is done once, in the background, and
+        only when there is enough dead space to be worth it.
+        """
+        with self.lock:
+            if self.db.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+                return 0
+            before = self.disk_used()
+            self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            self.db.execute("VACUUM").fetchall()
+            self.db.commit()
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            return max(0, before - self.disk_used())
 
     def get_meta(self, key, default=""):
         with self.lock:
@@ -753,6 +855,13 @@ def service_post(store, peers, hub, secret, path, data, quic=None):
 def _service_post(store, peers, hub, secret, path, data, quic=None):
     if path == "/kv":
         entries = [(k, v) for k, v in data["entries"]]
+        # Capacity is checked BEFORE the token gate, so a write we are going
+        # to refuse never costs the client a token. The cap applies to
+        # node-to-node repair too — repair is how most data arrives, so
+        # exempting it would make the limit decorative.
+        if store.is_full():
+            return 507, {"error": "node is at its configured disk limit",
+                         "used": store.disk_used(), "cap": store.cap_bytes}
         if GATE is not None:
             ok, code, why = GATE.check(data, len(entries))
             if not ok:
@@ -1121,6 +1230,8 @@ def service_get(store, peers, path, query, quic=None, status=None):
                      "keys": store.count(),
                      "read_batches": store.read_batches,
                      "writes": store.writes, "deletes": store.deletes,
+                     "disk_used": store.disk_used(),
+                     "disk_cap": store.cap_bytes, "full": store.is_full(),
                      "peers": len(peers.live()),
                      "mode": "tenant" if is_via(peers.addr) else "direct",
                      "quic": quic is not None, "udp": peers.udp,
@@ -1202,6 +1313,34 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
                                      }).encode(), secret)
             except OSError:
                 pass
+
+
+def _vacuum_loop(store):
+    """Hand free space back to the filesystem, a slice at a time.
+
+    Without this the file only ever grows: SQLite reuses free pages
+    internally but never returns them, so a node that churns looks far
+    larger on disk than the data it holds — and any cap the operator sets is
+    measured against the inflated number.
+    """
+    # A store predating incremental vacuum needs one rewrite. Do it in the
+    # background and only when it would actually recover something.
+    try:
+        if store.free_fraction() > 0.25:
+            freed = store.convert_to_incremental()
+            if freed:
+                print(f"reclaimed {human_size(freed)} converting the store to "
+                      f"incremental vacuum", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"vacuum conversion skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+    while True:
+        time.sleep(VACUUM_EVERY + random.random() * 30)
+        try:
+            store.vacuum_step()
+        except Exception as e:
+            print(f"vacuum step failed: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
 
 
 def _reachability_loop(store, peers, hub, secret, direct_addr):
@@ -1397,11 +1536,28 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
 
 def run(host, port, data_dir, seeds, secret="", advertise=None,
         quic_host="0.0.0.0", public_status=False, auto_update=False,
-        issuer=""):
+        issuer="", max_disk=""):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
     ident = Identity(data_dir)
-    store = Store(os.path.join(data_dir, "kv.db"))
+    try:
+        total = shutil.disk_usage(data_dir).total
+    except OSError:
+        total = None
+    cap = parse_size(max_disk, total)
+    store = Store(os.path.join(data_dir, "kv.db"), cap_bytes=cap)
+    if cap:
+        print(f"disk limit {human_size(cap)}"
+              f"{f' ({max_disk} of {human_size(total)})' if '%' in str(max_disk) else ''}"
+              f" · currently using {human_size(store.disk_used())}", flush=True)
+        if store.is_full():
+            # A cap below the empty database's own footprint means the node
+            # accepts nothing, ever, while looking perfectly healthy. Say so
+            # rather than letting someone wonder why their node never fills.
+            print(f"WARNING: already at the limit ({human_size(store.disk_used())} "
+                  f">= {human_size(cap)}) — this node will refuse every write "
+                  f"until the limit is raised or space is reclaimed",
+                  file=sys.stderr, flush=True)
     peers = Peers(ident, addr)
     peers.contacts.update(seeds)
     if issuer:
@@ -1432,6 +1588,7 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
                      daemon=True).start()
     threading.Thread(target=_repair_loop, args=(store, peers, secret),
                      daemon=True).start()
+    threading.Thread(target=_vacuum_loop, args=(store,), daemon=True).start()
     threading.Thread(target=_reachability_loop,
                      args=(store, peers, hub, secret, addr),
                      daemon=True).start()
@@ -1487,6 +1644,10 @@ def main():
                     help="bind address for the QUIC/UDP socket used by direct "
                          "paths (default all interfaces — hole punching needs "
                          "internet reachability even when HTTP is local)")
+    ap.add_argument("--max-disk", default=os.environ.get("BR_MAX_DISK", ""),
+                    help="stop accepting writes past this much disk, e.g. "
+                         "10GB or 5%% (of the filesystem). Data already held "
+                         "is never deleted to get under it.")
     ap.add_argument("--issuer", default=os.environ.get("BR_ISSUER", ""),
                     help="token issuer URL; writes require a blind token "
                          "when set (nodes hold only its public keys)")
@@ -1497,7 +1658,7 @@ def main():
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
     run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host,
-        a.public_status, a.auto_update, a.issuer)
+        a.public_status, a.auto_update, a.issuer, a.max_disk)
 
 
 if __name__ == "__main__":
