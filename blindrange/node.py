@@ -835,9 +835,19 @@ def status_rows(store, peers, secret, hub):
         build = BUILD if nid == me else (stats or {}).get("build", 0)
         if keys:
             total += keys
+        # Carry the throughput counters through as well. Adding them to
+        # /stats was not enough: the public activity figures are derived
+        # from THIS aggregation, and a missing field summed to zero, so the
+        # network read as idle while it was writing thousands of keys.
         rows.append({"id": nid, "mode": "relay tenant" if is_via(e["addr"])
                      else "directly reachable", "keys": keys, "version": ver,
                      "build": build or 0,
+                     "writes": (store.writes if nid == me
+                                else (stats or {}).get("writes", 0)) or 0,
+                     "deletes": (store.deletes if nid == me
+                                 else (stats or {}).get("deletes", 0)) or 0,
+                     "read_batches": (store.read_batches if nid == me
+                                      else (stats or {}).get("read_batches", 0)) or 0,
                      "age": round(now - e["ts"] / 1000, 1)})
     # compare commit COUNTS: hashes have no order, and a node too old to
     # report one is behind by definition

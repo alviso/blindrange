@@ -132,6 +132,12 @@ def main():
     while not STOP:
         try:
             due = a.compact_every and (cycles + 1) % a.compact_every == 0
+            # Announce the cycle before running it. Printing only on
+            # completion made a slow compaction indistinguishable from a
+            # hang — the process sat at 0% CPU with no output and looked
+            # dead when it was working.
+            print(f"  cycle {cycles + 1} starting"
+                  f"{' (compaction due)' if due else ''}…", flush=True)
             t = cycle(owner, a.records, compact=due)
             cycles += 1
             print(f"  cycle {cycles}: insert {t['insert']:.0f}s "
