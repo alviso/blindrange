@@ -918,16 +918,30 @@ def audit_badge(rows):
     worst = min(measured, key=lambda r: r["measured"]["rate"])
     rate = worst["measured"]["rate"]
     reports = sum(r["measured"]["reports"] for r in measured)
-    covered = f"{len(measured)}/{len(live)} nodes proved possession"
-    if len(measured) == len(live) and rate >= 0.9:
+    pending = len(live) - len(measured)
+
+    # A failing node and a node nobody has audited yet are different things,
+    # and the first version called both DEGRADED. A node joining the network
+    # then made the whole page cry wolf within minutes of doing nothing
+    # wrong — which is how a badge teaches people to ignore it. Only
+    # EVIDENCE of loss degrades; absence of evidence is reported as
+    # absence of evidence.
+    if rate < 0.9:
+        return (f'<div class="badge warn"><span class="dot"></span>'
+                f'DEGRADED <small>&nbsp;·&nbsp; a proved node is at '
+                f'{int(rate * 100)}% — it is missing data it was sent'
+                f'{f", and {pending} more await a first audit" if pending else ""}'
+                f'</small></div>')
+    if pending:
         return (f'<div class="badge pass"><span class="dot"></span>'
-                f'AUDIT PASSED <small>&nbsp;·&nbsp; {covered} across '
-                f'{reports} report(s) &nbsp;·&nbsp; weakest node '
-                f'{int(rate * 100)}%</small></div>')
-    return (f'<div class="badge warn"><span class="dot"></span>'
-            f'DEGRADED <small>&nbsp;·&nbsp; {covered}, weakest at '
-            f'{int(rate * 100)}% — a node is missing data it was sent, or '
-            f'has not been audited</small></div>')
+                f'AUDIT PASSED <small>&nbsp;·&nbsp; {len(measured)} of '
+                f'{len(live)} nodes proved possession across {reports} '
+                f'report(s), none below {int(rate * 100)}% &nbsp;·&nbsp; '
+                f'{pending} awaiting a first audit</small></div>')
+    return (f'<div class="badge pass"><span class="dot"></span>'
+            f'AUDIT PASSED <small>&nbsp;·&nbsp; all {len(live)} nodes proved '
+            f'possession across {reports} report(s) &nbsp;·&nbsp; weakest '
+            f'node {int(rate * 100)}%</small></div>')
 
 
 def status_html(rows, total, seed_addr, head=None):

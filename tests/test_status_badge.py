@@ -45,12 +45,21 @@ class TestAuditBadge(unittest.TestCase):
         self.assertIn("42%", text(b))
         self.assertNotIn("PASSED", text(b))
 
-    def test_partial_coverage_degrades(self):
-        """Two proved nodes out of three is not a pass, even if both are
-        perfect — the third is unaccounted for."""
+    def test_a_node_awaiting_its_first_audit_is_not_degradation(self):
+        """A joining node made the page read DEGRADED within minutes of
+        doing nothing wrong. Absence of evidence is not evidence of loss,
+        and a badge that cries wolf is one people learn to ignore."""
         b = audit_badge([row(0, 1.0, 2), row(1), row(2, 1.0, 2)])
+        self.assertNotIn("DEGRADED", text(b))
+        self.assertIn("PASSED", text(b))
+        self.assertIn("awaiting a first audit", text(b))
+        self.assertIn("2 of 3", text(b))
+
+    def test_real_loss_still_degrades_even_with_pending_nodes(self):
+        b = audit_badge([row(0, 1.0, 2), row(1, 0.42, 2), row(2)])
         self.assertIn("DEGRADED", text(b))
-        self.assertIn("2/3", text(b))
+        self.assertIn("42%", text(b))
+        self.assertIn("await a first audit", text(b))
 
     def test_threshold_is_not_a_rounding_accident(self):
         self.assertIn("PASSED", text(audit_badge([row(0, 0.9, 1)])))
@@ -59,7 +68,7 @@ class TestAuditBadge(unittest.TestCase):
     def test_dead_nodes_do_not_count_against_coverage(self):
         b = audit_badge([row(0, 1.0, 2), row(1, mode="down")])
         self.assertIn("PASSED", text(b))
-        self.assertIn("1/1", text(b))
+        self.assertIn("all 1 nodes", text(b))
 
     def test_no_live_nodes(self):
         self.assertIn("NO LIVE NODES", text(audit_badge([row(0, mode="down")])))
