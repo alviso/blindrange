@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange-s3 — an S3 endpoint that cannot read what it stores</title>
+<meta name="description" content="Point anything that already writes to S3 — backup tools, compliance archivers, Loki, rclone — at storage whose operators hold pseudorandom keys and AEAD blobs. Prefix listings stay native.">
+<meta property="og:title" content="blindrange-s3 — an S3 endpoint that cannot read what it stores">
+<meta property="og:description" content="Everything that archives data already speaks S3. This speaks it back, without anyone holding your data being able to read a filename, let alone a file.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/s3">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 80px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:38px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.12em;
+       color:var(--acc); margin:44px 0 14px; }
+  p { margin:0 0 14px; }
+  p.dim, li.dim { color:var(--dim); }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .btns { display:flex; gap:12px; flex-wrap:wrap; margin:24px 0 8px; }
+  .btn { border:1px solid var(--line); border-radius:8px; padding:10px 18px;
+         color:var(--txt); background:var(--panel); }
+  .btn.primary { border-color:var(--acc); color:var(--acc); }
+  .btn:hover { text-decoration:none; border-color:var(--acc); }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:16px 18px; overflow-x:auto; font-size:13.5px; line-height:1.55;
+        margin:0 0 14px; }
+  pre .c { color:var(--dim); }  pre .g { color:var(--ok); }
+  code { color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin:0 0 14px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--dim); font-weight:normal; text-transform:uppercase;
+       font-size:12px; letter-spacing:.08em; }
+  td.k { color:var(--warn); white-space:nowrap; }
+  td.y { color:var(--ok); } td.n { color:var(--dim); }
+  ul { margin:0 0 14px 20px; } li { margin-bottom:8px; }
+  .tabs { display:flex; gap:6px; margin-bottom:-1px; flex-wrap:wrap; }
+  .tab { border:1px solid var(--line); border-bottom:none;
+         border-radius:8px 8px 0 0; padding:7px 14px; font-size:13px;
+         color:var(--dim); cursor:pointer; background:#12161d; }
+  .tab.on { color:var(--acc); border-color:var(--acc);
+            border-bottom-color:transparent; background:var(--panel); }
+  .tab:focus { outline:none; }
+  .panel { display:none; } .panel.on { display:block; }
+  .panel pre { border-radius:0 10px 10px 10px; }
+  .warnbox { background:#12161d; border:1px solid var(--line);
+             border-left:3px solid var(--warn); border-radius:8px;
+             padding:14px 16px; font-size:13.5px; color:var(--dim); }
+  .warnbox b { color:var(--txt); font-weight:normal; }
+  .okbox { background:#12161d; border:1px solid var(--line);
+           border-left:3px solid var(--ok); border-radius:8px;
+           padding:14px 16px; font-size:13.5px; color:var(--dim); }
+  .okbox b { color:var(--txt); font-weight:normal; }
+  .foot { margin-top:52px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a> · <a href="/demos">demos</a></div>
+
+<h1>blindrange<span>-s3</span></h1>
+<div class="tag">An S3 endpoint whose operators <b>cannot read what they
+store</b> — not the contents, not the filenames, not the directory
+structure. Point anything that already writes to S3 at it: backup tools,
+compliance archivers, Loki, rclone.</div>
+
+<div class="btns">
+  <a class="btn primary" href="https://github.com/alviso/blindrange/tree/main/examples/s3gateway">Source &amp; README</a>
+  <a class="btn" href="https://github.com/alviso/blindrange/tree/main/examples/s3backup">Backup demo</a>
+  <a class="btn" href="/#pricing">What it costs</a>
+</div>
+
+<h2>The gap it fills</h2>
+<p>Encrypting before you upload is easy. The problem is that it takes the
+catalog with it — encrypt the object keys and you have a bucket of opaque
+blobs plus a local index you now have to keep safe separately, which is the
+thing you were trying to avoid.</p>
+<table>
+  <tr><th></th><th>searchable catalog</th><th>host cannot read it</th></tr>
+  <tr><td class="k">Plain S3</td><td class="y">yes</td>
+      <td class="n">no — the provider reads everything</td></tr>
+  <tr><td class="k">Encrypt-then-upload</td>
+      <td class="n">no — you encrypted the names too</td><td class="y">yes</td></tr>
+  <tr><td class="k">blindrange-s3</td><td class="y">yes</td><td class="y">yes</td></tr>
+</table>
+<p>A prefix listing here is a <b>dyadic index lookup over encrypted keys</b>,
+not a scan of anything readable. So <code>ls logs/2026/08/</code> is a native
+operation and no node learns what it matched.</p>
+
+<h2>Point your tools at it</h2>
+<div class="tabgroup">
+<div class="tabs">
+  <button class="tab on" data-t="rc">rclone</button>
+  <button class="tab" data-t="bo">boto3</button>
+  <button class="tab" data-t="cli">aws-cli</button>
+  <button class="tab" data-t="run">run the gateway</button>
+</div>
+<div class="panel on" id="rc"><pre>[blindrange]
+type              = s3
+provider          = Other
+endpoint          = http://127.0.0.1:8720
+access_key_id     = blindrange
+secret_access_key = &lt;yours&gt;
+force_path_style  = true
+
+<span class="c"># then, as usual</span>
+rclone copy ~/documents blindrange:archive/documents</pre></div>
+<div class="panel" id="bo"><pre>s3 = boto3.client(
+    "s3", endpoint_url="http://127.0.0.1:8720",
+    aws_access_key_id="blindrange", aws_secret_access_key="...",
+    config=Config(s3={"addressing_style": "path"}))
+
+s3.put_object(Bucket="archive", Key="logs/2026/08/app.log", Body=data)
+s3.list_objects_v2(Bucket="archive", Prefix="logs/2026/")</pre></div>
+<div class="panel" id="cli"><pre>aws configure set default.s3.addressing_style path
+
+aws --endpoint-url http://127.0.0.1:8720 s3 cp file.txt s3://archive/
+aws --endpoint-url http://127.0.0.1:8720 s3 ls s3://archive/logs/</pre></div>
+<div class="panel" id="run"><pre>python3 examples/s3gateway/gateway.py \
+    --state ~/.blindrange/s3.brdb \
+    --bootstrap seed.blindrange.dev:7501 \
+    --secret blindrange-public \
+    --access-key blindrange --secret-key &lt;choose one&gt;
+<span class="g"># → http://127.0.0.1:8720</span></pre></div>
+</div>
+
+<h2>Run it beside your data, never in front of it</h2>
+<p><b>Where this process runs is the entire security model.</b> The master
+key lives in it. Objects are encrypted there, before anything leaves the
+machine, and the nodes holding them see pseudorandom keys and AEAD blobs.</p>
+<p class="dim">This is the same line
+<a href="https://storj.dev/dcs/api/s3/s3-compatible-gateway">Storj draws</a>
+between its hosted gateway, where keys sit server-side, and its self-hosted
+one that keeps encryption end-to-end. Hosting it for you would be more
+convenient and would remove the only reason to choose it over S3, so we
+don't offer that half.</p>
+
+<div class="okbox"><b>Tested, not asserted.</b> Write a payload marked
+<code>TOP-SECRET-MARKER</code> to <code>confidential/salaries.csv</code>,
+then scan every key and value on all three nodes' disks: the payload is
+absent, the filename is absent, and the path is absent — while the object
+still reads back byte-identical. That check runs in the test suite as
+<code>test_09_nodes_hold_nothing_readable</code>, not once by hand.</div>
+
+<h2>How an object is stored</h2>
+<p>Two pieces, deliberately split:</p>
+<ul>
+  <li class="dim">a small <b>record</b>, indexed on bucket, key, mtime and
+  size — which is what makes <code>ListObjectsV2</code> with a prefix a
+  native lookup rather than a scan</li>
+  <li class="dim">its <b>bytes</b>, as unindexed AEAD chunks of 512 kB spread
+  across the ring, so a large object doesn't land whole on one replica set
+  and doesn't pay for index entries nobody will ever query</li>
+</ul>
+<p class="dim">That second point matters for the bill: object bodies cost
+storage and replication but almost no index amplification, so an archive of
+few large objects sits at the cheap end of the
+<a href="/#pricing">calculator</a> — near object-storage pricing rather than
+database pricing.</p>
+
+<h2>What works</h2>
+<p>Verified against <b>boto3</b> — an independent SigV4 implementation, which
+is the only way to know the signer is right rather than merely
+self-consistent.</p>
+<table>
+  <tr><td class="k">PutObject / GetObject / HeadObject / DeleteObject</td><td class="y">yes</td></tr>
+  <tr><td class="k">ListObjectsV2 — prefix, delimiter, continuation</td><td class="y">yes</td></tr>
+  <tr><td class="k">ListBuckets, CreateBucket, DeleteObjects</td><td class="y">yes</td></tr>
+  <tr><td class="k">Multipart upload</td><td class="y">yes — 5 MB via boto3 <code>upload_file</code>, byte-identical</td></tr>
+  <tr><td class="k">SigV4 verification</td><td class="y">yes — a wrong secret is refused</td></tr>
+  <tr><td class="k">aws-chunked streaming bodies</td><td class="y">decoded</td></tr>
+</table>
+<p class="dim">Using a real client paid for itself immediately: it found two
+bugs that would otherwise have shipped. The canonical query string wasn't
+RFC 3986-encoded, so a prefix like <code>logs/2026/</code> failed to sign
+<em>while an unfiltered listing kept working</em> — the bug hid behind the
+case anyone tries first. And <code>HEAD</code> emitted two
+<code>Content-Length</code> headers, which makes a strict client abort
+rather than degrade.</p>
+
+<h2>What does not work</h2>
+<div class="warnbox">
+An S3 endpoint that fails mysteriously is worse than one with a stated edge,
+so: <b>no range GETs</b> (a <code>Range:</code> header is ignored and the
+whole object returned, which will disappoint anything that seeks inside
+archives); <b>no versioning, ACLs, bucket policies, lifecycle rules, tagging
+or presigned URLs</b>; <b>buckets are implicit</b> — <code>CreateBucket</code>
+succeeds without creating anything and a bucket exists once it holds an
+object; <b>multipart parts are held in memory</b> until completion, so a very
+large multipart upload is bounded by RAM; and <b>streaming payload
+signatures are not verified</b>, which is why binding to a non-loopback
+interface with <code>--no-auth</code> is refused outright.
+<br><br>
+Listing is also bounded by what the index can discriminate — the key field
+resolves the first 12 characters and exact prefix matching finishes
+client-side. Correct, but a listing under a very deep shared prefix does
+more work than S3 would.
+</div>
+
+<h2>A worked example</h2>
+<p>The <a href="https://github.com/alviso/blindrange/tree/main/examples/s3backup">backup
+demo</a> uses plain boto3 and <b>imports nothing from blindrange</b> — it
+would run unchanged against AWS. Backing up the package source to a
+three-node network:</p>
+<pre>snapshot 20260815T180000Z: 14 files, 259,724 bytes in 0.3s
+
+find work --name '*.py'    <span class="c">→ 13 of 14 objects</span>
+restore + verify           <span class="c">→ 14 identical, 0 differ</span>
+diff -r original restored  <span class="g">→ IDENTICAL to the original tree</span>
+
+what the machine storing it sees:
+  B:0c31fd78ff7a2432bd4eec2a0e68d5dd  ->  FkVzGNFZ1d9mPoXmYJUeluoF
+  B:5619f394bdb1bd32fb6e1e5d587bec10  ->  46jrSv2aUjqM8ovsEcQFCdvT
+  2,059 keys, none readable, none named after your files</pre>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/demos">demos</a> ·
+<a href="/audit">audit log</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+<script>
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  const g = t.closest('.tabgroup');
+  g.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+  g.querySelectorAll('.panel').forEach(x => x.classList.remove('on'));
+  t.classList.add('on');
+  document.getElementById(t.dataset.t).classList.add('on');
+});
+</script>
+</body>
+</html>
