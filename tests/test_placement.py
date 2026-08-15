@@ -34,9 +34,14 @@ class TestFailureGroup(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertEqual(a, "24.72.147.0/24")
 
-    def test_tenant_without_candidates_falls_back_to_the_relay(self):
-        self.assertEqual(failure_group("via:46.4.48.244:7501/x"),
-                         "46.4.48.0/24")
+    def test_tenant_without_candidates_is_its_own_group(self):
+        """Observed live: a tenant and its relay were treated as one place
+        purely because one relays for the other. Relaying is not a shared
+        disk, and 'unknown' must never mean 'shared'."""
+        relay = failure_group("46.4.48.244:7501")
+        tenant = failure_group("via:46.4.48.244:7501/abc123")
+        self.assertNotEqual(tenant, relay)
+        self.assertNotEqual(tenant, failure_group("via:46.4.48.244:7501/def456"))
 
     def test_ipv6_uses_the_routed_prefix(self):
         self.assertEqual(failure_group("[2a06:98c1:3121::3]:7501"),
@@ -120,3 +125,20 @@ class TestPlacement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGroupingBias(unittest.TestCase):
+    """The two errors are not symmetric, and the code must lean the safe way.
+
+    Calling independent nodes "the same place" costs spread. Calling
+    co-located nodes "different places" claims durability that is not there.
+    """
+
+    def test_private_subnets_stay_grouped(self):
+        a = failure_group("n1", "192.168.1.10:7501")
+        b = failure_group("n2", "192.168.1.99:7501")
+        self.assertEqual(a, b, "same LAN must not read as two places")
+
+    def test_a_public_candidate_beats_a_lan_one(self):
+        g = failure_group("via:r:7501/x", "192.168.1.5:7501,24.72.147.56:7501")
+        self.assertEqual(g, "24.72.147.0/24")

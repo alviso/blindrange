@@ -43,9 +43,29 @@ def failure_group(addr: str, udp: str = "") -> str:
 
     Relay tenants advertise "via:<relay>/<id>", which describes the relay's
     network and not the tenant's. Their own public UDP candidate is the
-    honest signal, so it wins when present; falling back to the relay would
-    group every tenant of one relay together and quietly refuse to place
-    data across them.
+    honest signal and wins when present. With no candidate the tenant gets
+    a group of its own rather than its relay's: observed live, Mac B and
+    the seed were being treated as one place purely because one relays for
+    the other, which is not a shared disk. A tenant does depend on its
+    relay to be REACHED, but that is availability and it can re-home;
+    durability is about whose machine holds the bytes.
+
+    WHEN IN DOUBT, GROUP. The two possible errors are not symmetric. Calling
+    two independent nodes "the same place" costs diversity: replicas still
+    get placed, and durability is no worse than it was before any of this
+    existed. Calling two co-located nodes "different places" claims
+    diversity that is not there and puts every copy on one machine — which
+    is the failure this whole mechanism exists to prevent. So a private
+    /24 stays a group even though 192.168.1.0/24 is the most common home
+    subnet on earth: merging two unrelated households costs a little
+    spread, while splitting one household's cluster would be a lie.
+
+    Note what is deliberately not done: hostnames are not resolved. DNS
+    would make this depend on when and where it was evaluated, and client
+    and node must derive identical groups or they will fight over
+    placement. Two hostnames pointing at one host therefore look
+    independent — the unsafe direction, and the reason a node should
+    advertise an address rather than a name where it can.
     """
     host = ""
     if udp:
@@ -57,7 +77,7 @@ def failure_group(addr: str, udp: str = "") -> str:
     if not host:
         a = str(addr)
         if a.startswith("via:"):
-            a = a[4:].rpartition("/")[0]
+            return "tenant:" + a.rpartition("/")[2]
         host = a.rsplit(":", 1)[0]
     host = host.strip("[]")
     parts = host.split(".")
