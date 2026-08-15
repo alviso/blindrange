@@ -749,7 +749,7 @@ STATUS_CSS = """
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--txt);font:15px/1.65 ui-monospace,
 SFMono-Regular,Menlo,monospace;padding:48px 24px 80px}
-.wrap{max-width:760px;margin:0 auto}
+.wrap{max-width:1080px;margin:0 auto}
 h1{font-size:30px;margin-bottom:6px}h1 span{color:var(--acc)}
 .sub{color:var(--dim);margin-bottom:28px}
 .big{font-size:15px;color:var(--dim);margin:0 0 18px}
@@ -765,7 +765,54 @@ padding:16px 18px;color:var(--dim);font-size:13.5px;margin-bottom:16px}
 .note b{color:var(--txt);font-weight:normal}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .foot{color:var(--dim);font-size:13px;margin-top:26px}
+.badge{display:inline-flex;align-items:center;gap:10px;border-radius:10px;
+padding:11px 17px;font-size:14px;border:1px solid;margin:0 0 20px;
+letter-spacing:.04em}
+.badge .dot{width:9px;height:9px;border-radius:50%;flex:none}
+.badge.pass{border-color:#2f6d3f;background:#122016;color:var(--ok)}
+.badge.pass .dot{background:var(--ok)}
+.badge.warn{border-color:#6d5a2f;background:#201c12;color:var(--gold)}
+.badge.warn .dot{background:var(--gold)}
+.badge.none{border-color:var(--line);background:var(--panel);color:var(--dim)}
+.badge.none .dot{background:var(--dim)}
+.badge small{color:var(--dim);font-size:12.5px;letter-spacing:0}
+@media (max-width:700px){body{padding:28px 14px 60px}
+th,td{padding:7px 6px;font-size:13px}}
 """
+
+
+def audit_badge(rows):
+    """One line answering the question people arrive with: is the data
+    still there?
+
+    Deliberately not a green light that is always on. It reports the WORST
+    live node, because a network is only as intact as its weakest replica
+    holder, and it says "unproved" rather than "passed" when nobody has
+    audited recently. An unaudited network and a healthy one must never
+    look the same — which is precisely what a decorative badge would do,
+    and this page went sixteen hours in that state earlier today.
+    """
+    live = [r for r in rows if r.get("mode") != "down"]
+    measured = [r for r in live if r.get("measured")]
+    if not live:
+        return '<div class="badge none"><span class="dot"></span>NO LIVE NODES</div>'
+    if not measured:
+        return ('<div class="badge none"><span class="dot"></span>'
+                'UNPROVED <small>&nbsp;·&nbsp; no audit in the last 6 hours, '
+                'so no node can currently show it holds anything</small></div>')
+    worst = min(measured, key=lambda r: r["measured"]["rate"])
+    rate = worst["measured"]["rate"]
+    reports = sum(r["measured"]["reports"] for r in measured)
+    covered = f"{len(measured)}/{len(live)} nodes proved possession"
+    if len(measured) == len(live) and rate >= 0.9:
+        return (f'<div class="badge pass"><span class="dot"></span>'
+                f'AUDIT PASSED <small>&nbsp;·&nbsp; {covered} across '
+                f'{reports} report(s) &nbsp;·&nbsp; weakest node '
+                f'{int(rate * 100)}%</small></div>')
+    return (f'<div class="badge warn"><span class="dot"></span>'
+            f'DEGRADED <small>&nbsp;·&nbsp; {covered}, weakest at '
+            f'{int(rate * 100)}% — a node is missing data it was sent, or '
+            f'has not been audited</small></div>')
 
 
 def status_html(rows, total, seed_addr, head=None):
@@ -808,6 +855,7 @@ def status_html(rows, total, seed_addr, head=None):
 </head><body><div class="wrap">
 <h1>blind<span>range</span> — public network</h1>
 <div class="sub">live status, served by the network itself</div>
+{audit_badge(rows)}
 <p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
 encrypted keys stored</p>
 <table><tr><th>node</th><th>reachability</th><th>keys (self-reported)</th>
