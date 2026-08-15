@@ -38,10 +38,26 @@ import threading
 from base64 import b64decode, b64encode
 from datetime import datetime, timedelta, timezone
 
-from aioquic.asyncio import connect, serve
-from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import StreamDataReceived
+# QUIC is an optimisation: it turns a two-hop relay path into a direct one.
+# A bare import made it a hard dependency of the whole package, so on any
+# platform without an aioquic wheel — a fresh Windows box being the obvious
+# one — `import blindrange.node` failed and the node would not start at
+# all. Absent aioquic we simply stay on the relay path, which is what
+# BR_NO_QUIC=1 already selects deliberately.
+try:
+    from aioquic.asyncio import connect, serve
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import StreamDataReceived
+    _AIOQUIC_ERROR = None
+except Exception as _e:                        # ImportError, or a broken build
+    _AIOQUIC_ERROR = _e
+    connect = serve = QuicConfiguration = StreamDataReceived = None
+
+    class QuicConnectionProtocol:              # placeholder for the subclass
+        def __init__(self, *a, **k):
+            raise RuntimeError("aioquic is not available")
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -49,7 +65,13 @@ from cryptography.x509.oid import NameOID
 
 MAGIC = b"BRP1"
 ALPN = ["blindrange/1"]
-DISABLED = os.environ.get("BR_NO_QUIC", "") == "1"
+DISABLED = (os.environ.get("BR_NO_QUIC", "") == "1"
+            or _AIOQUIC_ERROR is not None)
+if _AIOQUIC_ERROR is not None:
+    import sys as _sys
+    print(f"note: aioquic unavailable ({type(_AIOQUIC_ERROR).__name__}), so "
+          f"direct QUIC paths are off — relayed connections still work",
+          file=_sys.stderr)
 
 
 def _self_signed(common_name):

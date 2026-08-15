@@ -9,8 +9,12 @@ description = "Range queries over encrypted data stored on blind, decentralized 
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-dependencies = ["cryptography>=41", "aioquic>=1.2"]
-optional-dependencies = { keychain = ["keyring>=24"] }
+dependencies = ["cryptography>=41"]
+# aioquic only buys direct QUIC paths between NAT'd peers; without it the
+# relay path still works. Keeping it out of the hard requirements means a
+# platform with no wheel can still run a node.
+optional-dependencies = { keychain = ["keyring>=24"], quic = ["aioquic>=1.2"],
+                          all = ["keyring>=24", "aioquic>=1.2"] }
 keywords = ["encrypted-database", "searchable-encryption", "structured-encryption",
             "decentralized", "range-queries", "forward-privacy"]
 classifiers = [

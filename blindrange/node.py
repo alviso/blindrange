@@ -1340,7 +1340,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address (0.0.0.0 to serve a LAN)")
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--data", required=True, help="data directory for this node")
+    ap.add_argument("--data", required=True, type=os.path.expanduser,
+                    help="data directory for this node")
     ap.add_argument("--seed", action="append", default=[],
                     help="host:port of any live peer (repeatable; omit to start a new network)")
     ap.add_argument("--secret", default=os.environ.get("BLINDRANGE_SECRET", ""),
