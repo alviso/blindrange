@@ -69,9 +69,22 @@ from blindrange import receipt  # noqa: E402
 # data can still submit honest-looking reports about themselves. That buys
 # little, because scoring is relative and honest nodes already score 1.0 —
 # to gain, a cheat must push others down, which needs their signatures.
-# The unsolved one is the ring itself: identities are cheap, so an attacker
-# minting many nodes gets a larger STRUCTURAL share regardless of any of
-# this. That is Sybil resistance on placement, a separate problem.
+# Cheap identities are the other open one, but NOT in the way this comment
+# first claimed. Share is structural x PROVED possession, and a minted
+# identity can only realise its ring share by actually holding the data
+# routed to it and passing audits on it. An attacker with a hundred
+# identities earns a hundred times as much and stores a hundred times as
+# much, which is not an attack — it is a large operator, and paying for
+# stored data is the entire point.
+#
+# The real exposure is REPLICA CAPTURE, and it is about durability rather
+# than money: at RF3, a party holding fraction k of the ring holds all
+# three replicas of roughly k^3 of the keys, so half the ring means ~12% of
+# data with no independent copy left to delete or ransom. Stake would make
+# identities expensive without changing that arithmetic. Diversity-aware
+# placement — refusing to route a key's replicas to nodes sharing a subnet,
+# an ASN or a first-seen fingerprint — attacks the mechanism instead of the
+# motive, and costs nothing.
 REPORTS = collections.defaultdict(collections.deque)   # node_id -> (ts, rate)
 REPORT_WINDOW = 500
 REPORT_MAX_AGE = float(os.environ.get("BR_REPORT_MAX_AGE", "21600"))  # 6h

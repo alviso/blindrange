@@ -9,8 +9,12 @@ Identity: each node generates an Ed25519 keypair on first start (kept in its
 data directory). Its node id is a hash of the public key, and every gossip
 heartbeat ("I am at <addr> at time <t>") is signed by the node itself and
 verified by everyone who relays or receives it. Placement hashes node ids,
-so a node can change address without reshuffling data. This is not Sybil
-resistance: anyone holding the network secret can mint identities.
+so a node can change address without reshuffling data. Identities are cheap
+— anyone with the network secret can mint them — and the consequence is
+durability, not payouts: earnings require proved possession, so a minted
+node has to store what it is sent, but a party holding fraction k of the
+ring holds every replica of about k^3 of the keys. Placement does not yet
+spread replicas across subnets or operators, and should.
 
 Self-assembly / NAT: on joining, a node asks a peer to DIAL IT BACK at its
 advertised address. If that fails (typical home NAT — no port forwarding),

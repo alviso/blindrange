@@ -240,8 +240,15 @@ time T") are signed by the node itself and verified by everyone who stores or
 relays them, so no insider can forge another node's liveness or hijack its
 traffic by advertising a wrong address. Placement hashes node *ids*, not
 addresses — a node can move (DHCP, new network) without reshuffling data.
-This is not Sybil resistance: anyone with the network secret can mint
-identities.
+Identities are cheap — anyone with the network secret can mint them. The
+cost of that is **durability, not earnings**: payouts follow proved
+possession, so a minted node only earns by actually storing what it is
+sent, which makes it a large operator rather than an attacker. What cheap
+identities do buy is **replica capture** — at RF3, a party holding fraction
+`k` of the ring holds all three replicas of roughly `k³` of the keys, and
+can delete or ransom them. The fix is diversity-aware placement (spreading
+a key's replicas across subnets and operators), which is not implemented
+yet.
 
 Nodes are **self-healing**: each continuously walks its own keys in small
 batches (tunable via `BR_REPAIR_EVERY` / `BR_REPAIR_BATCH`) and re-pushes

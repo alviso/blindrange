@@ -350,11 +350,16 @@ paying customers yet. We will not pay hosts out of revenue that hasn't come
 in, and we won't quote you a per-terabyte rate that implies otherwise. Run a
 node now because you want this to exist; the economics start when the
 customers do.</p>
-<p class="note">One more, unsolved and worth knowing before you join:
-ring placement has <b>no Sybil resistance</b>. Identities are cheap, so
-someone minting many nodes gets a larger structural share regardless of the
-possession proofs. We know, it's in the code comments, and it needs solving
-before real money moves.</p>
+<p class="note">One more, unsolved and worth knowing before you join.
+Identities are cheap — anyone can mint them — but the cost of that is
+<b>durability, not earnings</b>. Payouts follow proved possession, so a
+minted node only earns by genuinely storing what it is sent, which makes it
+a large operator rather than a thief. What cheap identities really buy is
+<b>replica capture</b>: at three replicas, a party holding half the ring
+holds every copy of roughly an eighth of the data, and can delete or ransom
+it. The fix is spreading a key's replicas across subnets and operators
+rather than trusting the hash — not implemented yet, and it is the thing we
+would want done before this network held anything you could not lose.</p>
 
 <h2>Honesty as the design principle</h2>
 <p>Every queryable-encryption scheme leaks something. Most products bury
