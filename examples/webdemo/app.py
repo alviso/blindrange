@@ -70,15 +70,20 @@ DEMO_SECRET = "demo-network-secret"
 class Net:
     """Local node processes this app spawned (killable/spawnable from the UI)."""
 
-    def __init__(self, tmpdir, base_port=7501):
+    def __init__(self, tmpdir, base_port=None):
         self.tmp = tmpdir
-        self.base = base_port
+        # Default 7501 was the node's own default port, so this demo could
+        # not run on any machine already running a node — which is every
+        # machine that followed the "join the network" instructions. Pick a
+        # free range instead of assuming one.
+        self.base = base_port or free_port()
         self.procs = {}
         self.lock = threading.Lock()
 
     def spawn(self, port=None):
         with self.lock:
-            port = port or (max(self.procs, default=self.base - 1) + 1)
+            port = port or free_port(
+                max(self.procs, default=self.base - 1) + 1)
             seeds = [f"127.0.0.1:{p}" for p, pr in self.procs.items()
                      if pr.poll() is None][:2]
             args = [sys.executable, "-m", "blindrange.node", "--port", str(port),
@@ -105,6 +110,28 @@ class Net:
             for p in self.procs.values():
                 if p.poll() is None:
                     p.terminate()
+
+
+def free_port(start=None):
+    """A port nothing is listening on, from `start` upward."""
+    import socket
+    if start is None:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+    for port in range(start, start + 200):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    raise RuntimeError(f"no free port near {start}")
 
 
 def wait_http(addr, tries=60):
@@ -206,7 +233,9 @@ def main():
     else:
         net = Net(str(workdir))
         first = net.spawn()
-        wait_http(first)
+        if not wait_http(first):
+            sys.exit(f"the first node never answered on {first} — is another "
+                     f"process holding that port, or did it fail to start?")
         for _ in range(a.nodes - 1):
             net.spawn()
         bootstrap = [first]
@@ -214,6 +243,7 @@ def main():
         import hmac as _hmac
         sig = _hmac.new(DEMO_SECRET.encode(), b"/peers",
                         hashlib.sha256).hexdigest()
+        live = 0
         for _ in range(120):                            # wait for gossip to converge
             try:
                 req = urllib.request.Request(f"http://{first}/peers",
@@ -226,7 +256,22 @@ def main():
             except OSError:
                 pass
             time.sleep(0.25)
+        if live < a.nodes:
+            # Say so rather than starting a demo whose network is not there.
+            # The previous version crashed here with an unbound variable,
+            # which described the symptom and not the cause.
+            sys.exit(f"only {live} of {a.nodes} nodes joined the gossip mesh "
+                     f"(seed {first}). Ports {net.base}+ may be in use, or a "
+                     f"node failed to start.")
         print(f"spawned {a.nodes} local blind nodes (seed {first}, {live} live)")
+
+    # In self-contained mode the network is thrown away when the demo exits,
+    # so a state file left behind by a previous run points at nodes that no
+    # longer exist. Keeping it meant the SECOND run of the demo showed an
+    # empty database and no error — the data was real, the nodes were gone.
+    if net and not a.state and Path(state_path).exists():
+        Path(state_path).unlink()
+        print("previous demo network is gone; reseeding a fresh one")
 
     if Path(state_path).exists():
         try:
