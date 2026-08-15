@@ -5,6 +5,7 @@ code for a day with --auto-update set because its sandbox made its own
 checkout read-only and the pull failure was swallowed. And a node once
 restarted mid-ingest, which cost a benchmark at 620k records.
 """
+import os
 import threading
 import time
 import unittest
@@ -139,12 +140,11 @@ class TestRestartMechanics(unittest.TestCase):
                                 "too short to cover a handover")
         self.assertLessEqual(node.BIND_RETRY_S, 120)
 
-    def test_windows_uses_spawn_not_execv(self):
+    def test_unix_still_replaces_itself_in_place(self):
         import inspect
         src = inspect.getsource(node._update_loop)
-        self.assertIn('os.name == "nt"', src)
-        self.assertIn("subprocess.Popen", src)
         self.assertIn("os.execv", src, "unix path must remain")
+        self.assertIn("supervised()", src, "windows path must remain")
 
     def test_restart_preserves_how_it_was_started(self):
         """Under `python -m pkg.mod`, argv[0] is a file path — re-execing it
@@ -190,3 +190,80 @@ class TestRestartMechanics(unittest.TestCase):
                 p.terminate()
             p.wait()
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestWindowsSupervisor(unittest.TestCase):
+    """Windows cannot replace a running process, so the node gets a parent.
+
+    Spawning a replacement and exiting instead left the new node running
+    while PowerShell took its prompt back: it looked dead, Ctrl+C no longer
+    reached it, and closing the window orphaned it.
+    """
+
+    def setUp(self):
+        self._env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_unix_needs_no_supervisor(self):
+        os.environ.pop("BR_FORCE_SUPERVISOR", None)
+        if os.name != "nt":
+            self.assertFalse(node.needs_supervisor())
+
+    def test_the_path_can_be_exercised_off_windows(self):
+        """Otherwise it is only ever tested by the person it breaks."""
+        os.environ["BR_FORCE_SUPERVISOR"] = "1"
+        self.assertTrue(node.needs_supervisor())
+
+    def test_child_knows_it_is_supervised(self):
+        os.environ.pop("BR_SUPERVISED", None)
+        self.assertFalse(node.supervised())
+        os.environ["BR_SUPERVISED"] = "1"
+        self.assertTrue(node.supervised())
+
+    def test_supervisor_relaunches_only_on_the_restart_code(self):
+        import subprocess
+        calls = []
+        codes = [node.RESTART_CODE, node.RESTART_CODE, 0]
+
+        def fake_call(cmd, env=None):
+            calls.append(env.get("BR_SUPERVISED"))
+            return codes[len(calls) - 1]
+
+        real = subprocess.call
+        subprocess.call = fake_call
+        try:
+            rc = node.supervise()
+        finally:
+            subprocess.call = real
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 3, "should relaunch twice then stop")
+        self.assertTrue(all(c == "1" for c in calls),
+                        "children must be told they are supervised")
+
+    def test_a_crash_is_not_a_restart_request(self):
+        """A node dying must not be relaunched forever in a tight loop."""
+        import subprocess
+        calls = []
+
+        def fake_call(cmd, env=None):
+            calls.append(1)
+            return 1                       # crash, not RESTART_CODE
+
+        real = subprocess.call
+        subprocess.call = fake_call
+        try:
+            rc = node.supervise()
+        finally:
+            subprocess.call = real
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 1, "crash-looped instead of exiting")
+
+    def test_supervised_child_exits_rather_than_spawning(self):
+        import inspect
+        src = inspect.getsource(node._update_loop)
+        self.assertIn("os._exit(RESTART_CODE)", src)
+        self.assertNotIn("subprocess.Popen", src,
+                         "spawning from the child is what orphaned it")

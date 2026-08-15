@@ -232,8 +232,9 @@ def code_version():
 
 
 def _update_loop(secret):
-    """Opt-in self-update: fast-forward this checkout and exit so the
-    supervisor restarts on the new code.
+    """Opt-in self-update: fast-forward this checkout and come back on the
+    new code — by replacing this process on Unix, or by asking the
+    supervisor to relaunch it on Windows.
 
     This is a real trust decision, not a convenience: a node running with
     --auto-update will run whatever the configured remote publishes next.
@@ -278,12 +279,13 @@ def _update_loop(secret):
                 print(f"auto-update: {RUNNING_COMMIT[:8]} -> {after[:8]}, "
                       f"restarting",
                       file=sys.stderr, flush=True)
-                # Re-exec rather than exit. Exiting only works under a
-                # supervisor, and a node started by hand in a terminal would
-                # simply vanish — which is how a live network lost two of
-                # three nodes mid-benchmark. execv replaces this process
-                # with a fresh one on the new code, keeping the same command
-                # line, and works identically under systemd.
+                # Two ways back, by platform. On Unix, execv replaces this
+                # process in place — a node started by hand in a terminal
+                # must not simply vanish, which is how a live network once
+                # lost two of three nodes mid-benchmark. Windows has no such
+                # call, so there a parent process supervises and this one
+                # exits with an agreed code for it to act on.
+                #
                 # Wait for the data path to go quiet. A restart between
                 # requests is invisible; one in the middle of a write makes
                 # the client retry and, at scale, can fail a long ingest.
@@ -320,17 +322,14 @@ def _update_loop(secret):
                     args = [sys.executable, "-m", spec.name] + sys.argv[1:]
                 else:
                     args = [sys.executable] + sys.argv
-                if os.name == "nt":
-                    # Windows has no exec that replaces a running process:
-                    # os.execv there spawns a new one and kills this one, but
-                    # in an order that leaves the console and the listening
-                    # socket in an ambiguous state. Doing it explicitly is
-                    # the same outcome, legibly — start the replacement, let
-                    # it inherit the console, then leave. The new process
-                    # retries the bind while this one finishes exiting.
-                    import subprocess
-                    subprocess.Popen(args, close_fds=False)
-                    os._exit(0)
+                if supervised():
+                    # Under the Windows supervisor: exit with the agreed
+                    # code and let the parent relaunch us. Spawning a
+                    # replacement from here instead left the new node
+                    # running while PowerShell took its prompt back — the
+                    # node looked dead, Ctrl+C no longer reached it, and
+                    # closing the window orphaned it.
+                    os._exit(RESTART_CODE)
                 os.execv(sys.executable, args)
         except Exception:
             continue
@@ -1315,6 +1314,44 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
                 pass
 
 
+RESTART_CODE = 42          # child -> supervisor: "relaunch me on new code"
+
+
+def needs_supervisor():
+    """Windows cannot replace a running process, so it gets a parent.
+
+    BR_FORCE_SUPERVISOR exists so this path can be exercised on a machine
+    that is not Windows — otherwise it would only ever be tested by the
+    person it breaks.
+    """
+    return os.name == "nt" or os.environ.get("BR_FORCE_SUPERVISOR") == "1"
+
+
+def supervised():
+    return os.environ.get("BR_SUPERVISED") == "1"
+
+
+def supervise():
+    """Run the node as a child and relaunch it when it asks to be.
+
+    One parent, one child, forever — not a chain that grows by a process per
+    update. The console stays attached to the parent, so Ctrl+C still stops
+    it and the shell does not hand back the prompt while a node is quietly
+    still running.
+    """
+    import subprocess
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    base = ([sys.executable, "-m", spec.name] if spec is not None
+            else [sys.executable, sys.argv[0]])
+    env = {**os.environ, "BR_SUPERVISED": "1"}
+    while True:
+        rc = subprocess.call(base + sys.argv[1:], env=env)
+        if rc != RESTART_CODE:
+            return rc
+        print("supervisor: node updated, relaunching", file=sys.stderr,
+              flush=True)
+
+
 def _vacuum_loop(store):
     """Hand free space back to the filesystem, a slice at a time.
 
@@ -1657,6 +1694,8 @@ def main():
                          "If it turns out to be unreachable, the node automatically "
                          "relays through a reachable peer instead.")
     a = ap.parse_args()
+    if a.auto_update and needs_supervisor() and not supervised():
+        sys.exit(supervise())
     run(a.host, a.port, a.data, a.seed, a.secret, a.advertise, a.quic_host,
         a.public_status, a.auto_update, a.issuer, a.max_disk)
 
