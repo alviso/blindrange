@@ -295,6 +295,9 @@ vendor can read it" is tolerated; for an audit trail it is a liability.</p>
 Bit or the OpenTelemetry Collector with configuration alone, has no delete
 route by design, and shows every event twice — as you see it, and as a node
 operator sees it.</p>
+<p>There is also an <a href="/audit#s3"><b>S3-compatible gateway</b></a>, so
+backup tools, compliance archivers, Loki and rclone can write here without
+being ported — verified against boto3, including multipart.</p>
 
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding

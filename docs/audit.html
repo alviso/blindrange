@@ -109,6 +109,7 @@ rather than the compromise.</p>
 the OpenTelemetry Collector all ship a generic HTTP output, so the entire
 integration is a few lines of config:</p>
 
+<div class="tabgroup">
 <div class="tabs">
   <button class="tab on" data-t="v">Vector</button>
   <button class="tab" data-t="f">Fluent Bit</button>
@@ -139,6 +140,7 @@ service:
 <div class="panel" id="c"><pre>curl -X POST http://127.0.0.1:8710/ingest \
   -H 'Content-Type: application/json' \
   -d '{"actor":"alice@corp","action":"role.grant","target":"billing-admin"}'</pre></div>
+</div>
 
 <p class="dim">Ingest takes a single object, a JSON array, NDJSON, or an
 OTLP/JSON envelope — and it <b>unwraps OTLP into individual records</b>
@@ -151,6 +153,55 @@ unrecognised still rides along inside the encrypted payload. Being
 forgiving here is deliberate: an audit pipeline that drops events over a
 key name is worse than no pipeline.</p>
 
+<h2 id="s3">Or point an S3 archiver at it</h2>
+<p>Log agents are one way in. The other is that almost everything which
+archives data already writes to <b>S3</b> — backup tools, compliance
+archivers, Loki, rclone. There is an S3-compatible gateway in front of the
+same storage, so those tools can target it today rather than being ported:</p>
+
+<div class="tabgroup">
+<div class="tabs">
+  <button class="tab on" data-t="s3a">rclone</button>
+  <button class="tab" data-t="s3b">boto3 / any SDK</button>
+  <button class="tab" data-t="s3c">run it</button>
+</div>
+<div class="panel on" id="s3a"><pre>[blindrange]
+type              = s3
+provider          = Other
+endpoint          = http://127.0.0.1:8720
+access_key_id     = blindrange
+secret_access_key = &lt;yours&gt;
+force_path_style  = true</pre></div>
+<div class="panel" id="s3b"><pre>s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:8720",
+                  aws_access_key_id="blindrange",
+                  aws_secret_access_key="...",
+                  config=Config(s3={"addressing_style": "path"}))
+s3.put_object(Bucket="archive", Key="logs/2026/08/app.log", Body=data)</pre></div>
+<div class="panel" id="s3c"><pre>python3 examples/s3gateway/gateway.py     --state ~/.blindrange/s3.brdb     --bootstrap seed.blindrange.dev:7501     --secret blindrange-public     --access-key blindrange --secret-key &lt;choose one&gt;
+<span class="g"># → http://127.0.0.1:8720</span></pre></div>
+</div>
+
+<p class="dim">An object is stored as two things: a small <b>record</b>
+indexed on bucket, key, mtime and size — which is what makes a prefix
+listing a native lookup instead of a scan — and its <b>bytes</b>, as
+unindexed encrypted chunks spread across the ring. PUT, GET, HEAD, DELETE,
+<code>ListObjectsV2</code> with prefixes and delimiters, and multipart
+upload all work, verified against boto3 rather than hand-written requests,
+because an independent SigV4 implementation is the only thing that proves
+the signer is right rather than merely self-consistent.</p>
+
+<p class="dim">What it does <b>not</b> do, so nothing fails mysteriously:
+no range GETs, no versioning, no ACLs or lifecycle rules, no presigned
+URLs; buckets are implicit; multipart parts are held in memory until
+completion. The <a href="https://github.com/alviso/blindrange/tree/main/examples/s3gateway">README</a>
+carries the full list.</p>
+
+<div class="warnbox"><b>Tested, not asserted.</b> Writing a marked payload
+to <code>confidential/salaries.csv</code> and then scanning every key and
+value on all three nodes' disks finds the payload absent, the filename
+absent, and the path absent — while the object still reads back
+byte-identical. That check runs in the test suite, not just once by hand.</div>
+
 <h2>Where it runs is the security model</h2>
 <pre>python3 examples/auditlog/audit.py \
     --state ~/.blindrange/audit.brdb \
@@ -158,9 +209,9 @@ key name is worse than no pipeline.</p>
     --secret blindrange-public \
     --account &lt;key from tokens.blindrange.dev/signup&gt;
 <span class="g"># → http://127.0.0.1:8710</span></pre>
-<p>The keys live in that process and in the <code>.brdb</code> file beside
-it. Never on a node, never with us. Run it next to whatever produces your
-events.</p>
+<p>The keys live in that process — and in the gateway's, if you run it —
+and in the <code>.brdb</code> file beside them. Never on a node, never with
+us. Run them next to whatever produces your events.</p>
 <p class="dim">This is the same fork Storj draws between its hosted S3
 gateway, where keys sit server-side, and the self-hosted one that keeps
 encryption end-to-end. Hosting it for you would be more convenient and
@@ -218,8 +269,11 @@ node operator sees it — because the difference is the entire point.
 </div>
 <script>
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
-  document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
-  document.querySelectorAll('.panel').forEach(x => x.classList.remove('on'));
+  // scoped to this group: the page has two tab sets, and a global reset
+  // would blank the other one
+  const g = t.closest('.tabgroup');
+  g.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+  g.querySelectorAll('.panel').forEach(x => x.classList.remove('on'));
   t.classList.add('on');
   document.getElementById(t.dataset.t).classList.add('on');
 });
