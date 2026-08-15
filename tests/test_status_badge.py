@@ -28,7 +28,7 @@ class TestAuditBadge(unittest.TestCase):
         b = audit_badge([row(i, 1.0, 2) for i in range(3)])
         self.assertIn("badge pass", b)
         self.assertIn("AUDIT PASSED", text(b))
-        self.assertIn("3/3", text(b))
+        self.assertIn("all 3 nodes", text(b))
 
     def test_unaudited_never_reads_as_passed(self):
         """The one that matters. No recent audit must look different from a
