@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange demos — see it, use it, check it</title>
+<meta name="description" content="Runnable demos for blindrange: an encrypted orders app, an audit trail, an S3-compatible gateway, off-site backup with a searchable catalog, and the attack harness we run against ourselves.">
+<meta property="og:title" content="blindrange demos — see it, use it, check it">
+<meta property="og:description" content="Everything runnable, grouped by what you want to do: see it work, put real data in, or check the claims yourself — including the attacks we run against our own design.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/demos">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:960px; margin:0 auto; padding:40px 24px 80px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:38px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:30px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.12em;
+       color:var(--acc); margin:46px 0 6px; }
+  .why { color:var(--dim); font-size:14px; margin-bottom:18px; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  pre { background:#12161d; border:1px solid var(--line); border-radius:8px;
+        padding:12px 14px; overflow-x:auto; font-size:13px; line-height:1.5;
+        margin:10px 0 0; }
+  pre .c { color:var(--dim); }  pre .g { color:var(--ok); }
+  code { color:var(--warn); }
+  .demo { background:var(--panel); border:1px solid var(--line);
+          border-radius:11px; padding:18px 20px; margin-bottom:14px; }
+  .demo h3 { font-size:17px; margin-bottom:6px; }
+  .demo h3 a { color:var(--txt); }
+  .demo h3 a:hover { color:var(--acc); }
+  .demo .lead { color:var(--dim); font-size:14px; margin-bottom:4px; }
+  .demo .lead b { color:var(--txt); font-weight:normal; }
+  .meta { font-size:12.5px; color:var(--dim); margin-top:10px; }
+  .meta a { color:var(--dim); text-decoration:underline; }
+  .meta a:hover { color:var(--acc); }
+  .pill { display:inline-block; font-size:11px; letter-spacing:.06em;
+          text-transform:uppercase; border:1px solid var(--line);
+          border-radius:20px; padding:2px 9px; color:var(--dim);
+          margin-left:8px; vertical-align:middle; }
+  .pill.live { border-color:#2f6d3f; color:var(--ok); }
+  .warnbox { background:#12161d; border:1px solid var(--line);
+             border-left:3px solid var(--warn); border-radius:8px;
+             padding:14px 16px; font-size:13.5px; color:var(--dim);
+             margin-top:14px; }
+  .warnbox b { color:var(--txt); font-weight:normal; }
+  .foot { margin-top:54px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>demos</h1>
+<div class="tag">Everything runnable, grouped by what you actually want to
+do: <b>see whether it works</b>, <b>put real data in</b>, or <b>check the
+claims yourself</b> — including the attacks we run against our own design.</div>
+
+<pre><span class="c"># all of these assume the package and, optionally, the public network</span>
+git clone https://github.com/alviso/blindrange &amp;&amp; cd blindrange &amp;&amp; pip install -e .</pre>
+
+<h2>See whether it works</h2>
+<div class="why">Sixty seconds, no account, nothing stored anywhere you care
+about.</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/tree/main/examples/webdemo">Encrypted orders, three panels</a></h3>
+  <div class="lead">One screen with your view, the network's view, and buttons
+  that <b>kill nodes while you query</b>. The fastest way to understand what
+  this is: the same rows are readable on the left and pseudorandom on the
+  right, and killing a node changes neither.</div>
+  <pre>python3 examples/webdemo/app.py   <span class="g"># → http://127.0.0.1:8600</span></pre>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/blob/main/examples/contrast.py">contrast.py</a></h3>
+  <div class="lead">The same thing without a browser: prints what the owner
+  reads beside what the network stores.</div>
+  <pre>python3 examples/contrast.py</pre>
+</div>
+
+<div class="demo">
+  <h3><a href="https://status.blindrange.dev/">The live network</a>
+    <span class="pill live">running now</span></h3>
+  <div class="lead">Three nodes across two continents, self-reported key
+  counts next to <b>proved</b> possession, and each node's share of a
+  distribution pool.</div>
+  <pre>python3 examples/whos_here.py     <span class="c"># the same roster, from a terminal</span></pre>
+</div>
+
+<h2>Put real data in</h2>
+<div class="why">These are the ones shaped like something you might actually
+run.</div>
+
+<div class="demo">
+  <h3><a href="/audit">blindrange-audit</a> — an audit trail its host cannot read</h3>
+  <div class="lead">The workload where this design wins on the merits rather
+  than as a privacy tax: append-only is what the index already is, and
+  tamper-evidence falls out of per-record AEAD. Ships from <b>Vector, Fluent
+  Bit or the OpenTelemetry Collector with configuration alone</b> — no plugin
+  to write.</div>
+  <pre>python3 examples/auditlog/audit.py --state ~/.blindrange/audit.brdb
+<span class="g"># → http://127.0.0.1:8710</span></pre>
+  <div class="meta">Deliberately has no delete route ·
+    <a href="/audit">full write-up</a></div>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/tree/main/examples/s3gateway">S3-compatible gateway</a></h3>
+  <div class="lead">Point <b>anything that already writes to S3</b> at
+  storage that cannot read it — backup tools, compliance archivers, Loki,
+  rclone. Verified against boto3 including multipart, prefix and delimiter
+  listings, and SigV4.</div>
+  <pre>python3 examples/s3gateway/gateway.py --state ~/.blindrange/s3.brdb
+<span class="g"># → http://127.0.0.1:8720, path-style addressing</span></pre>
+  <div class="meta">No range GETs, no versioning, buckets are implicit —
+    the <a href="https://github.com/alviso/blindrange/tree/main/examples/s3gateway">README</a>
+    lists every gap rather than failing mysteriously</div>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/tree/main/examples/s3backup">Off-site backup with a searchable catalog</a></h3>
+  <div class="lead">Plain boto3, <b>no blindrange imports at all</b> — it
+  would work unchanged against AWS. It exists to show the gap: plain S3 gives
+  you a catalog and a provider who reads everything; encrypting before upload
+  takes the catalog with it. This keeps both, because a prefix listing is an
+  index lookup over encrypted keys.</div>
+  <pre>python3 examples/s3backup/backup.py backup ~/src --bucket work
+python3 examples/s3backup/backup.py find work --name '*.py' --since 1h
+python3 examples/s3backup/backup.py what-they-see work</pre>
+  <div class="meta">Measured: 14 files restored byte-identical, <code>diff -r</code>
+    clean — and the node holds neither the contents nor the filenames</div>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/blob/main/blindrange/webui.py">The client app</a></h3>
+  <div class="lead">Drop a CSV in, get a schema with an honest one-sentence
+  description of what it leaks, then query it. For when you want your own
+  data in without writing code.</div>
+  <pre>blindrange init      <span class="c"># schema wizard</span>
+blindrange ui        <span class="g"># → http://127.0.0.1:8700</span></pre>
+</div>
+
+<h2>Check the claims</h2>
+<div class="why">The part most projects don't ship. If the disclosures are
+only as good as our willingness to run the attacks, you should be able to run
+them too.</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/blob/main/prototype/attack.py">The attack harness</a></h3>
+  <div class="lead">Runs the real attacks from the literature against our own
+  design and prints the numbers — snapshot equality, frequency inference, and
+  an ML query-watcher. It is how we know <code>leaf_width</code> bounds
+  reconstruction <b>by construction</b> rather than by hope.</div>
+  <pre>python3 prototype/attack.py
+python3 prototype/bounded_demo.py   <span class="c"># the leaf-width bound, measured</span></pre>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/blob/main/examples/verify_log.py">verify_log.py</a>
+    <span class="pill live">checks us</span></h3>
+  <div class="lead">We compute the payout shares, which makes us the one
+  party you'd otherwise have to trust. This remembers the log's tree head and
+  demands proof, next run, that <b>nothing already published has changed</b>.
+  Tested by actually cheating: rewriting a past share from 333 to 900 is
+  rejected.</div>
+  <pre>python3 examples/verify_log.py
+<span class="g">  consistent with the 2 entries seen previously  ✓  (1 new)</span></pre>
+</div>
+
+<div class="demo">
+  <h3><a href="https://github.com/alviso/blindrange/blob/main/examples/bench_logs.py">Benchmarks</a></h3>
+  <div class="lead">Ingest and delete, run against the real public network
+  rather than localhost — which is where every interesting bug turned up.</div>
+  <pre>python3 examples/bench_logs.py --records 100000
+python3 examples/bench_delete.py --state my.brdb</pre>
+</div>
+
+<div class="warnbox"><b>What none of these are.</b> This is a research
+prototype on a demo network with no durability promises. Run your own nodes
+for anything you would mind losing, and read the
+<a href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">threat
+model</a> first — it is explicit that this is not for healthcare or
+high-stakes PII, and why.</div>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/audit">audit log</a> ·
+<a href="https://status.blindrange.dev/">live network</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>

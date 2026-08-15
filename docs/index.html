@@ -126,7 +126,7 @@ measured and published</b>.</div>
     link or decrypt, and you can still run <code>BETWEEN</code> and
     <code>LIKE 'ac%'</code> over the result.</p>
     <div class="go">→ <a href="#store">Why store here</a> ·
-       <a href="#pricing">Pricing</a> · <a href="/audit">Audit-log app</a></div>
+       <a href="#pricing">Pricing</a> · <a href="/demos">Demos</a></div>
   </div>
   <div class="door earn">
     <div class="eyebrow">If you have a spare disk</div>
@@ -142,7 +142,7 @@ measured and published</b>.</div>
 
 <div class="btns">
   <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
-  <a class="btn" href="/audit">Audit-log app</a>
+  <a class="btn" href="/demos">Demos</a>
   <a class="btn" href="https://status.blindrange.dev/">Live network</a>
   <a class="btn" href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">Threat model</a>
 </div>
@@ -295,9 +295,11 @@ vendor can read it" is tolerated; for an audit trail it is a liability.</p>
 Bit or the OpenTelemetry Collector with configuration alone, has no delete
 route by design, and shows every event twice — as you see it, and as a node
 operator sees it.</p>
-<p>There is also an <a href="/audit#s3"><b>S3-compatible gateway</b></a>, so
-backup tools, compliance archivers, Loki and rclone can write here without
-being ported — verified against boto3, including multipart.</p>
+<p>There is also an <b>S3-compatible gateway</b>, so backup tools,
+compliance archivers, Loki and rclone can write here without being ported,
+and an off-site backup demo built on it whose catalog stays searchable. All
+of it, plus the attack harness we run against our own design, is on the
+<a href="/demos"><b>demos page →</b></a></p>
 
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding
