@@ -344,6 +344,30 @@ about itself can raise its earnings:</p>
   trusted.</li>
 </ul>
 
+<h2 class="e">Checking us</h2>
+<p>Everything else here removes a party you would have to trust. The payout
+measurement did not: <b>we</b> score the audits and compute the shares, and
+you had no way to tell whether a number was revised afterwards. That is a
+strange gap in a system whose whole argument is that you shouldn't have to
+take anyone's word.</p>
+<p>Every accepted audit report and every share calculation now goes into an
+<b>append-only Merkle log</b>. Reports go in whole — they carry no owner or
+database identifier by design — so you can re-run the scoring over the
+logged inputs and check our arithmetic, not merely that we didn't quietly
+edit the answer later.</p>
+<pre><span class="c"># remembers the head it saw; next run demands proof the log still contains it</span>
+python3 examples/verify_log.py
+<span class="g">  head      size 3  root 4cd723911d1ce43e…
+  signature valid
+  consistent with the 2 entries seen previously  ✓  (1 new)</span></pre>
+<p class="dim">Tested against the live log by actually cheating: rewriting
+a past share from 333 to 900, and separately deleting an entry. An operator
+holding yesterday's head rejects both. What this <b>cannot</b> do is stop us
+declining to log something in the first place, and it cannot by itself catch
+a split view — showing you one log and someone else another. That takes two
+operators comparing heads, which is why the verifier prints the head in a
+form you can paste to somebody.</p>
+
 <p class="note"><b>And the part most networks won't print:</b> the pool is
 whatever the network actually earns. Today that is <b>$0</b> — there are no
 paying customers yet. We will not pay hosts out of revenue that hasn't come
