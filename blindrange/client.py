@@ -178,6 +178,72 @@ class Owner:
                        "ct": ct.hex()}, f)
         os.replace(tmp, self._path)
 
+    # --------------------------------------------------------------- blobs
+    # Records are small and indexed; object bodies are large and never
+    # queried. Forcing bytes through insert_many() would build a dyadic
+    # index entry per level for content nobody will ever range over —
+    # tens of wasted keys per megabyte, paid for at write time and again
+    # every month it is stored.
+    #
+    # A blob is therefore raw KV: one PRF-derived key, one AEAD value, no
+    # index. Nodes see exactly what they see for everything else, and the
+    # name never travels — only an HMAC of it under a key they do not have.
+
+    BLOB_CHUNK = 512 * 1024
+
+    def _blob_key(self, name, part=0):
+        h = hmac.new(self._master, f"blob|{name}|{part}".encode(),
+                     hashlib.sha256).hexdigest()[:32]
+        return "B:" + h
+
+    def put_blob(self, name, data: bytes):
+        """Store opaque bytes under `name`. Returns the number of chunks.
+
+        Chunked so a large object spreads across the ring instead of
+        landing whole on one replica set, and so a read can fetch parts in
+        parallel. The chunk count is recoverable from the object's own
+        record, so nothing here needs an index of its own.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("put_blob takes bytes")
+        data = bytes(data)
+        parts = [data[i:i + self.BLOB_CHUNK]
+                 for i in range(0, len(data), self.BLOB_CHUNK)] or [b""]
+        pairs = []
+        for i, chunk in enumerate(parts):
+            nonce = os.urandom(12)
+            ct = self._aes.encrypt(nonce, chunk, None)
+            pairs.append((self._blob_key(name, i),
+                          b64encode(nonce + ct).decode()))
+        self._put(pairs)
+        return len(parts)
+
+    def get_blob(self, name, chunks: int):
+        """Reassemble a blob. None if any chunk is missing — a partial
+        object is worse than an absent one, so it is never returned."""
+        keys = [self._blob_key(name, i) for i in range(max(chunks, 1))]
+        got = self._mget(keys)
+        out = bytearray()
+        for k in keys:
+            v = got.get(k)
+            if v is None:
+                return None
+            raw = b64decode(v)
+            try:
+                out += self._aes.decrypt(raw[:12], raw[12:], None)
+            except Exception:
+                return None
+        return bytes(out)
+
+    def delete_blob(self, name, chunks: int):
+        keys = [self._blob_key(name, i) for i in range(max(chunks, 1))]
+        for addr in {self._addr(n) for k in keys for n in self.ring.route(k)
+                     if self._addr(n)}:
+            try:
+                self._post(addr, "/delete", {"keys": keys})
+            except (OSError, ValueError):
+                pass          # replicas that miss it are cleaned by repair
+
     # -------------------------------------------------------------- tokens
     # A wallet of blind tokens lives in the encrypted state file, for the
     # same reason the master key does: they are bearer instruments, and
