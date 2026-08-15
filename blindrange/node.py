@@ -98,6 +98,7 @@ UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "300"))   # 5 min
 # Two is enough to land between requests without waiting for silence that a
 # busy node will never produce.
 UPDATE_IDLE_SAMPLES = int(os.environ.get("BR_UPDATE_IDLE_SAMPLES", "2"))
+BIND_RETRY_S = int(os.environ.get("BR_BIND_RETRY_S", "15"))
 UPDATE_MAX_DEFER = float(os.environ.get("BR_UPDATE_MAX_DEFER", "3600"))
 
 
@@ -279,6 +280,17 @@ def _update_loop(secret):
                     args = [sys.executable, "-m", spec.name] + sys.argv[1:]
                 else:
                     args = [sys.executable] + sys.argv
+                if os.name == "nt":
+                    # Windows has no exec that replaces a running process:
+                    # os.execv there spawns a new one and kills this one, but
+                    # in an order that leaves the console and the listening
+                    # socket in an ambiguous state. Doing it explicitly is
+                    # the same outcome, legibly — start the replacement, let
+                    # it inherit the console, then leave. The new process
+                    # retries the bind while this one finishes exiting.
+                    import subprocess
+                    subprocess.Popen(args, close_fds=False)
+                    os._exit(0)
                 os.execv(sys.executable, args)
         except Exception:
             continue
@@ -1342,10 +1354,28 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
     threading.Thread(target=_reachability_loop,
                      args=(store, peers, hub, secret, addr),
                      daemon=True).start()
-    server = ThreadingHTTPServer((host, port),
-                                 make_handler(store, peers, hub, secret,
-                                              quic=quic,
-                                              public_status=public_status))
+    # Bind with a short retry. On a re-exec the outgoing process may not
+    # have released the port yet — on Windows especially, where the
+    # replacement is a genuinely new process rather than this one wearing
+    # new code. Failing instantly here would turn an auto-update into an
+    # outage that needs a human.
+    handler = make_handler(store, peers, hub, secret, quic=quic,
+                           public_status=public_status)
+    server = None
+    for attempt in range(BIND_RETRY_S):
+        try:
+            server = ThreadingHTTPServer((host, port), handler)
+            break
+        except OSError as e:
+            if attempt == BIND_RETRY_S - 1:
+                print(f"cannot bind {host}:{port} after {BIND_RETRY_S}s: {e}",
+                      file=sys.stderr, flush=True)
+                raise
+            if attempt == 0:
+                print(f"{host}:{port} still busy, retrying for "
+                      f"{BIND_RETRY_S}s (a previous instance may be exiting)",
+                      file=sys.stderr, flush=True)
+            time.sleep(1)
     server.serve_forever()
 
 

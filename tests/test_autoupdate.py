@@ -9,7 +9,11 @@ import threading
 import time
 import unittest
 
+from pathlib import Path
+
 import blindrange.node as node
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestInFlightTracking(unittest.TestCase):
@@ -119,3 +123,70 @@ class TestServiceWrapping(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRestartMechanics(unittest.TestCase):
+    """How a node comes back, which differs by platform.
+
+    Unix replaces the process in place. Windows cannot: os.execv there
+    spawns a new process and kills this one, leaving the console and the
+    listening socket ambiguous for a moment. Either way the replacement can
+    reach the port before the outgoing process has let go of it.
+    """
+
+    def test_bind_retry_is_configured(self):
+        self.assertGreaterEqual(node.BIND_RETRY_S, 5,
+                                "too short to cover a handover")
+        self.assertLessEqual(node.BIND_RETRY_S, 120)
+
+    def test_windows_uses_spawn_not_execv(self):
+        import inspect
+        src = inspect.getsource(node._update_loop)
+        self.assertIn('os.name == "nt"', src)
+        self.assertIn("subprocess.Popen", src)
+        self.assertIn("os.execv", src, "unix path must remain")
+
+    def test_restart_preserves_how_it_was_started(self):
+        """Under `python -m pkg.mod`, argv[0] is a file path — re-execing it
+        directly breaks every relative import."""
+        import inspect
+        src = inspect.getsource(node._update_loop)
+        self.assertIn("__spec__", src)
+        self.assertIn('"-m"', src)
+
+    def test_node_waits_for_a_held_port_instead_of_dying(self):
+        import socket
+        import subprocess
+        import sys
+        import tempfile
+        import shutil
+        import urllib.request
+        held = socket.socket()
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        held.listen(1)
+        tmp = tempfile.mkdtemp()
+        p = subprocess.Popen(
+            [sys.executable, "-m", "blindrange.node", "--port", str(port),
+             "--data", tmp, "--secret", "bindtest"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=str(ROOT))
+        try:
+            time.sleep(3)
+            self.assertIsNone(p.poll(), "node gave up instead of retrying")
+            held.close()
+            for _ in range(20):
+                try:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/stats", timeout=1)
+                    break
+                except OSError:
+                    time.sleep(1)
+            else:
+                self.fail("node never bound after the port was released")
+        finally:
+            if p.poll() is None:
+                p.terminate()
+            p.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
