@@ -89,7 +89,44 @@ POLL_WAIT = 20.0          # relay parks a tenant's poll this long
 SEND_WAIT = 15.0          # relay waits this long for a tenant's reply
 TENANT_FRESH = 45.0       # tenant counts as connected if polled this recently
 CACHE_KB = int(os.environ.get("BR_CACHE_KB", "32000"))   # SQLite page cache
-UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "900"))   # 15 min
+UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "300"))   # 5 min
+# An update must never land in the middle of someone's write. A node that
+# vanished mid-ingest once cost a 1M-record benchmark at 620k, so a pending
+# restart waits for the data path to go quiet — but not forever, because a
+# node that is always busy would otherwise never update at all.
+UPDATE_QUIET_S = float(os.environ.get("BR_UPDATE_QUIET", "5"))
+UPDATE_MAX_DEFER = float(os.environ.get("BR_UPDATE_MAX_DEFER", "3600"))
+
+
+_UPDATE_BROKEN = [""]
+_INFLIGHT = [0]
+_LAST_OP = [0.0]
+_OP_LOCK = threading.Lock()
+# Only the client data path counts. Gossip and heartbeats never stop, a
+# relay tenant's long-poll is open by definition, and repair is internal and
+# resumable from its cursor — counting any of them would mean "busy" is
+# always true and the node would never update.
+DATA_PATHS = ("/kv", "/mget", "/delete")
+
+
+class _op:
+    def __enter__(self):
+        with _OP_LOCK:
+            _INFLIGHT[0] += 1
+        return self
+
+    def __exit__(self, *exc):
+        with _OP_LOCK:
+            _INFLIGHT[0] -= 1
+            _LAST_OP[0] = time.time()
+        return False
+
+
+def data_path_busy():
+    """True while a client operation is in flight or just finished."""
+    with _OP_LOCK:
+        return (_INFLIGHT[0] > 0
+                or (time.time() - _LAST_OP[0]) < UPDATE_QUIET_S)
 
 
 def _git(*args):
@@ -155,7 +192,20 @@ def _update_loop(secret):
             pull = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
                                   capture_output=True, text=True, timeout=120)
             if pull.returncode != 0:
-                continue                       # dirty tree or diverged: leave it
+                # Say why, once. Silence here meant a node ran stale code for
+                # a day with --auto-update set and looked configured
+                # correctly: the service sandbox made its own checkout
+                # read-only, the pull failed every time, and nothing was
+                # logged. A node that cannot update must be noisy about it.
+                why = (pull.stderr or pull.stdout or "").strip().splitlines()
+                msg = why[-1] if why else f"git exited {pull.returncode}"
+                if _UPDATE_BROKEN[0] != msg:
+                    _UPDATE_BROKEN[0] = msg
+                    print(f"auto-update BLOCKED: {msg} "
+                          f"(repo {repo}) — this node will not self-update",
+                          file=sys.stderr, flush=True)
+                continue
+            _UPDATE_BROKEN[0] = ""
             after = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                                    capture_output=True, text=True,
                                    timeout=20).stdout.strip()
@@ -177,6 +227,24 @@ def _update_loop(secret):
                 # three nodes mid-benchmark. execv replaces this process
                 # with a fresh one on the new code, keeping the same command
                 # line, and works identically under systemd.
+                # Wait for the data path to go quiet. A restart between
+                # requests is invisible; one in the middle of a write makes
+                # the client retry and, at scale, can fail a long ingest.
+                waited = 0.0
+                while data_path_busy() and waited < UPDATE_MAX_DEFER:
+                    if waited and waited % 60 < 2:
+                        print(f"auto-update: deferred {int(waited)}s, "
+                              f"{_INFLIGHT[0]} operation(s) in flight",
+                              file=sys.stderr, flush=True)
+                    time.sleep(2)
+                    waited += 2
+                if waited >= UPDATE_MAX_DEFER:
+                    print(f"auto-update: proceeding after {int(waited)}s of "
+                          f"continuous traffic — replicas and client retries "
+                          f"cover the gap", file=sys.stderr, flush=True)
+                elif waited:
+                    print(f"auto-update: data path quiet after {int(waited)}s",
+                          file=sys.stderr, flush=True)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 # Preserve HOW we were started. Under `python -m pkg.mod`,
@@ -618,6 +686,13 @@ def post_any(addr, path, payload: bytes, secret: str, timeout=5):
 # Request handling shared by the HTTP server and the tenant envelope loop.
 
 def service_post(store, peers, hub, secret, path, data, quic=None):
+    if path in DATA_PATHS:
+        with _op():
+            return _service_post(store, peers, hub, secret, path, data, quic)
+    return _service_post(store, peers, hub, secret, path, data, quic)
+
+
+def _service_post(store, peers, hub, secret, path, data, quic=None):
     if path == "/kv":
         entries = [(k, v) for k, v in data["entries"]]
         if GATE is not None:
