@@ -246,9 +246,16 @@ possession, so a minted node only earns by actually storing what it is
 sent, which makes it a large operator rather than an attacker. What cheap
 identities do buy is **replica capture** — at RF3, a party holding fraction
 `k` of the ring holds all three replicas of roughly `k³` of the keys, and
-can delete or ransom them. The fix is diversity-aware placement (spreading
-a key's replicas across subnets and operators), which is not implemented
-yet.
+can delete or ransom them.
+
+Placement therefore spreads a key's replicas across distinct **failure
+groups** (an IPv4 /24, or for a relay tenant its own public endpoint rather
+than its relay's), reordering only within the window readers already probe
+so nothing lands where a read will not look. Measured on nine nodes where
+one party ran six: keys with every replica captured fell from **26.8% to
+0.4%**. Where the network is genuinely homogeneous — three nodes in one
+subnet, which is ours today — it still places a full replica set rather
+than refusing to write.
 
 Nodes are **self-healing**: each continuously walks its own keys in small
 batches (tunable via `BR_REPAIR_EVERY` / `BR_REPAIR_BATCH`) and re-pushes

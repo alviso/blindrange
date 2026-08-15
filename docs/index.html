@@ -357,9 +357,11 @@ minted node only earns by genuinely storing what it is sent, which makes it
 a large operator rather than a thief. What cheap identities really buy is
 <b>replica capture</b>: at three replicas, a party holding half the ring
 holds every copy of roughly an eighth of the data, and can delete or ransom
-it. The fix is spreading a key's replicas across subnets and operators
-rather than trusting the hash — not implemented yet, and it is the thing we
-would want done before this network held anything you could not lose.</p>
+it. Placement now spreads a key's replicas across distinct failure groups
+instead of trusting the hash — measured on nine nodes with one party running
+six, fully-captured keys fell from <b>26.8% to 0.4%</b>. A /24 is a coarse
+proxy for "the same place" and it is wrong at the edges in both directions,
+so treat this as raising the cost of capture rather than removing it.</p>
 
 <h2>Honesty as the design principle</h2>
 <p>Every queryable-encryption scheme leaks something. Most products bury

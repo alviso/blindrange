@@ -69,7 +69,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .dyadic import (dyadic_cover, encode_str, levels_for, max_level,
                      prefix_range)
-from .ring import Ring
+from .ring import Ring, failure_group
 
 # A node applies its own TTL (15s) before serving /peers, so the client
 # re-filtering more strictly than that just discards nodes the network still
@@ -400,7 +400,9 @@ class Owner:
                                   f"(tried {contacts})")
         self._addr_of = found
         self._udp_of = udp
-        new_ring = Ring(sorted(found), replicas=3)
+        new_ring = Ring(sorted(found), replicas=3,
+                        groups={nid: failure_group(a, udp.get(nid, ""))
+                                for nid, a in found.items()})
         if new_ring != self.ring:
             self.ring = new_ring
         return sorted(found)
