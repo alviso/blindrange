@@ -1,7 +1,7 @@
 """Synthetic traffic, so the public network is visibly doing something.
 
 A demo network with no users looks identical to a broken one. This writes,
-queries, deletes and compacts in a loop so the live figures on
+queries and deletes in a loop so the live figures on
 blindrange.dev move — and so the whole path stays continuously exercised
 rather than only when someone remembers to run a benchmark.
 
@@ -22,12 +22,14 @@ What it is genuinely good for:
   * honest cost — it churns, so the storage curve stays flat instead of
     climbing forever, and the token spend is visible
 
-Each cycle inserts N records, queries them, deletes them, and compacts so
-the space actually comes back. Net storage over a cycle is ~zero; what it
-consumes is bandwidth, CPU and write capacity.
+Each cycle inserts N records, counts them, and deletes them. Compaction —
+the part that actually reclaims space — runs every few cycles rather than
+every one, because on the live network inserting 25,000 records took 11s
+and compacting them took 565s. Net storage stays flat; what it consumes is
+bandwidth, CPU and write capacity.
 
-  python3 examples/heartbeat.py --records 100000
-  python3 examples/heartbeat.py --records 5000 --once
+  python3 examples/heartbeat.py --records 5000
+  python3 examples/heartbeat.py --records 2000 --once
 """
 import argparse
 import os
@@ -49,8 +51,16 @@ def _stop(*_):
     print("  finishing the current cycle, then stopping", flush=True)
 
 
-def cycle(owner, n, field="ts", verbose=True):
-    """Insert, read, delete, compact. Returns per-phase seconds."""
+def cycle(owner, n, field="ts", compact=False):
+    """Insert, read, delete, and — periodically — compact.
+
+    Compaction is deliberately NOT every cycle. Measured on the live
+    network: 11s to insert 25,000 records and 565s to compact them, so
+    compacting each time turns a heartbeat into a compaction stress test
+    that is idle 94% of the time. Tombstones are cheap and the space comes
+    back on the next sweep, so amortising it keeps the traffic steady and
+    the storage curve still flat.
+    """
     rng = random.Random()
     t = {}
     rows = [{"ts": rng.randrange(2_592_000), "m": f"hb {rng.randrange(1 << 30)}"}
@@ -61,11 +71,12 @@ def cycle(owner, n, field="ts", verbose=True):
     owner.drain()
     t["insert"] = time.time() - t0
 
+    # Full range, so the number logged is meaningful every time. A random
+    # window looked fine and quietly reported "0 matched", which reads as a
+    # broken read path rather than an unlucky range.
     t0 = time.time()
-    lo = rng.randrange(2_000_000)
-    got = owner.count(field, lo, lo + 500_000)
+    t["matched"] = owner.count(field, 0, (1 << 22) - 1)
     t["query"] = time.time() - t0
-    t["matched"] = got
 
     t0 = time.time()
     rids = [r["_rid"] for r in owner.query_stream(
@@ -74,11 +85,13 @@ def cycle(owner, n, field="ts", verbose=True):
         owner.delete_many(rids[i:i + 2000])
     t["delete"] = time.time() - t0
 
-    # Compaction is what actually reclaims the space. Without it this would
-    # be a slow storage leak dressed up as a heartbeat.
-    t0 = time.time()
-    owner.compact()
-    t["compact"] = time.time() - t0
+    # Compaction is what actually reclaims the space. Without it eventually,
+    # this would be a slow storage leak dressed up as a heartbeat.
+    t["compact"] = 0.0
+    if compact:
+        t0 = time.time()
+        owner.compact()
+        t["compact"] = time.time() - t0
     return t
 
 
@@ -90,8 +103,10 @@ def main():
     ap.add_argument("--secret", default="blindrange-public")
     ap.add_argument("--issuer", default="https://tokens.blindrange.dev")
     ap.add_argument("--account", default=os.environ.get("BR_ACCOUNT", ""))
-    ap.add_argument("--records", type=int, default=10_000,
+    ap.add_argument("--records", type=int, default=5_000,
                     help="records per cycle")
+    ap.add_argument("--compact-every", type=int, default=5,
+                    help="reclaim space every N cycles (0 = never)")
     ap.add_argument("--pause", type=float, default=30.0,
                     help="seconds between cycles")
     ap.add_argument("--once", action="store_true")
@@ -116,12 +131,14 @@ def main():
     cycles = 0
     while not STOP:
         try:
-            t = cycle(owner, a.records)
+            due = a.compact_every and (cycles + 1) % a.compact_every == 0
+            t = cycle(owner, a.records, compact=due)
             cycles += 1
             print(f"  cycle {cycles}: insert {t['insert']:.0f}s "
                   f"({a.records / max(t['insert'], 1e-9):,.0f}/s) · "
                   f"count {t['query']:.1f}s ({t['matched']:,} matched) · "
-                  f"delete {t['delete']:.0f}s · compact {t['compact']:.0f}s",
+                  f"delete {t['delete']:.0f}s"
+                  + (f" · compact {t['compact']:.0f}s" if t['compact'] else ""),
                   flush=True)
         except Exception as e:
             # Never die on one bad cycle: this runs unattended, and a

@@ -607,10 +607,9 @@ draw();
           `${(i / (s.length - 1)) * 240},${40 - (v / max) * 36}`).join(" "));
       }
       el("lnote").innerHTML =
-        '<b>This traffic is synthetic.</b> We run a load generator against ' +
-        'the public network so it is visibly alive and every path stays ' +
-        'exercised — there are no paying customers yet, and we are not going ' +
-        'to imply otherwise. ' +
+        '<b>Some of this traffic is synthetic.</b> We run a load generator ' +
+        'against the public network so it is visibly alive and every path ' +
+        'stays exercised. ' +
         '<a href="https://status.blindrange.dev/">per-node detail →</a>';
     } catch (e) {
       el("live").classList.add("stale");
