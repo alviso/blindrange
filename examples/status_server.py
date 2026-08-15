@@ -21,11 +21,11 @@ import sys
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from blindrange.node import status_html  # noqa: E402
-from blindrange import receipt  # noqa: E402
+from blindrange import merkle, receipt  # noqa: E402
 
 # Anonymous audit reports. Held in memory and, if BR_REPORT_STATE is set,
 # checkpointed to disk so a deploy does not erase them (see _save/_load).
@@ -172,6 +172,97 @@ def _load():
             SEEN_SET.add(sig)
 
 
+# ---------------------------------------------------------------- the log
+# Everything else here removes a party you would have to trust. This part
+# does not: we score the audits and compute the shares, and an operator has
+# no way to check that a number was not revised afterwards. That is the one
+# place we ARE the trusted party, and it sits badly next to the rest.
+#
+# So every accepted report and every share calculation goes into an
+# append-only Merkle log. Reports are logged IN FULL — they were designed to
+# be publishable, carrying no owner or database identifier — which buys more
+# than tamper-evidence: anyone can re-run score_groups() over the logged
+# inputs and check our arithmetic, not merely that we did not change our
+# answer later.
+#
+# What it does not do is stated in blindrange/merkle.py, and matters: it
+# cannot stop us declining to log something in the first place, and it
+# cannot alone stop a split view. Detecting that needs operators to compare
+# heads, which is a GET.
+LOG_PATH = os.environ.get("BR_LOG_PATH", "")
+LOG_KEY_PATH = os.environ.get("BR_LOG_KEY", "")
+LOG = merkle.Log()
+LOG_LOCK = threading.Lock()
+LOG_SIGNER = [None]
+
+
+def _log_key():
+    if LOG_SIGNER[0] is not None:
+        return LOG_SIGNER[0]
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    priv = None
+    if LOG_KEY_PATH and os.path.exists(LOG_KEY_PATH):
+        with open(LOG_KEY_PATH, "rb") as f:
+            priv = Ed25519PrivateKey.from_private_bytes(f.read())
+    elif LOG_KEY_PATH:
+        priv = Ed25519PrivateKey.generate()
+        with open(LOG_KEY_PATH, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(priv.private_bytes(serialization.Encoding.Raw,
+                                       serialization.PrivateFormat.Raw,
+                                       serialization.NoEncryption()))
+    LOG_SIGNER[0] = priv
+    return priv
+
+
+def log_append(kind, payload):
+    """Append one entry and persist it. Never rewrites: the file is opened
+    for append and the in-memory tree only ever grows."""
+    entry = json.dumps({"kind": kind, "at": int(time.time()), "body": payload},
+                       sort_keys=True, separators=(",", ":")).encode()
+    with LOG_LOCK:
+        idx = LOG.append(entry)
+        if LOG_PATH:
+            try:
+                with open(LOG_PATH, "ab") as f:
+                    f.write(entry + b"\n")
+            except OSError as e:
+                print(f"WARNING: cannot persist transparency log to "
+                      f"{LOG_PATH}: {e}. History will not survive restart.",
+                      file=sys.stderr, flush=True)
+    return idx
+
+
+def log_load():
+    if not LOG_PATH or not os.path.exists(LOG_PATH):
+        return
+    try:
+        with open(LOG_PATH, "rb") as f:
+            for line in f:
+                line = line.rstrip(b"\n")
+                if line:
+                    LOG.append(line)
+    except OSError:
+        pass
+
+
+def signed_head():
+    """A head an operator can keep and come back with tomorrow."""
+    with LOG_LOCK:
+        size, rt = len(LOG), LOG.root()
+    head = {"size": size, "root": rt.hex(), "at": int(time.time())}
+    priv = _log_key()
+    if priv is not None:
+        from cryptography.hazmat.primitives import serialization
+        msg = f"brlog|{head['size']}|{head['root']}|{head['at']}".encode()
+        head["sig"] = priv.sign(msg).hex()
+        head["pub"] = priv.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw).hex()
+    return head
+
+
 def score_groups(payload, now):
     """Turn a report into per-node rates, trusting only what nodes signed.
 
@@ -237,7 +328,11 @@ def record_report(payload):
     if not accepted:
         raise ValueError("no corroborated node receipts in report")
     _save()
-    return {"accepted": accepted}
+    # Log the inputs, not a summary: the point is that our scoring can be
+    # recomputed, not merely that it was not edited.
+    idx = log_append("report", payload)
+    return {"accepted": accepted, "log_index": idx,
+            "log_size": len(LOG)}
 
 
 def possession():
@@ -273,6 +368,22 @@ def refresh_loop(node_addr, every=15):
         time.sleep(every)
 
 
+_LAST_SHARE_LOG = [0.0]
+
+
+def log_shares(shares):
+    """Record what each node was actually credited with.
+
+    Reports are the inputs; this is the output, and an operator cares about
+    the output. Rate-limited because the page recomputes on every refresh
+    and a log that grows with page views is a log nobody will read.
+    """
+    if time.time() - _LAST_SHARE_LOG[0] < 900:
+        return
+    _LAST_SHARE_LOG[0] = time.time()
+    log_append("shares", shares)
+
+
 def with_shares(data):
     """Attach each node's share of a distribution pool, in per-mille.
 
@@ -300,13 +411,27 @@ def with_shares(data):
                       if total > 0 else None)
     data["pool_covered"] = round(
         100 * sum(1 for r in rows if r.get("measured")) / max(1, len(rows)))
+    if total > 0:
+        log_shares({r["id"]: r["share"] for r in rows
+                    if r.get("share") is not None})
     return data
 
 
 def make_handler(node_addr):
     class Handler(BaseHTTPRequestHandler):
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
-            path = urlparse(self.path).path
+            u = urlparse(self.path)
+            path, q = u.path, parse_qs(u.query)
+            if path.startswith("/log"):
+                return self._log_route(path, q)
             if path not in ("/", "/status.json", "/health",
                             "/possession.json"):
                 self.send_error(404)
@@ -339,6 +464,49 @@ def make_handler(node_addr):
             self.send_header("Cache-Control", "public, max-age=15")
             self.end_headers()
             self.wfile.write(body)
+
+        def _log_route(self, path, q):
+            """Endpoints an operator needs to check us, and nothing more.
+
+            Deliberately unauthenticated and CORS-open: a transparency log
+            that is awkward to read is not one, and everything in it was
+            built to be published.
+            """
+            self.send_header  # (kept for clarity; headers set in _json)
+            if path == "/log/sth":
+                return self._json(signed_head())
+            if path == "/log/entries":
+                start = max(0, int((q.get("start", ["0"])[0]) or 0))
+                end = min(len(LOG), start + min(
+                    int((q.get("count", ["64"])[0]) or 64), 256))
+                with LOG_LOCK:
+                    rows = [LOG.entries[i].decode("utf-8", "replace")
+                            for i in range(start, end)]
+                return self._json({"start": start, "entries": rows,
+                                   "size": len(LOG)})
+            if path == "/log/proof":
+                try:
+                    m = int(q.get("leaf", [""])[0])
+                    with LOG_LOCK:
+                        proof = [h.hex() for h in LOG.inclusion(m)]
+                        size, rt = len(LOG), LOG.root().hex()
+                        leaf = LOG.entries[m].decode("utf-8", "replace")
+                except (ValueError, IndexError):
+                    return self._json({"error": "no such leaf"}, 404)
+                return self._json({"leaf_index": m, "leaf": leaf,
+                                   "tree_size": size, "root": rt,
+                                   "proof": proof})
+            if path == "/log/consistency":
+                try:
+                    m = int(q.get("first", [""])[0])
+                    with LOG_LOCK:
+                        proof = [h.hex() for h in LOG.consistency(m)]
+                        size, rt = len(LOG), LOG.root().hex()
+                except (ValueError, IndexError):
+                    return self._json({"error": "bad first size"}, 400)
+                return self._json({"first": m, "second": size, "root": rt,
+                                   "proof": proof})
+            return self._json({"error": "not found"}, 404)
 
         def do_POST(self):
             if urlparse(self.path).path != "/report":
@@ -396,6 +564,7 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     a = ap.parse_args()
     _load()                               # survive deploys
+    log_load()
     threading.Thread(target=_restart_on_new_code, daemon=True).start()
     threading.Thread(target=refresh_loop, args=(a.node,), daemon=True).start()
     time.sleep(1.5)                       # let the first snapshot land
