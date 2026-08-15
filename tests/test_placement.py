@@ -142,3 +142,54 @@ class TestGroupingBias(unittest.TestCase):
     def test_a_public_candidate_beats_a_lan_one(self):
         g = failure_group("via:r:7501/x", "192.168.1.5:7501,24.72.147.56:7501")
         self.assertEqual(g, "24.72.147.0/24")
+
+
+class TestRepairCursorDurability(unittest.TestCase):
+    """The repair cursor has to survive a restart.
+
+    As a local variable it reset to "" on every start, so each restart swept
+    the keyspace from the beginning. Harmless when nodes ran for weeks;
+    crippling once auto-update restarted them every few minutes, because a
+    three-hour sweep interrupted every five never reaches the far end — and
+    a newly joined node simply stops filling with no error anywhere.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def store(self, name="kv.db"):
+        import os
+        import blindrange.node as node
+        return node.Store(os.path.join(self.tmp, name))
+
+    def test_cursor_survives_a_restart(self):
+        st = self.store()
+        st.put([(f"R:{i:06d}", "v") for i in range(50)])
+        st.set_meta("repair_cursor", "R:000031")
+        del st
+        self.assertEqual(self.store().get_meta("repair_cursor"), "R:000031")
+
+    def test_a_fresh_store_starts_at_the_beginning(self):
+        self.assertEqual(self.store("fresh.db").get_meta("repair_cursor"), "")
+
+    def test_resuming_continues_rather_than_restarting(self):
+        st = self.store()
+        st.put([(f"R:{i:06d}", "v") for i in range(50)])
+        first = st.batch_after("", 10)
+        st.set_meta("repair_cursor", first[-1][0])
+        resumed = st.batch_after(st.get_meta("repair_cursor"), 10)
+        self.assertGreater(resumed[0][0], first[-1][0],
+                           "resumed sweep re-covered ground it had done")
+
+    def test_meta_is_isolated_from_the_keyspace(self):
+        """Repair walks kv; the cursor must not appear there and get
+        replicated to other nodes as if it were data."""
+        st = self.store()
+        st.put([("R:a", "v")])
+        st.set_meta("repair_cursor", "R:a")
+        self.assertEqual([k for k, _ in st.batch_after("", 100)], ["R:a"])

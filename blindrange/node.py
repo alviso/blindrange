@@ -499,6 +499,10 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS spent "
                         "(ref TEXT PRIMARY KEY, epoch TEXT, ts INT) "
                         "WITHOUT ROWID")
+        # Small durable scratchpad. Today it holds the repair cursor, which
+        # has to outlive the process: see _repair_loop.
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta "
+                        "(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")
         self.db.commit()
         # Cumulative, never reset. A rate is the consumer's job: two
         # samples and a clock beat a counter that decays on its own, and it
@@ -507,6 +511,18 @@ class Store:
         self.read_batches = 0
         self.writes = 0
         self.deletes = 0
+
+    def get_meta(self, key, default=""):
+        with self.lock:
+            row = self.db.execute("SELECT v FROM meta WHERE k=?",
+                                  (key,)).fetchone()
+            return row[0] if row else default
+
+    def set_meta(self, key, value):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                            (key, str(value)))
+            self.db.commit()
 
     def spend(self, ref, epoch):
         """Record a token as spent. False if it already was.
@@ -1139,7 +1155,13 @@ def _gossip_loop(peers: Peers, secret: str):
 
 
 def _repair_loop(store: Store, peers: Peers, secret: str):
-    cursor = ""
+    # The cursor MUST outlive the process. It used to be a local reset to ""
+    # on every start, so each restart swept the keyspace from the beginning
+    # again — harmless when a node ran for weeks, and quietly crippling once
+    # auto-update began restarting nodes every few minutes: a three-hour
+    # sweep interrupted every five minutes never gets past its first few
+    # percent, so a newly joined node stops filling and nothing says why.
+    cursor = store.get_meta("repair_cursor", "")
     while True:
         time.sleep(REPAIR_EVERY + random.random())
         if peers.stable_since() < REPAIR_SETTLE:
@@ -1161,10 +1183,12 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
             size = int(min(REPAIR_BATCH_MAX,
                            max(200, store.count() / rounds)))
         batch = store.batch_after(cursor, size)
-        if not batch:
+        if not batch:                       # wrapped: start the next sweep
             cursor = ""
+            store.set_meta("repair_cursor", cursor)
             continue
         cursor = batch[-1][0]
+        store.set_meta("repair_cursor", cursor)
         by_addr = {}
         for k, v in batch:
             for nid in ring.route(k):
