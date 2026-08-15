@@ -57,6 +57,10 @@
   .warnbox b { color:var(--txt); font-weight:normal; }
   .foot { margin-top:54px; padding-top:20px; border-top:1px solid var(--line);
           color:var(--dim); font-size:13px; }
+  .shot { margin:14px 0 4px; border:1px solid var(--line); border-radius:9px;
+          overflow:hidden; line-height:0; display:block; }
+  .shot:hover { border-color:var(--acc); }
+  .shot img { width:100%; height:auto; display:block; }
 </style>
 </head>
 <body>
@@ -82,7 +86,17 @@ about.</div>
   that <b>kill nodes while you query</b>. The fastest way to understand what
   this is: the same rows are readable on the left and pseudorandom on the
   right, and killing a node changes neither.</div>
+  <a class="shot" href="/webdemo.png">
+    <img src="/webdemo.png" width="1760" height="930" loading="lazy"
+         alt="The demo in two halves. Left: readable customer orders with
+              amounts, dates and statuses, returned by a range query over
+              amount and date. Right: the same data as a node operator sees
+              it — opaque I: keys mapped to base64 blobs — above a list of
+              eight live nodes each with a kill button.">
+  </a>
   <pre>python3 examples/webdemo/app.py   <span class="g"># → http://127.0.0.1:8600</span></pre>
+  <div class="meta">202 rows in 39ms over eight nodes holding 62,517 keys ·
+    the node panel is what an operator actually gets</div>
 </div>
 
 <div class="demo">

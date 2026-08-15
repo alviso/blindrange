@@ -7,7 +7,7 @@
 <meta name="description" content="An open-source encrypted database distributed across nodes that cannot read it. Range queries without order leakage, a privacy budget you set, and a storage market that pays on proved possession.">
 <meta property="og:title" content="blindrange — a database that can't read its own data">
 <meta property="og:description" content="Range queries on encrypted data, served by machines that cannot read it. Store data nobody can be subpoenaed for, or run a node and earn a share of what the network earns.">
-<meta property="og:image" content="https://blindrange.dev/webdemo.png">
+<meta property="og:image" content="https://blindrange.dev/header.png">
 <meta property="og:url" content="https://blindrange.dev/">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
@@ -55,14 +55,20 @@
   .card p { font-size:13.5px; color:var(--dim); margin:0; }
   .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
           color:var(--dim); font-size:13px; }
-  .shot { margin:30px 0 8px; }
-  .shot a { display:block; border:1px solid var(--line); border-radius:12px;
-            overflow:hidden; line-height:0; background:var(--panel); }
-  .shot a:hover { border-color:var(--acc); }
-  .shot img { width:100%; height:auto; display:block; }
-  .shot .cap { line-height:1.6; font-size:13px; color:var(--dim);
-               margin-top:10px; }
-  .shot .cap b { color:var(--txt); font-weight:normal; }
+  .live { margin:26px 0 6px; background:var(--panel);
+          border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+  .lrow { display:flex; gap:26px; align-items:flex-end; flex-wrap:wrap; }
+  .lstat { display:flex; flex-direction:column; min-width:96px; }
+  .lstat b { font-size:26px; font-weight:normal; color:var(--ok);
+             font-variant-numeric:tabular-nums; line-height:1.1; }
+  .lstat span { font-size:11.5px; color:var(--dim); text-transform:uppercase;
+                letter-spacing:.07em; margin-top:3px; }
+  .spark { flex:1; min-width:140px; height:40px; color:var(--acc);
+           opacity:.75; }
+  .lnote { font-size:12.5px; color:var(--dim); margin-top:12px;
+           border-top:1px solid var(--line); padding-top:10px; }
+  .lnote b { color:var(--warn); font-weight:normal; }
+  .live.stale .lstat b { color:var(--dim); }
 
   /* the two doors */
   .doors { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
@@ -148,25 +154,25 @@ measured and published</b>.</div>
   </div>
 </div>
 
-<div class="shot">
-  <a href="/demos" title="run it yourself — examples/webdemo/app.py">
-    <img src="/webdemo.png" width="1760" height="930" loading="lazy"
-         alt="The blindrange demo: on the left, readable customer orders with
-              amounts, dates and statuses returned by a range query. On the
-              right, the same data as a node operator sees it — a list of
-              opaque I: keys mapped to base64 blobs, and eight live nodes
-              each with a kill button.">
-  </a>
-  <div class="cap"><b>The same data, twice.</b> On the left, a range query
-  over amount and date, decrypted on the owner's machine. On the right, what
-  the machines storing it actually hold — opaque keys, opaque blobs, no
-  order and no equality. The nodes have kill buttons; replication covers it
-  mid-query. <a href="/demos">Run it yourself →</a></div>
+<div class="live" id="live">
+  <div class="lrow">
+    <div class="lstat"><b id="lw">–</b><span>writes / sec</span></div>
+    <div class="lstat"><b id="ld">–</b><span>deletes / sec</span></div>
+    <div class="lstat"><b id="lr">–</b><span>reads / sec</span></div>
+    <div class="lstat"><b id="lk">–</b><span>keys stored</span></div>
+    <div class="lstat"><b id="ln">–</b><span>live nodes</span></div>
+    <svg class="spark" id="spark" viewBox="0 0 240 40" preserveAspectRatio="none"
+         aria-hidden="true"><polyline id="sparkline" fill="none"
+         stroke="currentColor" stroke-width="1.5" points=""/></svg>
+  </div>
+  <div class="lnote" id="lnote">connecting to the public network…</div>
 </div>
 
 <div class="btns">
   <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
   <a class="btn" href="/demos">Demos</a>
+  <a class="btn" href="/audit">Audit log</a>
+  <a class="btn" href="/s3">S3 gateway</a>
   <a class="btn" href="https://status.blindrange.dev/">Live network</a>
   <a class="btn" href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">Threat model</a>
 </div>
@@ -574,6 +580,48 @@ document.getElementById("add").onclick = () => {
 document.getElementById("recs").oninput = draw;
 document.getElementById("size").oninput = draw;
 draw();
+</script>
+
+<script>
+// Live figures from the public network. Deliberately fails quiet: if the
+// status server is unreachable the panel says so rather than showing zeros,
+// because a dead network and an idle one must not look the same.
+(function () {
+  const el = id => document.getElementById(id);
+  const fmt = n => n == null ? "–" : Number(n).toLocaleString("en-US");
+  async function tick() {
+    try {
+      const r = await fetch("https://status.blindrange.dev/activity.json",
+                            {cache: "no-store"});
+      const d = await r.json();
+      el("lw").textContent = fmt(d.writes_per_s);
+      el("ld").textContent = fmt(d.deletes_per_s);
+      el("lr").textContent = fmt(d.reads_per_s);
+      el("lk").textContent = fmt(d.keys);
+      el("ln").textContent = fmt(d.nodes);
+      el("live").classList.remove("stale");
+      const s = d.series || [];
+      if (s.length > 1) {
+        const max = Math.max(...s, 1);
+        el("sparkline").setAttribute("points", s.map((v, i) =>
+          `${(i / (s.length - 1)) * 240},${40 - (v / max) * 36}`).join(" "));
+      }
+      el("lnote").innerHTML =
+        '<b>This traffic is synthetic.</b> We run a load generator against ' +
+        'the public network so it is visibly alive and every path stays ' +
+        'exercised — there are no paying customers yet, and we are not going ' +
+        'to imply otherwise. ' +
+        '<a href="https://status.blindrange.dev/">per-node detail →</a>';
+    } catch (e) {
+      el("live").classList.add("stale");
+      el("lnote").textContent =
+        "the public network is not answering right now — which is itself " +
+        "worth knowing, so this says so instead of showing zeros";
+    }
+  }
+  tick();
+  setInterval(tick, 5000);
+})();
 </script>
 </body>
 </html>

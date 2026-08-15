@@ -263,6 +263,62 @@ def signed_head():
     return head
 
 
+# ---------------------------------------------------------------- activity
+# Rates for the public page, derived from two samples of the nodes' own
+# cumulative counters rather than from anything a node reports about its
+# own throughput. A counter that only goes up cannot flatter itself: if a
+# node restarts the counter drops, and rather than render that as a huge
+# negative rate we treat it as a gap and skip the interval.
+#
+# What this exposes is aggregate and nothing more — network-wide writes,
+# deletes and reads per second. Per-database activity is not derivable from
+# it, and could not be even if we wanted: nodes cannot tell whose keys are
+# whose, which is the property the whole system is built on.
+ACTIVITY = collections.deque(maxlen=240)      # (ts, writes, deletes, reads)
+ACTIVITY_LOCK = threading.Lock()
+
+
+def record_activity(nodes):
+    tot_w = sum(int(n.get("writes") or 0) for n in nodes)
+    tot_d = sum(int(n.get("deletes") or 0) for n in nodes)
+    tot_r = sum(int(n.get("read_batches") or 0) for n in nodes)
+    with ACTIVITY_LOCK:
+        ACTIVITY.append((time.time(), tot_w, tot_d, tot_r))
+
+
+def activity(window=120):
+    """Per-second rates over the last `window` seconds, plus a short series
+    for a sparkline."""
+    with ACTIVITY_LOCK:
+        pts = list(ACTIVITY)
+    if len(pts) < 2:
+        return {"writes_per_s": 0, "deletes_per_s": 0, "reads_per_s": 0,
+                "samples": 0, "series": []}
+    now = pts[-1][0]
+    span = [p for p in pts if now - p[0] <= window] or pts[-2:]
+    if len(span) < 2:
+        span = pts[-2:]
+    dt = span[-1][0] - span[0][0]
+    if dt <= 0:
+        return {"writes_per_s": 0, "deletes_per_s": 0, "reads_per_s": 0,
+                "samples": len(span), "series": []}
+
+    def rate(i):
+        d = span[-1][i] - span[0][i]
+        return round(max(d, 0) / dt, 1)       # counter reset -> 0, never negative
+
+    series = []
+    for a, b in zip(pts, pts[1:]):
+        gap = b[0] - a[0]
+        if gap <= 0:
+            continue
+        w = (b[1] - a[1]) / gap
+        series.append(round(max(w, 0), 1))
+    return {"writes_per_s": rate(1), "deletes_per_s": rate(2),
+            "reads_per_s": rate(3), "samples": len(span),
+            "window_s": round(dt), "series": series[-60:]}
+
+
 def score_groups(payload, now):
     """Turn a report into per-node rates, trusting only what nodes signed.
 
@@ -362,6 +418,7 @@ def refresh_loop(node_addr, every=15):
                     f"http://{node_addr}/status.json", timeout=20) as r:
                 SNAPSHOT["data"] = json.loads(r.read())
                 SNAPSHOT["error"] = None
+                record_activity(SNAPSHOT["data"].get("nodes") or [])
         except Exception as e:                       # keep the last good one
             SNAPSHOT["error"] = f"{type(e).__name__}: {e}"
         SNAPSHOT["at"] = time.time()
@@ -433,7 +490,7 @@ def make_handler(node_addr):
             if path.startswith("/log"):
                 return self._log_route(path, q)
             if path not in ("/", "/status.json", "/health",
-                            "/possession.json"):
+                            "/possession.json", "/activity.json"):
                 self.send_error(404)
                 return
             data = SNAPSHOT["data"]
@@ -441,6 +498,23 @@ def make_handler(node_addr):
                 self.send_error(503, SNAPSHOT["error"] or "warming up")
                 return
             data = with_shares(json.loads(json.dumps(data)))
+            if path == "/activity.json":
+                data = with_shares(json.loads(json.dumps(SNAPSHOT["data"] or {})))
+                nodes = data.get("nodes") or []
+                body = json.dumps({
+                    **activity(),
+                    "nodes": len(nodes),
+                    "keys": data.get("keys"),
+                    "synthetic": True,
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/possession.json":
                 body = json.dumps(possession()).encode()
                 self.send_response(200)

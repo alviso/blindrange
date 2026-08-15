@@ -466,7 +466,13 @@ class Store:
                         "(ref TEXT PRIMARY KEY, epoch TEXT, ts INT) "
                         "WITHOUT ROWID")
         self.db.commit()
+        # Cumulative, never reset. A rate is the consumer's job: two
+        # samples and a clock beat a counter that decays on its own, and it
+        # means a restart shows as a visible discontinuity rather than a
+        # quiet lie about how busy the node has been.
         self.read_batches = 0
+        self.writes = 0
+        self.deletes = 0
 
     def spend(self, ref, epoch):
         """Record a token as spent. False if it already was.
@@ -500,6 +506,7 @@ class Store:
         with self.lock:
             self.db.executemany("INSERT OR REPLACE INTO kv VALUES (?,?)", entries)
             self.db.commit()
+            self.writes += len(entries)
 
     def put_nx(self, entries):
         with self.lock:
@@ -518,6 +525,7 @@ class Store:
             for k in keys:
                 n += self.db.execute("DELETE FROM kv WHERE k=?", (k,)).rowcount
             self.db.commit()
+            self.deletes += n
             return n
 
     def mget(self, keys):
@@ -981,6 +989,7 @@ def service_get(store, peers, path, query, quic=None, status=None):
         return 200, {"addr": peers.addr, "node_id": peers.ident.node_id,
                      "keys": store.count(),
                      "read_batches": store.read_batches,
+                     "writes": store.writes, "deletes": store.deletes,
                      "peers": len(peers.live()),
                      "mode": "tenant" if is_via(peers.addr) else "direct",
                      "quic": quic is not None, "udp": peers.udp,
