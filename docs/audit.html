@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blindrange-audit — an audit trail its host cannot read or alter</title>
+<meta name="description" content="An append-only audit log stored on machines that cannot read it. Ships from Vector, Fluent Bit or the OpenTelemetry Collector with configuration alone — no plugin.">
+<meta property="og:title" content="blindrange-audit — an audit trail its host cannot read or alter">
+<meta property="og:description" content="The one workload where an encrypted, decentralized store wins on the merits: append-only by construction, tamper-evident by AEAD, and queried exactly the way audit logs are read.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/audit">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:880px; margin:0 auto; padding:40px 24px 80px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:38px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:15px; text-transform:uppercase; letter-spacing:.12em;
+       color:var(--acc); margin:44px 0 14px; }
+  p { margin:0 0 14px; }
+  p.dim, li.dim { color:var(--dim); }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .btns { display:flex; gap:12px; flex-wrap:wrap; margin:24px 0 8px; }
+  .btn { border:1px solid var(--line); border-radius:8px; padding:10px 18px;
+         color:var(--txt); background:var(--panel); }
+  .btn.primary { border-color:var(--acc); color:var(--acc); }
+  .btn:hover { text-decoration:none; border-color:var(--acc); }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:16px 18px; overflow-x:auto; font-size:13.5px; line-height:1.55;
+        margin:0 0 14px; }
+  pre .c { color:var(--dim); }  pre .g { color:var(--ok); }
+  code { color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:14px; margin:0 0 14px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
+           vertical-align:top; }
+  th { color:var(--dim); font-weight:normal; text-transform:uppercase;
+       font-size:12px; letter-spacing:.08em; }
+  td.k { color:var(--warn); white-space:nowrap; }
+  ul { margin:0 0 14px 20px; } li { margin-bottom:8px; }
+  .tabs { display:flex; gap:6px; margin-bottom:-1px; flex-wrap:wrap; }
+  .tab { border:1px solid var(--line); border-bottom:none;
+         border-radius:8px 8px 0 0; padding:7px 14px; font-size:13px;
+         color:var(--dim); cursor:pointer; background:#12161d; }
+  .tab.on { color:var(--acc); border-color:var(--acc); border-bottom-color:transparent;
+            background:var(--panel); }
+  .tab:focus { outline:none; }
+  .panel { display:none; } .panel.on { display:block; }
+  .panel pre { border-radius:0 10px 10px 10px; }
+  .warnbox { background:#12161d; border:1px solid var(--line);
+             border-left:3px solid var(--warn); border-radius:8px;
+             padding:14px 16px; font-size:13.5px; color:var(--dim); }
+  .warnbox b { color:var(--txt); font-weight:normal; }
+  .foot { margin-top:52px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>blindrange<span>-audit</span></h1>
+<div class="tag">An append-only audit trail stored on machines that
+<b>cannot read or alter it</b> — and that ships from the log agent you
+already run, with configuration rather than code.</div>
+
+<div class="btns">
+  <a class="btn primary" href="https://github.com/alviso/blindrange/tree/main/examples/auditlog">Source &amp; README</a>
+  <a class="btn" href="/#pricing">What it costs</a>
+  <a class="btn" href="https://github.com/alviso/blindrange">GitHub</a>
+</div>
+
+<h2>Why an audit log, specifically</h2>
+<p>Most things you could store this way involve a trade: you give up
+sorting, or joins, or full-text, in exchange for privacy. An audit trail is
+the case where there is <b>no trade</b> — the shape of the problem and the
+shape of this database are the same shape.</p>
+<table>
+  <tr><th>An audit trail needs</th><th>What this already is</th></tr>
+  <tr><td class="k">Append-only history</td><td>The index <em>is</em>
+  per-writer append-only counter chains. Rewriting history was never
+  expressible, so nothing has to forbid it.</td></tr>
+  <tr><td class="k">Tamper-evidence</td><td>Every record is AES-GCM. An
+  altered blob does not decrypt — a holder cannot quietly change an entry,
+  only destroy one, and the replica group makes that visible.</td></tr>
+  <tr><td class="k">Filter by actor, action, time</td><td>Prefix, prefix and
+  range — the three operations this index is fastest at. Ordered by time for
+  free, because dyadic leaves are already in value order.</td></tr>
+  <tr><td class="k">A holder who can't read it</td><td>Nodes hold
+  pseudorandom keys and opaque blobs.</td></tr>
+</table>
+<p>That last row is the whole argument. For most data, "the vendor can read
+it" is something you tolerate. For an audit trail it is a <b>liability</b> —
+which makes this the rare case where being unable to read is the feature
+rather than the compromise.</p>
+
+<h2>Send events from what you already run</h2>
+<p>There is no plugin to install and none to write. Vector, Fluent Bit and
+the OpenTelemetry Collector all ship a generic HTTP output, so the entire
+integration is a few lines of config:</p>
+
+<div class="tabs">
+  <button class="tab on" data-t="v">Vector</button>
+  <button class="tab" data-t="f">Fluent Bit</button>
+  <button class="tab" data-t="o">OpenTelemetry</button>
+  <button class="tab" data-t="c">curl</button>
+</div>
+<div class="panel on" id="v"><pre>[sinks.blindrange]
+type      = "http"
+inputs    = ["your_source"]
+uri       = "http://127.0.0.1:8710/ingest"
+method    = "post"
+encoding.codec = "json"</pre></div>
+<div class="panel" id="f"><pre>[OUTPUT]
+    Name   http
+    Match  *
+    Host   127.0.0.1
+    Port   8710
+    URI    /ingest
+    Format json</pre></div>
+<div class="panel" id="o"><pre>exporters:
+  otlphttp/blindrange:
+    logs_endpoint: http://127.0.0.1:8710/ingest
+    encoding: json
+service:
+  pipelines:
+    logs:
+      exporters: [otlphttp/blindrange]</pre></div>
+<div class="panel" id="c"><pre>curl -X POST http://127.0.0.1:8710/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"actor":"alice@corp","action":"role.grant","target":"billing-admin"}'</pre></div>
+
+<p class="dim">Ingest takes a single object, a JSON array, NDJSON, or an
+OTLP/JSON envelope — and it <b>unwraps OTLP into individual records</b>
+rather than storing a whole batch as one blob, which is the failure mode
+that would leave a pipeline looking healthy while quietly destroying the
+trail. Timestamps are read in seconds, milliseconds, nanoseconds or
+RFC 3339, from any of five key names; the actor from <code>actor</code>,
+<code>user</code>, <code>principal</code> or <code>subject</code>. Anything
+unrecognised still rides along inside the encrypted payload. Being
+forgiving here is deliberate: an audit pipeline that drops events over a
+key name is worse than no pipeline.</p>
+
+<h2>Where it runs is the security model</h2>
+<pre>python3 examples/auditlog/audit.py \
+    --state ~/.blindrange/audit.brdb \
+    --bootstrap seed.blindrange.dev:7501 \
+    --secret blindrange-public \
+    --account &lt;key from tokens.blindrange.dev/signup&gt;
+<span class="g"># → http://127.0.0.1:8710</span></pre>
+<p>The keys live in that process and in the <code>.brdb</code> file beside
+it. Never on a node, never with us. Run it next to whatever produces your
+events.</p>
+<p class="dim">This is the same fork Storj draws between its hosted S3
+gateway, where keys sit server-side, and the self-hosted one that keeps
+encryption end-to-end. Hosting it for you would be more convenient and
+would cost exactly the property you came for, so we don't offer it.</p>
+
+<h2>One dial for privacy and cost</h2>
+<p><code>--leaf</code> sets the time resolution that <b>nobody</b> can ever
+exceed — not a node operator, not someone logging every query you run,
+however long they watch. It is also what you pay: finer resolution means
+more dyadic levels, so more index entries per event.</p>
+<pre>--leaf 3600   <span class="c">→  leaf_width 4096  (1.1 hours)</span>
+--leaf 60     <span class="c">→  leaf_width 64    (1.1 minutes)</span></pre>
+<p class="dim">Widths must be powers of two, so a human interval is snapped
+— and the tool prints the bound you actually got, not the one you asked
+for. Calling 4096 seconds "an hour" would be a lie in the one number that
+<em>is</em> the guarantee. Coarser is cheaper <b>and</b> more private, which
+is the unusual direction; see the <a href="/#pricing">calculator</a>.</p>
+
+<h2>What it deliberately will not do</h2>
+<ul>
+  <li class="dim"><b>No delete, no compact.</b> Both exist in the SDK and
+  neither is exposed here. An audit trail whose own tooling can drop entries
+  answers the wrong question when someone asks whether records could have
+  been removed. The test suite asserts those routes return 404, rather than
+  trusting that nobody adds them later.</li>
+  <li class="dim"><b>No full-text search over payloads.</b> You filter by
+  actor, action and time, then read what comes back — which is how audit
+  logs are actually read. Claiming otherwise would need a different scheme
+  with a different leakage profile.</li>
+  <li class="dim"><b>No GROUP BY.</b> Counts come from index metadata with
+  zero records fetched, accurate to one leaf. The privacy budget shows up as
+  the error bar.</li>
+</ul>
+
+<h2>On compliance, carefully</h2>
+<div class="warnbox">
+<b>SEC Rule 17a-4 was amended in 2022</b> to add an <b>audit-trail
+alternative</b> to WORM: rather than write-once media, a system may qualify
+if it can recreate an original record after any change and produce a
+complete, time-stamped account of what happened. Append-only chains with
+per-record AEAD sit far closer to that alternative than to WORM — which
+this design cannot offer at all, since compaction rewrites by construction.
+<br><br>
+That is a description of the regulation and <b>not a claim of
+compliance</b>. No lawyer has reviewed this, and it has not been assessed
+against 17a-4, FINRA 4511, or anything else. Treat it as the reason the
+question is worth asking, not as an answer to it.
+</div>
+
+<div class="foot">Part of <a href="https://github.com/alviso/blindrange">blindrange</a>,
+MIT-licensed. The console shows every event twice — as you see it, and as a
+node operator sees it — because the difference is the entire point.
+<a href="/">← back to blindrange</a></div>
+
+</div>
+<script>
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('on'));
+  t.classList.add('on');
+  document.getElementById(t.dataset.t).classList.add('on');
+});
+</script>
+</body>
+</html>

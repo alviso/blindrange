@@ -126,7 +126,7 @@ measured and published</b>.</div>
     link or decrypt, and you can still run <code>BETWEEN</code> and
     <code>LIKE 'ac%'</code> over the result.</p>
     <div class="go">→ <a href="#store">Why store here</a> ·
-       <a href="#pricing">Pricing &amp; calculator</a></div>
+       <a href="#pricing">Pricing</a> · <a href="/audit">Audit-log app</a></div>
   </div>
   <div class="door earn">
     <div class="eyebrow">If you have a spare disk</div>
@@ -142,6 +142,7 @@ measured and published</b>.</div>
 
 <div class="btns">
   <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
+  <a class="btn" href="/audit">Audit-log app</a>
   <a class="btn" href="https://status.blindrange.dev/">Live network</a>
   <a class="btn" href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">Threat model</a>
 </div>
@@ -282,6 +283,18 @@ with invented addresses — signup is rate-limited per IP and that is the
 whole defence. And your key is the only thing identifying your account:
 keep it, because it cannot be recovered, and anyone holding it can spend
 your quota.</p>
+
+<h2>A worked example: audit logs</h2>
+<p>Most things you could store here involve a trade — you give up sorting,
+or joins, or full-text, and get privacy back. An <b>audit trail</b> is the
+case where there is no trade: append-only is what the index already is,
+tamper-evidence falls out of per-record AEAD, and the queries audit logs
+actually use are the three this index is fastest at. For most data "the
+vendor can read it" is tolerated; for an audit trail it is a liability.</p>
+<p><a href="/audit"><b>blindrange-audit →</b></a> ships from Vector, Fluent
+Bit or the OpenTelemetry Collector with configuration alone, has no delete
+route by design, and shows every event twice — as you see it, and as a node
+operator sees it.</p>
 
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding
