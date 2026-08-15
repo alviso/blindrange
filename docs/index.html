@@ -7,7 +7,7 @@
 <meta name="description" content="An open-source encrypted database distributed across nodes that cannot read it. Range queries without order leakage, a privacy budget you set, and a storage market that pays on proved possession.">
 <meta property="og:title" content="blindrange — a database that can't read its own data">
 <meta property="og:description" content="Range queries on encrypted data, served by machines that cannot read it. Store data nobody can be subpoenaed for, or run a node and earn a share of what the network earns.">
-<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:image" content="https://blindrange.dev/webdemo.png">
 <meta property="og:url" content="https://blindrange.dev/">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
@@ -55,6 +55,14 @@
   .card p { font-size:13.5px; color:var(--dim); margin:0; }
   .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
           color:var(--dim); font-size:13px; }
+  .shot { margin:30px 0 8px; }
+  .shot a { display:block; border:1px solid var(--line); border-radius:12px;
+            overflow:hidden; line-height:0; background:var(--panel); }
+  .shot a:hover { border-color:var(--acc); }
+  .shot img { width:100%; height:auto; display:block; }
+  .shot .cap { line-height:1.6; font-size:13px; color:var(--dim);
+               margin-top:10px; }
+  .shot .cap b { color:var(--txt); font-weight:normal; }
 
   /* the two doors */
   .doors { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr));
@@ -138,6 +146,22 @@ measured and published</b>.</div>
     <div class="go">→ <a href="#node">Run a node</a> ·
        <a href="#earn">How earning works</a></div>
   </div>
+</div>
+
+<div class="shot">
+  <a href="/demos" title="run it yourself — examples/webdemo/app.py">
+    <img src="/webdemo.png" width="1760" height="930" loading="lazy"
+         alt="The blindrange demo: on the left, readable customer orders with
+              amounts, dates and statuses returned by a range query. On the
+              right, the same data as a node operator sees it — a list of
+              opaque I: keys mapped to base64 blobs, and eight live nodes
+              each with a kill button.">
+  </a>
+  <div class="cap"><b>The same data, twice.</b> On the left, a range query
+  over amount and date, decrypted on the owner's machine. On the right, what
+  the machines storing it actually hold — opaque keys, opaque blobs, no
+  order and no equality. The nodes have kill buttons; replication covers it
+  mid-query. <a href="/demos">Run it yourself →</a></div>
 </div>
 
 <div class="btns">
