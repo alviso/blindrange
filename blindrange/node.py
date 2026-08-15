@@ -768,7 +768,27 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 """
 
 
-def status_html(rows, total, seed_addr):
+def status_html(rows, total, seed_addr, head=None):
+    # The shares above are computed by us, which makes this the one page on
+    # the network where you would otherwise have to take our word for
+    # something. Say where the receipts are, right next to the numbers they
+    # are about.
+    if head:
+        logstr = (
+            '<div class="note"><b>Every number above is logged.</b> Each '
+            'accepted audit and each share calculation is a leaf in an '
+            'append-only Merkle log, so we cannot revise one after the fact '
+            'without anyone who kept an earlier head noticing. Current head: '
+            f'<code>{head.get("size")}:{str(head.get("root", ""))[:32]}</code> '
+            '(<a href="/log/sth">/log/sth</a>, '
+            '<a href="/log/entries?start=0&amp;count=20">/log/entries</a>). '
+            'Check it yourself with '
+            '<code>python3 examples/verify_log.py</code> — it remembers this '
+            'head and demands proof next time that the log still contains '
+            'it. It cannot stop us declining to log something, and catching '
+            'a split view needs two operators comparing heads.</div>')
+    else:
+        logstr = ""
     body = "".join(
         f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
         f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
@@ -814,6 +834,7 @@ per thousand — 500 would be half of everything. It is structural position on
 the ring multiplied by <b>proved</b> possession, so a node with no audits yet
 earns nothing and a node that self-reports generously earns nothing extra.
 Illustrative: a share of a pool, not an entitlement, and not money.</div>
+{logstr}
 <div class="foot">join with two commands ·
 <a href="https://blindrange.dev">blindrange.dev</a> ·
 <a href="https://github.com/alviso/blindrange">source</a><br>

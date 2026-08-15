@@ -246,6 +246,41 @@ is the unusual direction; see the <a href="/#pricing">calculator</a>.</p>
   the error bar.</li>
 </ul>
 
+<h2>Checking the people who hold it</h2>
+<p>An audit trail is only as good as your ability to prove nothing was
+removed, and that question applies to <em>us</em> as much as to a node
+operator. Two different mechanisms cover the two halves, and it is worth
+keeping them apart.</p>
+<table>
+  <tr><th>Question</th><th>What answers it</th></tr>
+  <tr><td class="k">Did a node lose my events?</td><td>You audit it: sample
+  your own records and check the AES-GCM tag. A node cannot fabricate a hit
+  — it cannot derive the key or forge the ciphertext.</td></tr>
+  <tr><td class="k">Did the network quietly drop a node's failures, or
+  restate what it was paid?</td><td>Every accepted audit and every share
+  calculation is a leaf in an <b>append-only Merkle log</b>. Keep one tree
+  head and any later rewrite of anything before it fails a consistency
+  proof.</td></tr>
+</table>
+<pre><span class="c"># remembers the head; next run demands proof the log still contains it</span>
+python3 examples/verify_log.py
+<span class="g">  head      size 3  root 4cd723911d1ce43e…
+  signature valid
+  consistent with the 2 entries seen previously  ✓  (1 new)</span></pre>
+<p class="dim">The head is published at
+<a href="https://status.blindrange.dev/log/sth">status.blindrange.dev/log/sth</a>,
+with the entries themselves at <code>/log/entries</code>. Reports are logged
+<b>whole</b> — they carry no owner or database identifier by design — so you
+can re-run the scoring over the logged inputs and check the arithmetic, not
+merely that nobody edited the answer afterwards. Tested by actually
+cheating: rewriting a past share from 333 to 900, and separately deleting an
+entry; an operator holding the earlier head rejects both.</p>
+<p class="dim">What it does <b>not</b> do: it cannot stop us declining to
+log something in the first place, and it cannot by itself catch a split
+view — one log shown to you and a different one to someone else. That needs
+two operators comparing heads, which is why the verifier prints one in a
+form you can paste to somebody.</p>
+
 <h2>On compliance, carefully</h2>
 <div class="warnbox">
 <b>SEC Rule 17a-4 was amended in 2022</b> to add an <b>audit-trail

@@ -456,7 +456,7 @@ def make_handler(node_addr):
                 ctype = "application/json"
             else:
                 body = status_html(data["nodes"], data["keys"],
-                                   node_addr).encode()
+                                   node_addr, signed_head()).encode()
                 ctype = "text/html; charset=utf-8"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
