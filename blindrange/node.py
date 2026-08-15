@@ -94,7 +94,10 @@ UPDATE_EVERY = float(os.environ.get("BR_UPDATE_EVERY", "300"))   # 5 min
 # vanished mid-ingest once cost a 1M-record benchmark at 620k, so a pending
 # restart waits for the data path to go quiet — but not forever, because a
 # node that is always busy would otherwise never update at all.
-UPDATE_QUIET_S = float(os.environ.get("BR_UPDATE_QUIET", "5"))
+# Consecutive one-second samples with nothing in flight before restarting.
+# Two is enough to land between requests without waiting for silence that a
+# busy node will never produce.
+UPDATE_IDLE_SAMPLES = int(os.environ.get("BR_UPDATE_IDLE_SAMPLES", "2"))
 UPDATE_MAX_DEFER = float(os.environ.get("BR_UPDATE_MAX_DEFER", "3600"))
 
 
@@ -123,10 +126,23 @@ class _op:
 
 
 def data_path_busy():
-    """True while a client operation is in flight or just finished."""
+    """True while a client operation is actually in flight.
+
+    Deliberately NOT "and nothing finished recently". That version also
+    required a quiet window since the last completed request, which sounds
+    safer and is worse: a node under any steady traffic never sees the
+    window clear, so it deferred for the full hour and then restarted
+    anyway — at an arbitrary moment rather than a chosen one, having logged
+    "deferred 240s, 0 operation(s) in flight" the whole time.
+
+    What actually matters is not restarting mid-request. With nothing in
+    flight there is no request to interrupt: the next one arrives at a
+    closed port for the length of an exec, and hedged writes and replicas
+    already cover that. The caller waits for a couple of consecutive idle
+    samples so it lands between requests rather than inside one.
+    """
     with _OP_LOCK:
-        return (_INFLIGHT[0] > 0
-                or (time.time() - _LAST_OP[0]) < UPDATE_QUIET_S)
+        return _INFLIGHT[0] > 0
 
 
 def _git(*args):
@@ -230,14 +246,20 @@ def _update_loop(secret):
                 # Wait for the data path to go quiet. A restart between
                 # requests is invisible; one in the middle of a write makes
                 # the client retry and, at scale, can fail a long ingest.
-                waited = 0.0
-                while data_path_busy() and waited < UPDATE_MAX_DEFER:
+                waited, idle_runs = 0.0, 0
+                while waited < UPDATE_MAX_DEFER:
+                    if data_path_busy():
+                        idle_runs = 0
+                    else:
+                        idle_runs += 1
+                        if idle_runs >= UPDATE_IDLE_SAMPLES:
+                            break
                     if waited and waited % 60 < 2:
                         print(f"auto-update: deferred {int(waited)}s, "
                               f"{_INFLIGHT[0]} operation(s) in flight",
                               file=sys.stderr, flush=True)
-                    time.sleep(2)
-                    waited += 2
+                    time.sleep(1)
+                    waited += 1
                 if waited >= UPDATE_MAX_DEFER:
                     print(f"auto-update: proceeding after {int(waited)}s of "
                           f"continuous traffic — replicas and client retries "

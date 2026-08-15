@@ -16,11 +16,8 @@ class TestInFlightTracking(unittest.TestCase):
     def setUp(self):
         node._INFLIGHT[0] = 0
         node._LAST_OP[0] = 0.0
-        self.quiet = node.UPDATE_QUIET_S
-        node.UPDATE_QUIET_S = 0.4
 
     def tearDown(self):
-        node.UPDATE_QUIET_S = self.quiet
         node._INFLIGHT[0] = 0
         node._LAST_OP[0] = 0.0
 
@@ -32,13 +29,26 @@ class TestInFlightTracking(unittest.TestCase):
             self.assertTrue(node.data_path_busy())
             self.assertEqual(node._INFLIGHT[0], 1)
 
-    def test_stays_busy_through_the_quiet_window(self):
-        """A gap between two writes in a batch is not idleness."""
+    def test_idle_the_moment_the_last_request_finishes(self):
+        """Observed in production: also requiring a quiet window since the
+        last COMPLETED request meant a node under steady traffic never went
+        idle, deferred the full hour, and then restarted at an arbitrary
+        moment having logged "0 operation(s) in flight" throughout."""
         with node._op():
-            pass
-        self.assertTrue(node.data_path_busy())
-        time.sleep(0.5)
-        self.assertFalse(node.data_path_busy())
+            self.assertTrue(node.data_path_busy())
+        self.assertFalse(node.data_path_busy(),
+                         "steady traffic must not block updates forever")
+
+    def test_continuous_traffic_still_yields_idle_gaps(self):
+        """A stream of back-to-back requests, sampled between them, must
+        show idle — otherwise the deferral never ends."""
+        seen_idle = False
+        for _ in range(20):
+            with node._op():
+                pass
+            if not node.data_path_busy():
+                seen_idle = True
+        self.assertTrue(seen_idle)
 
     def test_counter_survives_an_exception(self):
         try:
@@ -74,6 +84,10 @@ class TestInFlightTracking(unittest.TestCase):
         self.assertEqual(set(node.DATA_PATHS), {"/kv", "/mget", "/delete"})
         for p in ("/gossip", "/poll", "/heartbeat", "/stats", "/dialback"):
             self.assertNotIn(p, node.DATA_PATHS)
+
+    def test_idle_samples_are_configured(self):
+        self.assertGreaterEqual(node.UPDATE_IDLE_SAMPLES, 1)
+        self.assertLessEqual(node.UPDATE_IDLE_SAMPLES, 10)
 
     def test_check_interval_is_five_minutes(self):
         self.assertEqual(node.UPDATE_EVERY, 300.0)
