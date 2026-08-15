@@ -903,6 +903,9 @@ letter-spacing:.04em}
 .badge.none{border-color:var(--line);background:var(--panel);color:var(--dim)}
 .badge.none .dot{background:var(--dim)}
 .badge small{color:var(--dim);font-size:12.5px;letter-spacing:0}
+.upd{float:right;font-size:12px;color:var(--dim);font-weight:normal}
+.upd.stale{color:var(--gold)}
+#dyn{transition:opacity .15s}#dyn.loading{opacity:.55}
 @media (max-width:700px){body{padding:28px 14px 60px}
 th,td{padding:7px 6px;font-size:13px}}
 """
@@ -956,6 +959,76 @@ def audit_badge(rows):
             f'node {int(rate * 100)}%</small></div>')
 
 
+STATUS_JS = """<script>
+// Refresh in place rather than reloading: a full reload loses your scroll
+// position and blinks, and this page is meant to be left open. The server
+// renders the fragment, so the badge rules live in exactly one place
+// instead of being reimplemented here and drifting.
+(function () {
+  var last = Date.now(), failing = false;
+  function ago() {
+    var el = document.getElementById("upd");
+    if (!el) return;
+    var s = Math.round((Date.now() - last) / 1000);
+    el.textContent = failing
+      ? "not answering \u2014 showing the last good reading"
+      : (s < 2 ? "updated just now" : "updated " + s + "s ago");
+    el.className = "upd" + (failing || s > 45 ? " stale" : "");
+  }
+  async function poll() {
+    var dyn = document.getElementById("dyn");
+    try {
+      dyn.classList.add("loading");
+      var r = await fetch("/fragment", {cache: "no-store"});
+      if (!r.ok) throw new Error(r.status);
+      dyn.innerHTML = await r.text();
+      last = Date.now(); failing = false;
+    } catch (e) {
+      // Keep the last good numbers and mark them stale. Blank figures would
+      // imply an empty network rather than an unreachable one.
+      failing = true;
+    } finally {
+      dyn.classList.remove("loading");
+      ago();
+    }
+  }
+  setInterval(poll, 10000);
+  setInterval(ago, 1000);
+  ago();
+})();
+</script>"""
+
+
+def status_fragment(rows, total):
+    """The part of the page that changes, rendered once and reused.
+
+    The poller swaps this in rather than rebuilding rows in JavaScript.
+    Duplicating the badge rules into the browser would mean two places to
+    get "degraded versus not yet audited" right, and they would drift.
+    """
+    body = "".join(
+        f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
+        f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
+        f"<td class='{'ver' if (r.get('measured') or {}).get('rate', 0) >= 0.9 else 'behind'}'>"
+        f"{(str(int((r['measured']['rate']) * 100)) + '% · ' + str(r['measured']['reports']) + ' audits') if r.get('measured') else '—'}</td>"
+        f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
+        f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
+        f"{' · behind' if r.get('behind') else ''}"
+        f"{' · modified' if str(r.get('version', '')).endswith('+dirty') else ''}"
+        f"</td>"
+        f"<td class='num'>{r['age']}s</td>"
+        f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
+        f"</tr>" for r in rows)
+    return (f"{audit_badge(rows)}"
+            f"<p class=\"big\"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; "
+            f"<b>{total}</b> encrypted keys stored"
+            f"<span class='upd' id='upd'></span></p>"
+            f"<table><tr><th>node</th><th>reachability</th>"
+            f"<th>keys (self-reported)</th><th>possession (proved)</th>"
+            f"<th>version</th><th>last seen</th><th>share ‰</th></tr>"
+            f"{body}</table>")
+
+
 def status_html(rows, total, seed_addr, head=None):
     # The shares above are computed by us, which makes this the one page on
     # the network where you would otherwise have to take our word for
@@ -977,31 +1050,13 @@ def status_html(rows, total, seed_addr, head=None):
             'a split view needs two operators comparing heads.</div>')
     else:
         logstr = ""
-    body = "".join(
-        f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
-        f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
-        f"<td class='{'ver' if (r.get('measured') or {}).get('rate', 0) >= 0.9 else 'behind'}'>"
-        f"{(str(int((r['measured']['rate']) * 100)) + '% · ' + str(r['measured']['reports']) + ' audits') if r.get('measured') else '—'}</td>"
-        f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
-        f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
-        f"{' · behind' if r.get('behind') else ''}"
-        f"{' · modified' if str(r.get('version', '')).endswith('+dirty') else ''}"
-        f"</td>"
-        f"<td class='num'>{r['age']}s</td>"
-        f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
-        f"</tr>" for r in rows)
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>blindrange — public network status</title><style>{STATUS_CSS}</style>
 </head><body><div class="wrap">
 <h1>blind<span>range</span> — public network</h1>
 <div class="sub">live status, served by the network itself</div>
-{audit_badge(rows)}
-<p class="big"><b>{len(rows)}</b> live nodes &nbsp;·&nbsp; <b>{total}</b>
-encrypted keys stored</p>
-<table><tr><th>node</th><th>reachability</th><th>keys (self-reported)</th>
-<th>possession (proved)</th><th>version</th><th>last seen</th><th>share ‰</th></tr>
-{body}</table>
+<div id="dyn">{status_fragment(rows, total)}</div>
 <div class="note"><b>Key counts on this page are self-reported and
 unverified.</b> A node returns whatever number it likes; nothing here checks
 it. What can be proved is possession: a data owner can ask the node
@@ -1028,7 +1083,9 @@ Illustrative: a share of a pool, not an entitlement, and not money.</div>
 <a href="https://blindrange.dev">blindrange.dev</a> ·
 <a href="https://github.com/alviso/blindrange">source</a><br>
 demo network — no durability promises. seed: {seed_addr}</div>
-</div></body></html>"""
+</div>
+{STATUS_JS}
+</body></html>"""
 
 
 def service_get(store, peers, path, query, quic=None, status=None):

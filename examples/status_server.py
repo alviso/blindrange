@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from blindrange.node import status_html  # noqa: E402
+from blindrange.node import status_fragment, status_html  # noqa: E402
 from blindrange import merkle, receipt  # noqa: E402
 
 # Anonymous audit reports. Held in memory and, if BR_REPORT_STATE is set,
@@ -490,7 +490,8 @@ def make_handler(node_addr):
             if path.startswith("/log"):
                 return self._log_route(path, q)
             if path not in ("/", "/status.json", "/health",
-                            "/possession.json", "/activity.json"):
+                            "/possession.json", "/activity.json",
+                            "/fragment"):
                 self.send_error(404)
                 return
             data = SNAPSHOT["data"]
@@ -498,6 +499,19 @@ def make_handler(node_addr):
                 self.send_error(503, SNAPSHOT["error"] or "warming up")
                 return
             data = with_shares(json.loads(json.dumps(data)))
+            if path == "/fragment":
+                # Just the part that changes, rendered by the same code as
+                # the page itself.
+                data = with_shares(json.loads(json.dumps(SNAPSHOT["data"] or {})))
+                body = status_fragment(data.get("nodes") or [],
+                                       data.get("keys") or 0).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/activity.json":
                 data = with_shares(json.loads(json.dumps(SNAPSHOT["data"] or {})))
                 nodes = data.get("nodes") or []
