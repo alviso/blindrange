@@ -12,6 +12,7 @@ small homogeneous network. Both are tested.
 import collections
 import sys
 import unittest
+from pathlib import Path
 import unittest.mock
 
 from blindrange.ring import Ring, failure_group, REORDER_WINDOW
@@ -546,3 +547,60 @@ class TestBucketCountsNeedNoScratchSpace(unittest.TestCase):
         # matters.
         counts = st.bucket_counts(4)
         self.assertEqual(sum(counts.values()), 500)
+
+
+class TestRepairStatShape(unittest.TestCase):
+    """The counters the loop writes must exist in the dict it resets to.
+
+    They stopped matching: a counter was added to the initial value and not
+    to the reset literal at the end of the logging block, so the loop ran
+    fine for exactly one minute and then died on KeyError every sweep.
+    """
+
+    def test_reconcile_can_record_into_a_fresh_stat(self):
+        import json
+        import blindrange.node as node
+
+        keys = ["I:" + f"{i:032x}" for i in range(4)]
+
+        def fake_post(addr, path, body, secret, **kw):
+            if path == "/digest":
+                return {"chars": 4, "buckets": {}, "keys": 0}
+            if path == "/bucketkeys":
+                return {"buckets": {p: [] for p in json.loads(body)["prefixes"]}}
+            return {"stored": 0}
+
+        class FakeStore:
+            def bucket_chars(self):
+                return 4
+
+            def bucket_counts(self, chars=None, max_age=0):
+                return {"I:00": 4}
+
+            def bucket_entries_except(self, prefix, have, limit=None):
+                return [[k, "v"] for k in keys]
+
+        class Peers:
+            class ident:
+                @staticmethod
+                def poll_token():
+                    return {}
+
+        stat = node._new_repair_stat()
+        with unittest.mock.patch.object(node, "post_any", fake_post):
+            sent, _ = node._reconcile("1.2.3.4:1", FakeStore(), Peers(),
+                                      "s", stat)
+        self.assertEqual(sent, len(keys))
+        self.assertEqual(stat["reconciled"], len(keys))
+
+    def test_the_logging_reset_keeps_every_counter(self):
+        """The reset and the initial value are the same constructor now, so
+        this fails loudly if anyone reintroduces a second literal."""
+        import blindrange.node as node
+        import re
+        src = (Path(node.__file__).read_text()
+               if hasattr(Path(node.__file__), "read_text") else "")
+        literals = re.findall(r'\{"scanned": 0', src)
+        self.assertLessEqual(len(literals), 1,
+                             "the stat shape is written out in more than one "
+                             "place; they will drift again")

@@ -1478,6 +1478,17 @@ def _gossip_loop(peers: Peers, secret: str):
             pass                                       # peer down; TTL handles it
 
 
+def _new_repair_stat():
+    """One place that defines the shape.
+
+    The reset at the end of the logging block was a second literal, it
+    silently kept the old shape when a counter was added, and the loop then
+    died on KeyError the moment reconciliation tried to record anything.
+    """
+    return {"scanned": 0, "sent": Counter(), "rounds": 0,
+            "reconciled": 0, "since": time.time()}
+
+
 def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
     """Send a peer only what it is missing, by comparing key ranges.
 
@@ -1598,8 +1609,7 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
     # percent, so a newly joined node stops filling and nothing says why.
     cursor = store.get_meta("repair_cursor", "")
     last_poll, catching_up = 0.0, False
-    stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
-            "reconciled": 0, "since": time.time()}
+    stat = _new_repair_stat()
     no_digest = set()          # peers too old to reconcile; sweep them blind
     behind_addrs = set()
     # `stop` exists so a test can end this thread. Without it every test that
@@ -1714,10 +1724,11 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                     for a, n in stat["sent"].most_common(4)) or "nobody"
                 print(f"repair: {'catch-up' if catching_up else 'maintenance'} "
                       f"· scanned {stat['scanned'] / el:,.0f} keys/s over "
-                      f"{stat['rounds']} rounds · sent {per} · holding "
-                      f"{mine:,} keys", file=sys.stderr, flush=True)
-                stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
-                        "since": time.time()}
+                      f"{stat['rounds']} rounds · sent {per} · "
+                      f"{stat['reconciled'] / el:,.0f}/s of that reconciled"
+                      f" · holding {mine:,} keys",
+                      file=sys.stderr, flush=True)
+                stat = _new_repair_stat()
         except Exception as e:
             print(f"repair: sweep failed ({type(e).__name__}: "
                   f"{e}) — retrying", file=sys.stderr, flush=True)
