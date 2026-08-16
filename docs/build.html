@@ -183,16 +183,6 @@ not queryable, and nothing about them is indexed. In the example,
 <code>customer</code> is carried along and never appears on any node.</p>
 
 <h2 id="connect"><span class="n">3</span>Create the database</h2>
-<pre><code class="from-quickstart">state_path = a.state                  # local file; your keys live here
-passphrase = a.passphrase             # unlocks it; never leaves this box
-bootstrap = [a.bootstrap]             # any live peer, to find the rest
-network_secret = a.secret             # which network you are joining
-
-db = Owner.create(state_path, passphrase, schema,
-                  bootstrap=bootstrap,
-                  network_secret=network_secret)</code></pre>
-
-<p>With real values in place of the script's arguments:</p>
 <pre>db = Owner.create(
     <span class="k">"orders.brdb"</span>,                        <span class="c"># state_path</span>
     <span class="k">"correct horse battery staple"</span>,       <span class="c"># passphrase</span>
@@ -243,6 +233,10 @@ db = Owner.create(state_path, passphrase, schema,
 <p>Reopening takes neither the schema nor the secret — both live in the
 state file:</p>
 <pre><code class="from-quickstart">db = Owner.open(state_path, passphrase, bootstrap=bootstrap)</code></pre>
+<p class="lead">Both calls are exercised by
+<a href="https://github.com/alviso/blindrange/blob/main/examples/quickstart.py">quickstart.py</a>,
+which takes these as command-line arguments so you can point it at your own
+network.</p>
 
 <div class="note warn"><b>Nobody can recover this for you.</b> The
 passphrase never leaves your process. It unlocks the state file holding the
