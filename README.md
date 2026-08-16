@@ -290,6 +290,43 @@ process, because it has no call that replaces a running process in place.
 On an update you will see the node restart and the shell keep hold of it —
 Ctrl+C still stops both.
 
+### Sharding a large database
+
+The network shards by itself — the ring spreads keys over every node. The
+**client** is what does not scale: one owner walks its whole index and
+compacts by rewriting an epoch in memory, so the first ceiling you hit is
+one machine, not the network.
+
+A shard is a whole separate database with its own master key. Independent
+owners have always coexisted invisibly on one network, because keys are PRF
+outputs and nothing on the wire says which database they belong to; this
+just makes the pattern usable as one object.
+
+```python
+from blindrange.sharded import ShardedOwner
+
+db = ShardedOwner.create("~/data/orders", "passphrase", schema,
+                         ["seed.blindrange.dev:7501"], shards=4)
+db.insert_many(rows)                       # spread round robin
+db.query("amount", 100, 2000)              # fanned out and merged
+db.count("amount", 0, 4095)                # summed
+db.compact()                               # one shard at a time
+```
+
+Measured at 4,000 records over 4 shards: compaction peak memory **28.4 MB →
+7.9 MB**, a 3.6x drop against a theoretical 4x. Queries are marginally
+slower (6ms → 9ms on a small local set) because every range query has to
+visit every shard — records are spread round robin, so no shard can be
+ruled out.
+
+**On unlinkability, honestly.** Separate master keys mean nodes cannot link
+your shards cryptographically: the same value in two shards produces
+unrelated index keys, and a test checks it. But a client that queries all
+its shards at once, from one address, in one burst, correlates them by
+behaviour. Shards are a scaling tool that happens to remove the
+cryptographic link — not compartments. Treat the unlinkability as a bonus,
+never as the reason.
+
 ### Keep it running after you close the terminal
 
 ```bash
