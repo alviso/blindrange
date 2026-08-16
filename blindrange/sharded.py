@@ -317,11 +317,19 @@ class ShardedOwner:
         return sum(_fan([o.count_deleted for o in self.shards]))
 
     def approx_sum(self, field, lo, hi):
-        """Sums add. So do the error bars: each shard's estimate is bounded
-        by its own leaf width, and N of them bound the total N times as
-        loosely in the worst case."""
-        return sum(_fan([(lambda o=o: o.approx_sum(field, lo, hi))
-                         for o in self.shards]))
+        """(estimate, worst_case_error, count), summed across shards.
+
+        All three add, and the error bar has to add with them: the estimate
+        is worthless without it, and returning only the estimate is exactly
+        the kind of tidy-looking lie this project exists not to tell. An
+        earlier version here summed the tuples themselves and raised.
+        """
+        parts = _fan([(lambda o=o: o.approx_sum(field, lo, hi))
+                      for o in self.shards])
+        est = sum(p[0] for p in parts)
+        err = sum(p[1] for p in parts)
+        n = sum(p[2] for p in parts)
+        return est, err, n
 
     def histogram(self, field, lo, hi, buckets=None):
         """Bars add, bucket by bucket.

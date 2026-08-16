@@ -149,7 +149,8 @@ measured and published</b>.</div>
     link or decrypt, and you can still run <code>BETWEEN</code> and
     <code>LIKE 'ac%'</code> over the result.</p>
     <div class="go">→ <a href="#store">Why store here</a> ·
-       <a href="#pricing">Pricing</a> · <a href="/demos">Demos</a></div>
+       <a href="#pricing">Pricing</a> · <a href="/build">Build</a> ·
+     <a href="/demos">Demos</a></div>
   </div>
   <div class="door earn">
     <div class="eyebrow">If you have a spare disk</div>
@@ -178,7 +179,8 @@ measured and published</b>.</div>
 </div>
 
 <div class="btns">
-  <a class="btn primary" href="https://github.com/alviso/blindrange">GitHub</a>
+  <a class="btn primary" href="/build">Build on it</a>
+  <a class="btn" href="https://github.com/alviso/blindrange">GitHub</a>
   <a class="btn" href="/demos">Demos</a>
   <a class="btn" href="/audit">Audit log</a>
   <a class="btn" href="/s3">S3 gateway</a>
@@ -330,6 +332,11 @@ case where there is no trade: append-only is what the index already is,
 tamper-evidence falls out of per-record AEAD, and the queries audit logs
 actually use are the three this index is fastest at. For most data "the
 vendor can read it" is tolerated; for an audit trail it is a liability.</p>
+<p><a href="/build"><b>Build on it →</b></a> nine steps from an empty
+directory to an application whose storage provider cannot read it: schema
+design, connecting, and every CRUD operation. The samples are quoted from a
+script the test suite runs, so the guide cannot drift from working code.</p>
+
 <p><a href="/audit"><b>blindrange-audit →</b></a> ships from Vector, Fluent
 Bit or the OpenTelemetry Collector with configuration alone, has no delete
 route by design, and shows every event twice — as you see it, and as a node

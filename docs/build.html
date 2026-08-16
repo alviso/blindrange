@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build on blindrange — connect, read, write</title>
+<meta name="description" content="A step-by-step guide to building an application on blindrange: schema design, connecting, and every CRUD operation, with code taken from a script that is run by the test suite.">
+<meta property="og:title" content="Build on blindrange">
+<meta property="og:description" content="Nine steps from an empty directory to an application whose storage provider cannot read it. Every sample is quoted from a program the test suite runs.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/build">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:20px; margin:44px 0 4px; scroll-margin-top:20px; }
+  h2 .n { color:var(--acc); margin-right:10px; }
+  h3 { font-size:15px; text-transform:uppercase; letter-spacing:.1em;
+       color:var(--acc); margin:34px 0 8px; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  pre { background:#12161d; border:1px solid var(--line); border-radius:9px;
+        padding:13px 15px; overflow-x:auto; font-size:13px; line-height:1.55;
+        margin:12px 0; }
+  pre .c { color:var(--dim); } pre .g { color:var(--ok); }
+  pre .k { color:var(--warn); }
+  code { color:var(--warn); }
+  .lead { color:var(--dim); }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--acc); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim); margin:14px 0; }
+  .note b { color:var(--txt); font-weight:normal; }
+  .warn { border-left-color:var(--warn); }
+  .toc { background:var(--panel); border:1px solid var(--line);
+         border-radius:11px; padding:16px 20px; margin:26px 0 10px;
+         font-size:14px; }
+  .toc ol { margin:0; padding-left:22px; color:var(--dim); }
+  .toc li { margin:3px 0; }
+  table { border-collapse:collapse; width:100%; font-size:13.5px;
+          margin:12px 0; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; }
+  th { color:var(--acc); font-weight:normal; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Build on <span>blindrange</span></h1>
+<div class="tag">Nine steps from an empty directory to an application whose
+storage provider <b>cannot read it</b>. Every sample below is quoted from
+<a href="https://github.com/alviso/blindrange/blob/main/examples/quickstart.py">examples/quickstart.py</a>,
+which the test suite runs — if the code here stopped working, the build
+would fail.</div>
+
+<div class="toc">
+<ol>
+  <li><a href="#install">Install</a></li>
+  <li><a href="#schema">Describe your data</a> — the one decision that matters</li>
+  <li><a href="#connect">Create the database</a></li>
+  <li><a href="#create">Create</a> — writing records</li>
+  <li><a href="#read">Read</a> — range, prefix, AND, ordering</li>
+  <li><a href="#aggregate">Read without decrypting</a> — count, histogram, sum</li>
+  <li><a href="#update">Update</a> — why there isn't one</li>
+  <li><a href="#delete">Delete</a> — and actually reclaiming space</li>
+  <li><a href="#production">Going further</a> — scale, cost, other machines</li>
+</ol>
+</div>
+
+<h2 id="install"><span class="n">1</span>Install</h2>
+<p class="lead">Python 3.10 or newer. Upgrade pip inside the venv first — a
+fresh venv seeds whatever pip the system Python bundles, and anything older
+than pip 21 predates the packaging standard used here and fails with a
+message about a missing <code>setup.py</code>.</p>
+<pre>git clone https://github.com/alviso/blindrange &amp;&amp; cd blindrange
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e .</pre>
+
+<p>You can point at the public demo network and write nothing yourself:</p>
+<pre><span class="c"># bootstrap seed.blindrange.dev:7501, secret "blindrange-public"</span>
+.venv/bin/python examples/quickstart.py</pre>
+
+<div class="note warn"><b>The demo network is a demo.</b> No durability
+promise, and the network secret is published — it is an anti-vandal measure,
+not access control. Run your own nodes for anything you would mind losing.
+Everything below works identically either way; only
+<code>--bootstrap</code> and <code>--secret</code> change.</div>
+
+<h2 id="schema"><span class="n">2</span>Describe your data</h2>
+<p>A schema names the fields you want to query and how precisely. This is
+the only place in the whole system where you make a privacy decision, so it
+is worth thirty seconds.</p>
+
+<pre><code class="from-quickstart">schema = {
+    "amount": {"type": "int", "bits": 20, "leaf_width": 64},
+    "day":    {"type": "int", "bits": 16, "leaf_width": 16},
+    "status": {"type": "str", "bits": 30, "chars": 6, "leaf_width": 16},
+}</code></pre>
+
+<table>
+<tr><th>key</th><th>what it does</th></tr>
+<tr><td><code>bits</code></td><td>size of the value domain. 2²⁰ covers
+amounts up to about a million.</td></tr>
+<tr><td><code>leaf_width</code></td><td><b>the resolution the network can
+distinguish.</b> The only number with a privacy consequence.</td></tr>
+<tr><td><code>chars</code></td><td>text only: how many leading characters
+are indexed, at 5 bits each, which is what makes prefix search work.</td></tr>
+</table>
+
+<div class="note"><b>Why coarser is better on both axes.</b> A query is
+answered by fetching whole buckets of <code>leaf_width</code>, so no
+observer — however many queries it watches — can localise a value more
+precisely than one bucket. That bound is structural, not statistical. It
+also means fewer index entries per record, so coarse is <i>cheaper</i> too.
+Privacy is the cheap direction here; resolution is what costs money.</div>
+
+<p>Fields you do not list are still stored and returned — they are simply
+not queryable, and nothing about them is indexed. In the example,
+<code>customer</code> is carried along and never appears on any node.</p>
+
+<h2 id="connect"><span class="n">3</span>Create the database</h2>
+<pre><code class="from-quickstart">db = Owner.create(a.state, a.passphrase, schema,
+                  bootstrap=[a.bootstrap],
+                  network_secret=a.secret)</code></pre>
+<p>and on later runs:</p>
+<pre><code class="from-quickstart">db = Owner.open(a.state, a.passphrase, bootstrap=[a.bootstrap])</code></pre>
+
+<div class="note warn"><b>Nobody can recover this for you.</b> The
+passphrase never leaves your process. It unlocks a local state file holding
+the master key, and every index key on the network is an HMAC under that
+key. Lose both the state file and the passphrase and the data is gone —
+that is the same property that stops the storage provider reading it, seen
+from the other side.</div>
+
+<h2 id="create"><span class="n">4</span>Create — writing records</h2>
+<pre><code class="from-quickstart">db.insert_many(rows)
+db.drain()</code></pre>
+<p><code>insert_many</code> returns once a quorum of replicas holds each
+key; <code>drain()</code> waits for the rest. Call it before you measure
+anything, and before the process exits — not after every insert, which
+would throw away the batching.</p>
+
+<h2 id="read"><span class="n">5</span>Read — range, prefix, AND, ordering</h2>
+<pre><code class="from-quickstart">hits = db.query("amount", 300, 500)
+prefix = db.query_prefix("status", "ref")
+both = db.query_multi([{"field": "amount", "lo": 300, "hi": 500},
+                       {"field": "day", "lo": 200, "hi": 210}])</code></pre>
+
+<p>For large or unbounded results, stream in bounded memory:</p>
+<pre><code class="from-quickstart">newest = list(db.query_stream([{"field": "day", "lo": 0, "hi": 65535}],
+                              limit=5, order="-day"))</code></pre>
+
+<div class="note"><b>Mind the direction.</b> <code>order="-day"</code> walks
+the range from the top. Ascending with a <code>limit</code> answers a
+different question — the <i>oldest</i> matches — and pays for every bucket
+in the range to get there. On a 25-day window that was five round trips
+versus one, and the rows it returned were 479 hours old rather than
+20 minutes.</div>
+
+<h2 id="aggregate"><span class="n">6</span>Read without decrypting anything</h2>
+<p>These are answered from index metadata alone. Nothing is fetched,
+nothing is decrypted, and the cost does not grow with the number of
+matches.</p>
+<pre><code class="from-quickstart">est, err, n = db.approx_sum("amount", 0, 1023)</code></pre>
+<pre><span class="c"># count(amount 300..500)   → 35</span>
+<span class="c"># histogram                → [(0, 22), (256, 35), (512, 35), (768, 28)]</span>
+<span class="g">approx_sum(amount)       → 64,644 ± 3,840 over 120 rows</span></pre>
+
+<div class="note">The estimate comes <b>with its error bar</b>, and the API
+will not hand you one without the other. Each bucket contributes count ×
+midpoint, so the per-record error is at most <code>leaf_width/2</code>: the
+resolution you traded away for privacy <i>is</i> the error. That is the
+honest way round, and it is why the number is called
+<code>approx_sum</code>.</div>
+
+<h2 id="update"><span class="n">7</span>Update — why there isn't one</h2>
+<p>There is no update call. A record is one sealed blob under a random
+handle, and editing in place would mean asking a node to modify ciphertext
+it cannot read. So:</p>
+<pre><code class="from-quickstart">db.delete_many([victim["_rid"]])
+db.insert_many([changed])
+db.drain()</code></pre>
+<p>Delete first, then insert. A crash between the two costs you a duplicate
+rather than a hole, and a duplicate is something you can notice and fix.</p>
+
+<h2 id="delete"><span class="n">8</span>Delete — and actually reclaiming space</h2>
+<pre><code class="from-quickstart">db.delete_many(doomed)
+db.drain()</code></pre>
+<p>The rows stop being returned immediately. But a delete writes a
+<i>tombstone</i>: the index entries are still out there and still counted,
+which is why <code>count()</code> can exceed what queries return.</p>
+<pre><span class="c"># deleted 12 rows — gone from queries immediately</span>
+<span class="c"># count() still says       → 12  (tombstoned, not yet reclaimed)</span>
+<span class="g">compact()                → kept 5,616 index entries, dropped 676</span>
+<span class="c"># count() now says         → 0</span></pre>
+<pre><code class="from-quickstart">stats = db.compact()</code></pre>
+
+<div class="note warn"><b>compact() is the only operation that forgets.</b>
+Until it runs, deleted data is unreadable but its index entries remain.
+Schedule it — every couple of hundred thousand deletes, not once a week.
+Tombstone backlog does not hurt in proportion to its size: on our own demo
+network a day of skipped compactions turned a 20-second delete phase into
+481 seconds and needed 2.8 GB of RAM to clear.</div>
+
+<h2 id="production"><span class="n">9</span>Going further</h2>
+
+<h3>Other machines, same database</h3>
+<pre>invite = db.invite()          <span class="c"># hand this to the other device</span>
+other = Owner.accept(path, passphrase, invite)</pre>
+<p>Multiple writers work concurrently; each owns its own append chains, so
+they never collide.</p>
+
+<h3>When one client is not enough</h3>
+<p>Data shards across nodes automatically — the ring handles that, and
+adding nodes adds capacity. The <b>client</b> is what runs out first,
+because compaction rewrites an epoch in memory. When that bites, split
+across independent master keys:</p>
+<pre>from blindrange.sharded import ShardedOwner
+db = ShardedOwner.create(path, passphrase, schema, bootstrap, shards=4)</pre>
+<p>Same API. Measured at 4 shards: compaction peak memory 28.4 MB → 7.9 MB.
+Every range query visits every shard, so keep the count low.</p>
+
+<h3>What it costs</h3>
+<p>A record costs one blob plus one index entry per dyadic level per
+indexed field, times the replication factor. Coarse
+<code>leaf_width</code> means fewer levels. There is a
+<a href="/#pricing">calculator on the front page</a> with the real
+numbers.</p>
+
+<h3>Check the claims yourself</h3>
+<p>Step 8 of the quickstart prints what a node actually holds for the data
+you just wrote:</p>
+<pre><span class="g">I:0003444dfc39de14496d98436571a361  →  S/4cP9LvVoA=
+I:0018472b150a157133733359a041a84e  →  F6QGdxhzbFg=</span>
+<span class="c"># no field names, no values, no ordering — and none of the
+# customer ids appear anywhere on any node</span></pre>
+<p>The <a href="/demos">attack harness</a> runs the real attacks from the
+literature against this design and prints the numbers, including the ones
+that work. Read the
+<a href="https://github.com/alviso/blindrange#threat-model--measured-not-asserted">threat
+model</a> before deciding this fits: it is explicit that this is not for
+healthcare or high-stakes PII, and why.</p>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/demos">demos</a> ·
+<a href="/audit">audit log</a> ·
+<a href="/s3">S3 gateway</a> ·
+<a href="https://status.blindrange.dev/">live network</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>
