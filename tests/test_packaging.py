@@ -71,3 +71,45 @@ class TestImportsWithoutOptionalDeps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDocumentedPythonFloor(unittest.TestCase):
+    """The docs promise a minimum Python. It has to be the real one.
+
+    Someone on an older box hit `Directory '.' is not installable. File
+    'setup.py' not found` — a pre-PEP-517 pip failing on a pyproject-only
+    project, and a message that names neither cause. The docs now state the
+    floor so that person can tell in one command whether their interpreter
+    or their pip is the problem, which is only useful while the number
+    stays true.
+    """
+
+    def _floor(self):
+        import re
+        text = (ROOT / "pyproject.toml").read_text()
+        m = re.search(r'requires-python\s*=\s*"[><=]*\s*(\d+\.\d+)', text)
+        self.assertIsNotNone(m, "pyproject has no requires-python")
+        return m.group(1)
+
+    def test_readme_states_the_real_minimum(self):
+        floor = self._floor()
+        text = (ROOT / "README.md").read_text()
+        self.assertIn(floor, text,
+                      f"README never mentions Python {floor}")
+
+    def test_landing_page_states_the_real_minimum(self):
+        floor = self._floor()
+        page = (ROOT / "docs" / "index.html").read_text()
+        self.assertIn(f"Python {floor}", page,
+                      f"the page a new operator reads should say {floor}")
+
+    def test_install_instructions_upgrade_pip_first(self):
+        """A new venv seeds the system pip, which on an older distro is from
+        2018 and cannot install this project at all."""
+        for name in ("README.md", "docs/index.html", "docs/demos.html"):
+            text = (ROOT / name).read_text()
+            if "pip install -e" not in text:
+                continue
+            self.assertIn("--upgrade pip", text,
+                          f"{name} tells people to install without first "
+                          f"upgrading pip inside the venv")

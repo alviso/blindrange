@@ -159,9 +159,16 @@ Three design decisions do the heavy lifting:
 ## The client — start here
 
 ```bash
-pip install -e .
-blindrange ui
+python3 -m venv .venv && .venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e .
+.venv/bin/blindrange ui
 ```
+
+Needs **Python 3.10 or newer**. Upgrade pip inside the venv first: a new
+venv seeds whatever pip the system Python bundles, and anything older than
+pip 21 predates the packaging standard used here — it fails with
+`Directory '.' is not installable. File 'setup.py' not found`, which is
+accurate and no help at all.
 
 A local client opens in your browser. **Drop a CSV** and it reads the file on
 your machine, proposes a schema, and shows in plain language what each field
@@ -197,8 +204,9 @@ There is a live demo network. Join it — as a node or a client — via the
 always-on seed:
 
 ```bash
-pip install -e .
-blindrange-node --port 7501 --data ~/.blindrange/n1 \
+python3 -m venv .venv && .venv/bin/pip install --upgrade pip
+.venv/bin/pip install -e ".[quic]"
+.venv/bin/blindrange-node --port 7501 --data ~/.blindrange/n1 \
     --seed seed.blindrange.dev:7501 --secret blindrange-public \
     --max-disk 20GB
 ```
@@ -262,6 +270,7 @@ than refusing to write.
 
 ```powershell
 py -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -e ".[quic]"
 
 .venv\Scripts\python -m blindrange.node --port 7501 `

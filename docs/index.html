@@ -351,12 +351,15 @@ to you when they can.</p>
   <button class="tab on" data-t="nmac">macOS / Linux</button>
   <button class="tab" data-t="nwin">Windows</button>
 </div>
-<div class="panel on" id="nmac"><pre>python3 -m venv .venv &amp;&amp; .venv/bin/pip install -e ".[quic]"
+<div class="panel on" id="nmac"><pre>python3 -m venv .venv
+.venv/bin/pip install --upgrade pip        <span class="c"># see below</span>
+.venv/bin/pip install -e ".[quic]"
 
 .venv/bin/blindrange-node --port 7501 --data ~/.blindrange/n1 \
     --seed seed.blindrange.dev:7501 --secret blindrange-public \
     --max-disk 20GB --auto-update</pre></div>
 <div class="panel" id="nwin"><pre>py -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -e ".[quic]"
 
 .venv\Scripts\python -m blindrange.node --port 7501 ^
@@ -364,6 +367,13 @@ to you when they can.</p>
     --seed seed.blindrange.dev:7501 --secret blindrange-public ^
     --max-disk 20GB --auto-update</pre></div>
 </div>
+<p class="dim"><b>Python 3.10 or newer.</b> Upgrade pip inside the venv
+before installing: a new venv seeds whatever pip the system Python bundles,
+and anything before pip 21 predates the packaging standard this project uses
+— it reports <code>Directory '.' is not installable. File 'setup.py' not
+found</code>, which is true and completely unhelpful. If that still fails
+with a message about the Python version, the interpreter is too old and
+needs replacing rather than persuading.</p>
 <p class="dim"><code>--max-disk</code> takes <code>20GB</code> or a
 percentage like <code>5%</code> of the drive. Past it the node stops
 accepting writes; <b>data it already holds is never deleted</b> to get under
