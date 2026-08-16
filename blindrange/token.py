@@ -95,8 +95,11 @@ def fetch_json(url, payload=None, timeout=15):
     Fixing those per-caller is how the first metered node came up silently
     unmetered, so there is exactly one implementation and both use it.
 
-    HTTPError propagates untouched: the issuer answers 402 for an exhausted
-    quota and callers need to see that as itself, not as a transport error.
+    HTTPError propagates as itself — the issuer answers 402 for an exhausted
+    quota and callers need to see that, not a transport error — but with the
+    server's explanation attached. A bare "HTTP Error 400: Bad Request"
+    tells you a rejection happened and nothing about why, when the body
+    said exactly why the whole time.
     """
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"User-Agent": USER_AGENT}
@@ -107,6 +110,14 @@ def fetch_json(url, payload=None, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout,
                                     context=_ssl_context()) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace").strip()[:300]
+        except Exception:                       # nothing to add
+            detail = ""
+        if detail:
+            e.msg = f"{e.msg}: {detail}"
+        raise
     except urllib.error.URLError as e:
         if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
             raise ConnectionError(
