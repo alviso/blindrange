@@ -91,6 +91,11 @@ REPAIR_CATCHUP_H = float(os.environ.get("BR_REPAIR_CATCHUP_H", "0.25"))
 REPAIR_BEHIND_RATIO = float(os.environ.get("BR_REPAIR_BEHIND_RATIO", "0.9"))
 REPAIR_PEER_POLL = float(os.environ.get("BR_REPAIR_PEER_POLL", "60"))
 REPAIR_BATCH_MAX = int(os.environ.get("BR_REPAIR_BATCH_MAX", "20000"))
+# Entries per POST. The sweep batch is how much we *scan*; this is how much
+# goes on the wire at once. They stopped being the same number the moment
+# catch-up sweeps started sizing batches for a whole store.
+REPAIR_POST_MAX = int(os.environ.get("BR_REPAIR_POST_MAX", "2000"))
+_repair_fail = {}                  # addr -> (consecutive failures, last log)
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
 DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
@@ -1353,13 +1358,32 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
                 if nid != peers.ident.node_id and nid in addr_of:
                     by_addr.setdefault(addr_of[nid], []).append([k, v])
         for addr, entries in by_addr.items():
-            try:
-                post_any(addr, "/kv",
-                         json.dumps({"entries": entries,
-                                     "node_token": peers.ident.poll_token()
-                                     }).encode(), secret)
-            except OSError:
-                pass
+            # Chunk. A catch-up sweep sizes its batch for the whole store,
+            # and one post of that many entries is a different animal from
+            # the trickle a maintenance sweep sends: the big ones time out,
+            # and this used to swallow that as `except OSError: pass`, so a
+            # peer could receive nothing while the logs stayed clean.
+            for i in range(0, len(entries), REPAIR_POST_MAX):
+                chunk = entries[i:i + REPAIR_POST_MAX]
+                try:
+                    post_any(addr, "/kv",
+                             json.dumps({"entries": chunk,
+                                         "node_token": peers.ident.poll_token()
+                                         }).encode(), secret)
+                    _repair_fail.pop(addr, None)
+                except OSError as e:
+                    # Log at most once a minute per peer. Silence here makes
+                    # a stalled catch-up look exactly like a healthy one.
+                    n, last = _repair_fail.get(addr, (0, 0.0))
+                    n += 1
+                    if time.time() - last > 60:
+                        print(f"repair: {addr} rejected {len(chunk)} keys "
+                              f"({type(e).__name__}: {str(e)[:80]}) — "
+                              f"{n} failure(s) since it last accepted any",
+                              file=sys.stderr, flush=True)
+                        last = time.time()
+                    _repair_fail[addr] = (n, last)
+                    break        # that peer is unwell; move on
 
 
 RESTART_CODE = 42          # child -> supervisor: "relaunch me on new code"
