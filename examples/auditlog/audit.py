@@ -57,6 +57,13 @@ from blindrange import Owner  # noqa: E402
 TS_BITS = 31
 # What makes an object look like an event rather than an envelope we have
 # failed to recognise. Used only to refuse the latter.
+# How far back an unbounded query looks. An ordered walk costs one lookup
+# per leaf, so the full 31-bit domain is 524,288 leaves — from 1970 to 2038,
+# almost all of it empty. /contrast asked for exactly that and never
+# returned; a default /events did the same, slowly enough on a local node to
+# look merely sluggish. A window is not a limitation here, it is the
+# difference between a query and a hang.
+DEFAULT_WINDOW_S = int(os.environ.get("BR_AUDIT_WINDOW", str(86400 * 30)))
 EVENT_FIELDS = {"ts", "timestamp", "time", "@timestamp", "actor", "user",
                 "action", "event", "message", "msg", "detail", "body",
                 "severity", "level"}
@@ -159,14 +166,27 @@ class Trail:
             v = q.get(k, [None])[0]
             return v.strip() if v else None
         preds, lo, hi = [], one("from"), one("to")
-        t0 = int(float(lo)) if lo else 0
-        t1 = int(float(hi)) if hi else (1 << TS_BITS) - 1
+        now = int(time.time())
+        # Bounded by default, both ends. Unbounded meant walking every leaf
+        # from the epoch to 2038 to answer "show me some events".
+        t1 = int(float(hi)) if hi else now
+        t0 = int(float(lo)) if lo else max(0, t1 - DEFAULT_WINDOW_S)
         preds.append({"field": "ts", "lo": t0, "hi": t1})
         for field in ("actor", "action"):
             val = one(field)
             if val:
                 preds.append({"field": field, "prefix": val})
         return preds
+
+    def window(self, q):
+        """The time range a query actually covered.
+
+        Returned with every answer, because the default is a window rather
+        than all of history and an empty result would otherwise be
+        indistinguishable from an empty database.
+        """
+        ts = next(p for p in self._preds(q) if p["field"] == "ts")
+        return {"from": ts["lo"], "to": ts["hi"]}
 
     def events(self, q, limit=200, newest_first=True):
         preds = self._preds(q)
@@ -296,11 +316,13 @@ def make_handler(trail):
                 # walking away from the end the caller cares about. `?order=asc`
                 # is there for exporting a trail in reading order.
                 asc = (q.get("order", ["desc"])[0] or "desc").lower() == "asc"
-                return self._send(200, {"events": trail.events(
-                    q, limit, newest_first=not asc)})
+                return self._send(200, {
+                    "events": trail.events(q, limit, newest_first=not asc),
+                    "window": trail.window(q)})
             if u.path == "/count":
                 n, kind = trail.count(q)
-                return self._send(200, {"count": n, "basis": kind})
+                return self._send(200, {"count": n, "basis": kind,
+                                        "window": trail.window(q)})
             if u.path == "/contrast":
                 return self._send(200, contrast(trail))
             if u.path == "/healthz":
@@ -428,9 +450,10 @@ def contrast(trail):
     rather than claimed."""
     mine, theirs = [], []
     try:
+        now = int(time.time())
         rows = trail.owner.query_stream(
-            [{"field": "ts", "lo": 0, "hi": (1 << TS_BITS) - 1}], limit=3,
-            order="ts")
+            [{"field": "ts", "lo": now - DEFAULT_WINDOW_S, "hi": now}],
+            limit=3, order="-ts")
         for r in rows:
             when = datetime.fromtimestamp(r["ts"], timezone.utc).strftime("%H:%M:%S")
             mine.append(f"{when}  {r['actor']:<14} {r['action']}")
@@ -461,7 +484,10 @@ def contrast(trail):
             break
     if not theirs:
         theirs = ["(no node reachable for an intel sample)"]
-    return {"mine": mine or ["(no events yet)"], "theirs": theirs}
+    # Say WHICH window was empty. "(no events yet)" on a trail full of
+    # older events is a lie the panel tells confidently.
+    empty = f"(no events in the last {human(DEFAULT_WINDOW_S)})"
+    return {"mine": mine or [empty], "theirs": theirs}
 
 
 def main():

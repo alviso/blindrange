@@ -156,7 +156,7 @@ class TestAuditService(unittest.TestCase):
                                    "operation": "record.export", "rows": 100 + i}).encode()
                        for i in range(3)), "application/x-ndjson")["stored"], 3)
 
-        ev = self.get("/events?limit=100")["events"]
+        ev = self.get("/events?limit=100&from=0")["events"]
         self.assertEqual(len(ev), 5)
         # Newest first by default: an audit UI asks for recent events, and
         # with a limit an ascending walk returns the OLDEST rows in the
@@ -166,23 +166,28 @@ class TestAuditService(unittest.TestCase):
                          "events must come back newest first")
 
         # Reading order is still available for exporting a trail.
-        asc = [e["ts"] for e in self.get("/events?limit=100&order=asc")["events"]]
+        asc = [e["ts"] for e in self.get("/events?limit=100&order=asc&from=0")["events"]]
         self.assertEqual(asc, sorted(asc), "?order=asc must ascend")
         self.assertEqual(sorted(asc), sorted(times), "same rows either way")
 
     def test_02_filters(self):
-        self.assertEqual(len(self.get("/events?actor=alice")["events"]), 2)
-        self.assertEqual(len(self.get("/events?actor=bob")["events"]), 3)
-        both = self.get("/events?actor=bob&action=record")["events"]
+        self.assertEqual(len(self.get("/events?actor=alice&from=0")["events"]), 2)
+        self.assertEqual(len(self.get("/events?actor=bob&from=0")["events"]), 3)
+        both = self.get("/events?actor=bob&action=record&from=0")["events"]
         self.assertEqual(len(both), 3)
         self.assertIn("rows", both[0]["payload"])
 
     def test_03_count_comes_from_index_metadata(self):
-        c = self.get("/count")
+        c = self.get("/count?from=0")
         self.assertEqual(c["count"], 5)
         self.assertEqual(c["basis"], "exact-to-leaf")
 
     def test_04_contrast_shows_both_views(self):
+        # The contrast panel is about recent activity and looks at the last
+        # 30 days; the shared fixture uses a fixed past instant so that the
+        # ordering assertions stay deterministic. Give it something current.
+        self.post([{"ts": int(time.time()) - 60, "actor": "dana@corp",
+                    "action": "login.success"}])
         c = self.get("/contrast")
         mine, theirs = " ".join(c["mine"]), " ".join(c["theirs"])
         self.assertIn("@corp", mine, "owner view shows no readable events")
