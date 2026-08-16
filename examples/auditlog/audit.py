@@ -55,6 +55,11 @@ from blindrange import Owner  # noqa: E402
 # what an adversary watching every query can ever resolve, and what the
 # archive costs, because index entries scale with the number of levels.
 TS_BITS = 31
+# What makes an object look like an event rather than an envelope we have
+# failed to recognise. Used only to refuse the latter.
+EVENT_FIELDS = {"ts", "timestamp", "time", "@timestamp", "actor", "user",
+                "action", "event", "message", "msg", "detail", "body",
+                "severity", "level"}
 DEFAULT_LEAF = 4096            # ~68 minutes: the power of two nearest an hour
 
 
@@ -376,6 +381,24 @@ def parse_batch(raw):
         if isinstance(doc, dict):
             if "resourceLogs" in doc:            # OpenTelemetry otlphttp
                 return unwrap_otlp(doc)
+            # A wrapper around a list is the other obvious thing to
+            # post, and it used to fall through to "this whole object is
+            # one event": a batch of 250 records became one row of
+            # nonsense, answered with {"stored": 1}. For an audit trail
+            # that is the worst failure available.
+            #
+            # The tell is a list of objects under some key, with nothing
+            # event-shaped at the top level. Keyed on shape rather than on
+            # a list of blessed names, so an unusual wrapper is handled
+            # too — and guarded by the event-field check, so a real event
+            # that happens to carry a list of objects (tags, attributes)
+            # is still one event.
+            if not (set(doc) & EVENT_FIELDS):
+                nested = [v for v in doc.values()
+                          if isinstance(v, list) and v
+                          and all(isinstance(x, dict) for x in v)]
+                if nested:
+                    return max(nested, key=len)
             return [doc]
     out = []
     for line in text.splitlines():                  # NDJSON
@@ -441,6 +464,12 @@ def main():
                     help="time resolution nobody can ever exceed, in seconds")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8710)
+    ap.add_argument("--shards", type=int, default=1,
+                    help="split the trail across N independent databases. "
+                         "An audit trail only ever appends, so the client "
+                         "ceiling — compaction rewriting an epoch in memory "
+                         "— is the one it hits first. With >1 the --state "
+                         "path is a DIRECTORY.")
     a = ap.parse_args()
 
     leaf = snap_leaf(a.leaf)
@@ -448,7 +477,17 @@ def main():
         print(f"note: leaf_width must be a power of two; {a.leaf}s snapped to "
               f"{leaf}s ({human(leaf)}) — that is the real bound, not {a.leaf}s.",
               file=sys.stderr, flush=True)
-    if os.path.exists(a.state):
+    if a.shards > 1:
+        from blindrange.sharded import ShardedOwner
+        if os.path.exists(os.path.join(a.state, "shards.json")):
+            owner = ShardedOwner.open(a.state, a.passphrase,
+                                      bootstrap=[a.bootstrap])
+        else:
+            owner = ShardedOwner.create(a.state, a.passphrase, schema(leaf),
+                                        bootstrap=[a.bootstrap],
+                                        shards=a.shards,
+                                        network_secret=a.secret)
+    elif os.path.exists(a.state):
         owner = Owner.open(a.state, a.passphrase, bootstrap=[a.bootstrap])
     else:
         owner = Owner.create(a.state, a.passphrase, schema(leaf),
@@ -456,7 +495,9 @@ def main():
     if a.account:
         owner.configure_tokens(a.issuer, a.account)
     trail = Trail(owner)
-    print(f"blindrange-audit on http://{a.host}:{a.port}  ·  state {a.state}\n"
+    shard_note = (f"  ·  {a.shards} shards" if a.shards > 1 else "")
+    print(f"blindrange-audit on http://{a.host}:{a.port}  ·  state {a.state}"
+          f"{shard_note}\n"
           f"  time resolution nobody can exceed: {human(leaf)} "
           f"(leaf_width {leaf})\n"
           f"  POST /ingest  ·  GET /events /count /  ·  append-only, no delete",

@@ -192,3 +192,67 @@ class TestAuditService(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIngestNeverSilentlyMangles(unittest.TestCase):
+    """An audit trail that stores the wrong thing and says "ok" is worse
+    than one that refuses.
+
+    A batch posted as {"events": [...250 records...]} fell through to
+    "treat the whole object as one event": the envelope was stored as a
+    single row of nonsense and the caller was answered {"stored": 1}. The
+    250 records were gone, and nothing anywhere said so.
+    """
+
+    def setUp(self):
+        import importlib.util
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "auditmod", root / "examples" / "auditlog" / "audit.py")
+        self.mod = importlib.util.module_from_spec(spec)
+        sys.modules["auditmod"] = self.mod
+        spec.loader.exec_module(self.mod)
+
+    def test_a_wrapped_batch_is_unwrapped(self):
+        evs = [{"ts": 1700000000 + i, "actor": "a", "action": "x"}
+               for i in range(250)]
+        for key in ("events", "records", "logs", "entries", "items"):
+            got = self.mod.parse_batch(json.dumps({key: evs}).encode())
+            self.assertEqual(len(got), 250, f"{key} wrapper was not unwrapped")
+
+    def test_an_unusual_wrapper_is_unwrapped_too(self):
+        """Keyed on shape, not on a list of blessed names."""
+        evs = [{"ts": 1, "actor": "a"}, {"ts": 2, "actor": "b"}]
+        got = self.mod.parse_batch(json.dumps({"payload_v2": evs}).encode())
+        self.assertEqual(len(got), 2)
+
+    def test_an_event_carrying_a_list_is_still_one_event(self):
+        """The guard that keeps unwrapping from eating real events: this
+        has a list of objects in it, but it is plainly an event."""
+        ev = {"ts": 1700000000, "actor": "a", "action": "x",
+              "tags": [{"k": "v"}, {"k": "w"}]}
+        got = self.mod.parse_batch(json.dumps(ev).encode())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["actor"], "a")
+
+    def test_a_custom_single_event_still_works(self):
+        """Objects with no field we recognise are still events — a caller
+        with its own vocabulary must not be turned away."""
+        self.assertEqual(len(self.mod.parse_batch(b'{"a":1}')), 1)
+
+    def test_the_shapes_real_shippers_send_still_work(self):
+        m = self.mod
+        self.assertEqual(len(m.parse_batch(b'[{"message":"a"},{"message":"b"}]')), 2)
+        self.assertEqual(len(m.parse_batch(b'{"message":"one"}')), 1)
+        self.assertEqual(len(m.parse_batch(b'{"ts":1700000000,"actor":"a"}')), 1)
+        self.assertEqual(
+            len(m.parse_batch(b'{"message":"x"}\n{"message":"y"}\n')), 2)
+        self.assertEqual(m.parse_batch(b""), [])
+
+    def test_a_bare_message_line_is_still_an_event(self):
+        """Plain text lines are a real shipper shape and must not start
+        failing now that objects can be refused."""
+        got = self.mod.parse_batch(b"just a log line\nand another\n")
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0]["message"], "just a log line")

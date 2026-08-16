@@ -201,6 +201,27 @@ class ShardedOwner:
     def query_prefix(self, field, prefix):
         return list(self.query_stream([{"field": field, "prefix": prefix}]))
 
+    def query_multi(self, predicates):
+        """AND-of-predicates across every shard, concatenated.
+
+        Each shard intersects its own index sets before fetching, which is
+        the point of query_multi over a stream for small results; the shards
+        are independent so there is nothing to intersect between them.
+        """
+        out = []
+        for n, rows in enumerate(_fan(
+                [(lambda o=o: o.query_multi(predicates)) for o in self.shards])):
+            for rec in rows:
+                rec["_rid"] = self._tag(n, rec["_rid"])
+                rec["_shard"] = n
+                out.append(rec)
+        return out
+
+    def _get(self, addr, path):
+        """Talk to a node. Shard-independent: every shard shares the same
+        network view, so any of them can ask."""
+        return self.shards[0]._get(addr, path)
+
     def count(self, field, lo, hi):
         return sum(_fan([(lambda o=o: o.count(field, lo, hi))
                          for o in self.shards]))

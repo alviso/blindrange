@@ -139,3 +139,32 @@ That is a description of the regulation, **not a claim of compliance**. No
 lawyer has reviewed this and none of it has been assessed against 17a-4,
 FINRA 4511, or anything else. Treat it as the reason the question is worth
 asking, not as an answer.
+
+## Sharding it
+
+An audit trail only appends, so the ceiling it hits first is the client's:
+compaction rewrites an epoch in memory. `--shards N` splits the trail
+across N independent databases (the `--state` path becomes a directory).
+
+```bash
+python3 examples/auditlog/audit.py --state ~/.blindrange/audit --shards 4
+```
+
+Measured, 2,000 events over one trail against four, on the public network:
+
+| | single | 4 shards |
+|---|---|---|
+| ingest 2,000 | 17.2s | **13.1s** |
+| count over 25 days | 5.8s | **5.4s** |
+| newest 5 events (ordered) | **5.6s** | 19.7s |
+| compaction peak memory | 28.4 MB | **7.9 MB** |
+
+Read that table before turning it on. Ingest and compaction improve, which
+is what an append-only workload is usually limited by. But **"show me the
+last N events" gets 3.5x slower**, because an ordered query walks dyadic
+leaves per shard and a `limit` does not shrink the walk — four sparse
+walks instead of one. That query is also the most common thing anyone asks
+an audit log.
+
+So: shard when ingest volume or compaction time is what hurts, and keep
+the shard count low. Do not shard for latency on recent-events queries.
