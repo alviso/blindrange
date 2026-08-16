@@ -290,6 +290,25 @@ process, because it has no call that replaces a running process in place.
 On an update you will see the node restart and the shell keep hold of it —
 Ctrl+C still stops both.
 
+### Keep it running after you close the terminal
+
+```bash
+sudo .venv/bin/python examples/install_service.py --data ~/.blindrange/n1
+```
+
+Writes a systemd service on Linux or a launchd agent on macOS, so the node
+starts at boot and comes back if it dies. `--print` shows the definition
+without installing anything; `--no-auto-update` leaves the checkout alone.
+
+```bash
+systemctl status blindrange-node     # or: launchctl list | grep blindrange
+systemctl stop blindrange-node
+journalctl -u blindrange-node -f
+```
+
+Windows is not covered — run it in a terminal there. The node already
+supervises itself on Windows so that auto-update can restart it.
+
 ### Disk use
 
 `--max-disk` accepts `20GB` or a percentage of the drive such as `5%`. Past
