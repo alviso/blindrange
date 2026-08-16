@@ -89,6 +89,16 @@ REPORTS = collections.defaultdict(collections.deque)   # node_id -> (ts, rate)
 REPORT_WINDOW = 500
 REPORT_MAX_AGE = float(os.environ.get("BR_REPORT_MAX_AGE", "21600"))  # 6h
 REPORT_QUANTILE = 0.25
+# Possession is a claim about NOW. Reports already expire for that reason;
+# this applies the same principle continuously instead of as a cliff, so a
+# proof from four hours ago stops counting as much as one from twenty
+# minutes ago. Without it the estimator was slow in BOTH directions: a node
+# that finished catching up stayed pinned at 0% by its own honest early
+# failures, and — the expensive direction — a node whose disk had just died
+# kept a full share through its next audit, because the low quantile over
+# [0,1,1,1] is still 1. One hour, against audits roughly two hours apart,
+# makes the newest report dominate while older ones remain a real tail.
+REPORT_HALFLIFE = float(os.environ.get("BR_REPORT_HALFLIFE", "3600"))
 REPORT_MIN_GROUP = 2       # a receipt nobody corroborates proves nothing
 POW_BITS = int(os.environ.get("BR_REPORT_POW_BITS", str(receipt.POW_BITS)))
 SEEN_SIGS = collections.deque()        # (ts, sig-prefix) — anti-replay only
@@ -391,16 +401,57 @@ def record_report(payload):
             "log_size": len(LOG)}
 
 
+def weighted_quantile(pairs, q):
+    """The q-quantile of (value, weight) pairs, lowest value first.
+
+    Returns the first value at which the running weight reaches q of the
+    total — the inverse CDF. This is NOT what the previous code computed:
+    `sorted(vals)[int(len(vals) * 0.25)]` floors the index, which skips the
+    failing report when exactly one in four has failed, so p25 of [0,1,1,1]
+    came out as 1.0. That off-by-one is the reason a node whose disk had
+    just died kept a full share until a second audit failed. The property
+    that chose a LOW quantile survives the change: the score falls to zero
+    as soon as a quarter of the weight is failing, so a failure cannot be
+    buried under a couple of passes — though enough same-age passes still
+    outvote it, which is why fabrication is fenced off by node-signed
+    receipts and proof-of-work rather than by this statistic.
+    """
+    if not pairs:
+        return None
+    ordered = sorted(pairs)
+    total = sum(w for _, w in ordered)
+    if total <= 0:                       # everything decayed to nothing
+        return ordered[-1][0]
+    target, run = q * total, 0.0
+    for val, w in ordered:
+        run += w
+        if run >= target:
+            return val
+    return ordered[-1][0]
+
+
 def possession():
-    cutoff = time.time() - REPORT_MAX_AGE
+    now = time.time()
+    cutoff = now - REPORT_MAX_AGE
     with REPORT_LOCK:
         out = {}
         for nid, dq in REPORTS.items():
-            vals = sorted(rate for ts, rate in dq if ts >= cutoff)
-            if vals:
-                idx = min(len(vals) - 1, int(len(vals) * REPORT_QUANTILE))
-                out[nid] = {"rate": round(vals[idx], 3),
-                            "reports": len(vals)}
+            fresh = [(ts, rate) for ts, rate in dq if ts >= cutoff]
+            if not fresh:
+                continue
+            pairs = [(rate, 0.5 ** ((now - ts) / REPORT_HALFLIFE))
+                     for ts, rate in fresh]
+            rate = weighted_quantile(pairs, REPORT_QUANTILE)
+            ts_last, rate_last = max(fresh)
+            out[nid] = {"rate": round(rate, 3),
+                        "reports": len(fresh),
+                        # The aggregate deliberately lags a single report, so
+                        # publish the newest one beside it. "0% · 2 audits"
+                        # hid that the most recent audit had passed, which
+                        # reads as a failing node rather than a recovering
+                        # one.
+                        "latest": round(rate_last, 3),
+                        "latest_age_s": int(now - ts_last)}
         return out
 
 

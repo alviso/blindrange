@@ -975,6 +975,28 @@ def _peer_stats(nid, e, secret, hub, self_id):
         return None
 
 
+def _possession_cell(m):
+    """The aggregate, plus the newest audit when the two disagree.
+
+    The score is a recency-weighted low quantile over a 6h window, so it
+    lags any single result on purpose — that is what stops a fabricated
+    pass from erasing a real failure. The cost is that a node which has
+    just recovered still reads as failing, and "0% · 2 audits" gave the
+    reader nothing to tell that apart from a node that is genuinely
+    empty. Showing the latest result resolves it in the honest direction:
+    both numbers are true and the difference is the story.
+    """
+    if not m:
+        return "—"
+    cell = f"{int(m['rate'] * 100)}% · {m['reports']} audits"
+    latest = m.get("latest")
+    if latest is not None and round(latest, 3) != round(m["rate"], 3):
+        mins = (m.get("latest_age_s") or 0) // 60
+        when = f"{mins}m ago" if mins < 90 else f"{mins // 60}h ago"
+        cell += f" · latest {int(latest * 100)}% {when}"
+    return cell
+
+
 def status_rows(store, peers, secret, hub):
     """Roster for the public status page; cached briefly."""
     now = time.time()
@@ -1156,7 +1178,7 @@ def status_fragment(rows, total):
         f"<tr><td class='id'>{r['id']}</td><td>{r['mode']}</td>"
         f"<td class='num'>{r['keys'] if r['keys'] is not None else '—'}</td>"
         f"<td class='{'ver' if (r.get('measured') or {}).get('rate', 0) >= 0.9 else 'behind'}'>"
-        f"{(str(int((r['measured']['rate']) * 100)) + '% · ' + str(r['measured']['reports']) + ' audits') if r.get('measured') else '—'}</td>"
+        f"{_possession_cell(r.get('measured'))}</td>"
         f"<td class='{'behind' if r.get('behind') else 'ver'}'>"
         f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
         f"{' · behind' if r.get('behind') else ''}"
@@ -1224,6 +1246,11 @@ when the networks allow.</div>
 per thousand — 500 would be half of everything. It is structural position on
 the ring multiplied by <b>proved</b> possession, so a node with no audits yet
 earns nothing and a node that self-reports generously earns nothing extra.
+Possession is scored over a six-hour window, weighting recent audits more
+heavily — a proof from this morning says little about a disk now, in either
+direction: a node that has just recovered stops being held to its earlier
+failures, and one that has just lost data stops coasting on earlier passes.
+Where the aggregate and the newest audit disagree, both are shown.
 Illustrative: a share of a pool, not an entitlement, and not money.</div>
 {logstr}
 <div class="foot">join with two commands ·

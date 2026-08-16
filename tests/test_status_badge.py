@@ -6,10 +6,24 @@ it is a green light that stays green when nobody has checked anything. This
 page spent sixteen hours in exactly that state before there was a scheduled
 auditor, so every state gets a test.
 """
+import importlib.util
+import os
 import re
+import sys
+import time
 import unittest
 
+from blindrange import node
 from blindrange.node import audit_badge, status_html
+
+# status_server lives in examples/, which is not a package.
+_spec = importlib.util.spec_from_file_location(
+    "status_server",
+    os.path.join(os.path.dirname(__file__), "..", "examples",
+                 "status_server.py"))
+status = importlib.util.module_from_spec(_spec)
+sys.modules["status_server"] = status
+_spec.loader.exec_module(status)
 
 
 def row(i, rate=None, reports=0, mode="direct"):
@@ -92,3 +106,104 @@ class TestStatusPage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecencyWeightedPossession(unittest.TestCase):
+    """The estimator has to be quick in both directions, and still resist
+    a node that pads the window with invented passes.
+
+    The unweighted low quantile was slow both ways: a node that had just
+    finished catching up stayed at 0% for hours on the strength of its own
+    honest early failures, and a node whose disk had just died kept a full
+    share through its next audit. The second one costs real money.
+    """
+
+    def setUp(self):
+        status.REPORTS.clear()
+
+    def _load(self, nid, samples):
+        """samples: (age_hours, rate)."""
+        now = time.time()
+        for age_h, rate in samples:
+            status.REPORTS[nid].append((now - age_h * 3600, rate))
+
+    def test_recovered_node_is_not_pinned_by_a_stale_failure(self):
+        # Exactly the live case: failed while still filling, passes now.
+        self._load("n", [(2.0, 0.0), (0.4, 1.0)])
+        m = status.possession()["n"]
+        self.assertGreater(m["rate"], 0.5,
+                           "a node that passes its newest audit should not "
+                           "read as failing on a two-hour-old result")
+        self.assertEqual(m["latest"], 1.0)
+
+    def test_a_node_that_just_died_loses_its_share_immediately(self):
+        # Three passes then one failure. Unweighted p25 over [0,1,1,1] is
+        # 1.0 — a full share for data that is already gone.
+        self._load("n", [(6.0, 1.0), (4.0, 1.0), (2.0, 1.0), (0.01, 0.0)])
+        self.assertEqual(status.possession()["n"]["rate"], 0.0)
+
+    def test_burying_a_failure_takes_a_supermajority_of_passes(self):
+        # What the low quantile actually buys, stated honestly: the score
+        # goes to zero whenever a quarter or more of the WEIGHT is failing,
+        # so one real failure cannot be waved away by a couple of passes.
+        # It is not unconditional — enough same-age passes do outvote it —
+        # and that is why fabrication is fenced off by node-signed receipts
+        # and proof-of-work rather than by this statistic alone.
+        self._load("n", [(0.5, 1.0), (0.5, 1.0), (0.5, 0.0)])
+        self.assertEqual(status.possession()["n"]["rate"], 0.0,
+                         "one failure in three should still sink the score")
+
+        status.REPORTS.clear()
+        self._load("n", [(0.5, 1.0)] * 10 + [(0.5, 0.0)])
+        self.assertEqual(status.possession()["n"]["rate"], 1.0,
+                         "one failure in eleven is below the quantile, and "
+                         "the receipts are what make those ten expensive")
+
+    def test_steady_healthy_node_scores_full(self):
+        self._load("n", [(5.0, 1.0), (3.0, 1.0), (1.0, 1.0), (0.1, 1.0)])
+        self.assertEqual(status.possession()["n"]["rate"], 1.0)
+
+    def test_expired_reports_are_ignored_entirely(self):
+        self._load("n", [(24.0, 1.0)])
+        self.assertNotIn("n", status.possession())
+
+    def test_quantile_is_the_inverse_cdf_not_a_floor_index(self):
+        """The definition change is half the fix, and it is deliberate.
+
+        The old code took `sorted(vals)[int(len(vals) * 0.25)]`, whose floor
+        index SKIPS the failing report when exactly one report in four has
+        failed: p25 of [0,1,1,1] came out as 1.0, which is how a node that
+        had just lost its data kept a full share. The standard inverse-CDF
+        quantile — the first value at which the running weight reaches a
+        quarter — returns 0.0 there, and agrees with the old one elsewhere.
+        """
+        at_equal_weight = lambda vals: status.weighted_quantile(
+            [(v, 1.0) for v in vals], status.REPORT_QUANTILE)
+        self.assertEqual(at_equal_weight([0.0, 1.0, 1.0, 1.0]), 0.0)
+        self.assertEqual(at_equal_weight([0.0, 1.0]), 0.0)
+        self.assertEqual(at_equal_weight([0.0, 0.0, 1.0, 1.0]), 0.0)
+        self.assertEqual(at_equal_weight([1.0, 1.0, 1.0, 1.0]), 1.0)
+
+    def test_weighting_is_what_saves_the_recovering_node(self):
+        # Same three results, only the ages differ. Old-to-new is a
+        # recovery; new-to-old is a node that has just started failing.
+        self._load("n", [(2.0, 0.0), (0.1, 1.0)])
+        recovering = status.possession()["n"]["rate"]
+        status.REPORTS.clear()
+        self._load("n", [(2.0, 1.0), (0.1, 0.0)])
+        failing = status.possession()["n"]["rate"]
+        self.assertGreater(recovering, failing,
+                           "age has to decide this; the multiset of results "
+                           "is identical in both directions")
+
+    def test_cell_shows_the_latest_when_it_disagrees(self):
+        self._load("n", [(3.0, 0.0), (2.5, 0.0), (0.2, 1.0)])
+        m = status.possession()["n"]
+        cell = node._possession_cell(m)
+        self.assertIn("latest 100%", cell)
+        self.assertIn("audits", cell)
+
+    def test_cell_stays_quiet_when_they_agree(self):
+        self._load("n", [(1.0, 1.0), (0.2, 1.0)])
+        self.assertNotIn("latest", node._possession_cell(
+            status.possession()["n"]))
