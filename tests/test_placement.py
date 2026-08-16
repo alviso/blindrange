@@ -10,7 +10,9 @@ data somewhere readers never look, or refusing to place it at all on a
 small homogeneous network. Both are tested.
 """
 import collections
+import sys
 import unittest
+import unittest.mock
 
 from blindrange.ring import Ring, failure_group, REORDER_WINDOW
 
@@ -234,3 +236,64 @@ class TestRepairCatchup(unittest.TestCase):
         changes slowly."""
         import blindrange.node as node
         self.assertGreaterEqual(node.REPAIR_PEER_POLL, 10)
+
+
+class TestRepairLoopSurvivesItself(unittest.TestCase):
+    """A crash inside the repair sweep must not stop replication.
+
+    This is not hypothetical. Twice in one session a plain NameError inside
+    this loop killed the thread outright — once reaching for a relay hub the
+    function never took as an argument, once for an unimported Counter. Both
+    times replication stopped network-wide, nothing was logged, and the only
+    visible symptom was a node that quietly never caught up. A sweep that
+    throws has to be loud and retried, not fatal.
+    """
+
+    def test_a_throwing_sweep_is_logged_and_retried(self):
+        import io
+        import threading
+        import time as _time
+        import blindrange.node as node
+
+        calls = []
+
+        class Boom:
+            def __init__(self, *a, **k):
+                calls.append(1)
+                raise RuntimeError("boom")
+
+        class FakeStore:
+            def get_meta(self, *a):
+                return ""
+
+            def count(self):
+                return 0
+
+        class FakePeers:
+            def stable_since(self):
+                return 1e9
+
+            def live(self):
+                return {"a" * 16: {"addr": "1.2.3.4:1", "udp": ""},
+                        "b" * 16: {"addr": "5.6.7.8:1", "udp": ""}}
+
+        err = io.StringIO()
+
+        def run():
+            node._repair_loop(FakeStore(), FakePeers(), "s")
+
+        with unittest.mock.patch.object(node, "Ring", Boom), \
+             unittest.mock.patch.object(node, "REPAIR_EVERY", 0.01), \
+             unittest.mock.patch.object(node, "REPAIR_SETTLE", 0), \
+             unittest.mock.patch.object(node.random, "random", lambda: 0.0), \
+             unittest.mock.patch.object(sys, "stderr", err):
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            _time.sleep(1.0)
+
+        self.assertTrue(t.is_alive(),
+                        "the repair thread died on a sweep error — that is "
+                        "exactly the silent replication stop this guards")
+        self.assertGreater(len(calls), 3,
+                           "it should keep retrying, not spin down")
+        self.assertIn("sweep failed", err.getvalue())

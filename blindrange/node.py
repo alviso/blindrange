@@ -54,7 +54,7 @@ import sys
 import threading
 import time
 from base64 import b64decode, b64encode
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
@@ -96,6 +96,11 @@ REPAIR_BATCH_MAX = int(os.environ.get("BR_REPAIR_BATCH_MAX", "20000"))
 # catch-up sweeps started sizing batches for a whole store.
 REPAIR_POST_MAX = int(os.environ.get("BR_REPAIR_POST_MAX", "2000"))
 _repair_fail = {}                  # addr -> (consecutive failures, last log)
+# How often repair says what it is doing. It used to say nothing at all
+# unless a post failed, so "repair is running" and "repair is delivering
+# nothing" produced identical logs — which is exactly the state the network
+# was in while a node sat 900k keys behind.
+REPAIR_LOG_EVERY = float(os.environ.get("BR_REPAIR_LOG_EVERY", "60"))
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
 DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
@@ -1324,93 +1329,122 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
     # percent, so a newly joined node stops filling and nothing says why.
     cursor = store.get_meta("repair_cursor", "")
     last_poll, catching_up = 0.0, False
+    stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
+            "since": time.time()}
     while True:
-        time.sleep(REPAIR_EVERY + random.random())
-        if peers.stable_since() < REPAIR_SETTLE:
-            continue
-        live = peers.live()
-        if len(live) < 2:
-            continue
-        # Same derivation as the client's, from the same gossiped fields —
-        # if these two disagreed, repair would relocate keys the writer had
-        # just placed and the pair would push data back and forth forever.
-        ring = Ring(sorted(live), replicas=3,
-                    groups={nid: failure_group(e["addr"], e.get("udp", ""))
-                            for nid, e in live.items()})
-        addr_of = {nid: e["addr"] for nid, e in live.items()}
-        mine = store.count()
-        # Is anyone visibly behind? Checked on a slow poll, because it costs
-        # a /stats round trip per peer and the answer changes slowly.
-        now_t = time.time()
-        if now_t - last_poll > REPAIR_PEER_POLL:
-            last_poll = now_t
-            # Never let this decision kill the loop. Reaching for peer stats
-            # without the relay hub in scope raised NameError on the first
-            # poll, the repair thread died, and replication stopped network
-            # wide with nothing logged — the tests caught it as "0 keys
-            # migrated", which is the only symptom there would have been.
-            try:
-                behind = False
-                for nid, e in live.items():
-                    if nid == peers.ident.node_id:
-                        continue
-                    st = _peer_stats(nid, e, secret, hub, peers.ident.node_id)
-                    keys = (st or {}).get("keys")
-                    if (keys is not None and mine > 0
-                            and keys < mine * REPAIR_BEHIND_RATIO):
-                        behind = True
-                        break
-                catching_up = behind
-            except Exception as e:
-                print(f"repair: could not poll peers ({type(e).__name__}: "
-                      f"{e}) — staying on the maintenance schedule",
-                      file=sys.stderr, flush=True)
-                catching_up = False
-        if REPAIR_BATCH:
-            size = REPAIR_BATCH
-        else:
-            hours = REPAIR_CATCHUP_H if catching_up else REPAIR_SWEEP_H
-            rounds = max(1.0, hours * 3600 / max(0.1, REPAIR_EVERY))
-            size = int(min(REPAIR_BATCH_MAX, max(200, mine / rounds)))
-        batch = store.batch_after(cursor, size)
-        if not batch:                       # wrapped: start the next sweep
-            cursor = ""
-            store.set_meta("repair_cursor", cursor)
-            continue
-        cursor = batch[-1][0]
-        store.set_meta("repair_cursor", cursor)
-        by_addr = {}
-        for k, v in batch:
-            for nid in ring.route(k):
-                if nid != peers.ident.node_id and nid in addr_of:
-                    by_addr.setdefault(addr_of[nid], []).append([k, v])
-        for addr, entries in by_addr.items():
-            # Chunk. A catch-up sweep sizes its batch for the whole store,
-            # and one post of that many entries is a different animal from
-            # the trickle a maintenance sweep sends: the big ones time out,
-            # and this used to swallow that as `except OSError: pass`, so a
-            # peer could receive nothing while the logs stayed clean.
-            for i in range(0, len(entries), REPAIR_POST_MAX):
-                chunk = entries[i:i + REPAIR_POST_MAX]
+        # A crash in here is indistinguishable from a healthy
+        # quiet network: the thread dies, replication stops, and
+        # nothing is logged. That has now happened twice — once
+        # reaching for the relay hub this loop never took as an
+        # argument, once for an unimported Counter. Degrade to a
+        # noisy retry instead of silently taking durability with
+        # it.
+        try:
+            time.sleep(REPAIR_EVERY + random.random())
+            if peers.stable_since() < REPAIR_SETTLE:
+                continue
+            live = peers.live()
+            if len(live) < 2:
+                continue
+            # Same derivation as the client's, from the same gossiped fields —
+            # if these two disagreed, repair would relocate keys the writer had
+            # just placed and the pair would push data back and forth forever.
+            ring = Ring(sorted(live), replicas=3,
+                        groups={nid: failure_group(e["addr"], e.get("udp", ""))
+                                for nid, e in live.items()})
+            addr_of = {nid: e["addr"] for nid, e in live.items()}
+            mine = store.count()
+            # Is anyone visibly behind? Checked on a slow poll, because it costs
+            # a /stats round trip per peer and the answer changes slowly.
+            now_t = time.time()
+            if now_t - last_poll > REPAIR_PEER_POLL:
+                last_poll = now_t
+                # Never let this decision kill the loop. Reaching for peer stats
+                # without the relay hub in scope raised NameError on the first
+                # poll, the repair thread died, and replication stopped network
+                # wide with nothing logged — the tests caught it as "0 keys
+                # migrated", which is the only symptom there would have been.
                 try:
-                    post_any(addr, "/kv",
-                             json.dumps({"entries": chunk,
-                                         "node_token": peers.ident.poll_token()
-                                         }).encode(), secret)
-                    _repair_fail.pop(addr, None)
-                except OSError as e:
-                    # Log at most once a minute per peer. Silence here makes
-                    # a stalled catch-up look exactly like a healthy one.
-                    n, last = _repair_fail.get(addr, (0, 0.0))
-                    n += 1
-                    if time.time() - last > 60:
-                        print(f"repair: {addr} rejected {len(chunk)} keys "
-                              f"({type(e).__name__}: {str(e)[:80]}) — "
-                              f"{n} failure(s) since it last accepted any",
-                              file=sys.stderr, flush=True)
-                        last = time.time()
-                    _repair_fail[addr] = (n, last)
-                    break        # that peer is unwell; move on
+                    behind = False
+                    for nid, e in live.items():
+                        if nid == peers.ident.node_id:
+                            continue
+                        st = _peer_stats(nid, e, secret, hub, peers.ident.node_id)
+                        keys = (st or {}).get("keys")
+                        if (keys is not None and mine > 0
+                                and keys < mine * REPAIR_BEHIND_RATIO):
+                            behind = True
+                            break
+                    catching_up = behind
+                except Exception as e:
+                    print(f"repair: could not poll peers ({type(e).__name__}: "
+                          f"{e}) — staying on the maintenance schedule",
+                          file=sys.stderr, flush=True)
+                    catching_up = False
+            if REPAIR_BATCH:
+                size = REPAIR_BATCH
+            else:
+                hours = REPAIR_CATCHUP_H if catching_up else REPAIR_SWEEP_H
+                rounds = max(1.0, hours * 3600 / max(0.1, REPAIR_EVERY))
+                size = int(min(REPAIR_BATCH_MAX, max(200, mine / rounds)))
+            batch = store.batch_after(cursor, size)
+            if not batch:                       # wrapped: start the next sweep
+                cursor = ""
+                store.set_meta("repair_cursor", cursor)
+                continue
+            cursor = batch[-1][0]
+            store.set_meta("repair_cursor", cursor)
+            stat["scanned"] += len(batch)
+            stat["rounds"] += 1
+            by_addr = {}
+            for k, v in batch:
+                for nid in ring.route(k):
+                    if nid != peers.ident.node_id and nid in addr_of:
+                        by_addr.setdefault(addr_of[nid], []).append([k, v])
+            for addr, entries in by_addr.items():
+                # Chunk. A catch-up sweep sizes its batch for the whole store,
+                # and one post of that many entries is a different animal from
+                # the trickle a maintenance sweep sends: the big ones time out,
+                # and this used to swallow that as `except OSError: pass`, so a
+                # peer could receive nothing while the logs stayed clean.
+                for i in range(0, len(entries), REPAIR_POST_MAX):
+                    chunk = entries[i:i + REPAIR_POST_MAX]
+                    try:
+                        post_any(addr, "/kv",
+                                 json.dumps({"entries": chunk,
+                                             "node_token": peers.ident.poll_token()
+                                             }).encode(), secret)
+                        _repair_fail.pop(addr, None)
+                        stat["sent"][addr] += len(chunk)
+                    except OSError as e:
+                        # Log at most once a minute per peer. Silence here makes
+                        # a stalled catch-up look exactly like a healthy one.
+                        n, last = _repair_fail.get(addr, (0, 0.0))
+                        n += 1
+                        if time.time() - last > 60:
+                            print(f"repair: {addr} rejected {len(chunk)} keys "
+                                  f"({type(e).__name__}: {str(e)[:80]}) — "
+                                  f"{n} failure(s) since it last accepted any",
+                                  file=sys.stderr, flush=True)
+                            last = time.time()
+                        _repair_fail[addr] = (n, last)
+                        break        # that peer is unwell; move on
+
+            el = time.time() - stat["since"]
+            if el >= REPAIR_LOG_EVERY:
+                per = ", ".join(
+                    f"{a.rsplit('/', 1)[-1][:8]}={n / el:,.0f}/s"
+                    for a, n in stat["sent"].most_common(4)) or "nobody"
+                print(f"repair: {'catch-up' if catching_up else 'maintenance'} "
+                      f"· scanned {stat['scanned'] / el:,.0f} keys/s over "
+                      f"{stat['rounds']} rounds · sent {per} · holding "
+                      f"{mine:,} keys", file=sys.stderr, flush=True)
+                stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
+                        "since": time.time()}
+        except Exception as e:
+            print(f"repair: sweep failed ({type(e).__name__}: "
+                  f"{e}) — retrying", file=sys.stderr, flush=True)
+            time.sleep(REPAIR_EVERY)
 
 
 RESTART_CODE = 42          # child -> supervisor: "relaunch me on new code"
