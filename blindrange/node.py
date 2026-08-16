@@ -110,6 +110,23 @@ REPAIR_LOG_EVERY = float(os.environ.get("BR_REPAIR_LOG_EVERY", "60"))
 # peer stay sequential, so one slow node still gets a coherent stream and
 # one failure still stops that peer rather than hammering it.
 REPAIR_FANOUT = int(os.environ.get("BR_REPAIR_FANOUT", "4"))
+# Reconciliation. A bucket is the first BUCKET_CHARS of a key, so with the
+# `I:`/`R:` tag plus three hex digits there are ~4k buckets per tag and a
+# few hundred keys in each — small enough that exchanging a bucket's key
+# list is cheap, large enough that the list of buckets stays short.
+BUCKET_CHARS = int(os.environ.get("BR_BUCKET_CHARS", "0"))   # 0 = by size
+# Aim for this many keys in a bucket. Granularity is the whole economics of
+# reconciliation: too coarse and a mismatched bucket drags along thousands
+# of keys the peer already has; too fine and we spend a round trip per key.
+# A fixed five characters was right for a 3.9M-key store and hopeless for a
+# small one, where it meant roughly one key per bucket.
+BUCKET_TARGET = int(os.environ.get("BR_BUCKET_TARGET", "200"))
+BUCKET_CACHE_S = float(os.environ.get("BR_BUCKET_CACHE_S", "60"))
+BUCKET_SEND_MAX = int(os.environ.get("BR_BUCKET_SEND_MAX", "5000"))
+# Buckets reconciled per peer per round. Bounded so one enormous gap cannot
+# monopolise a sweep, and so the round still ends in seconds.
+RECONCILE_BUCKETS = int(os.environ.get("BR_RECONCILE_BUCKETS", "400"))
+RECONCILE_KEYS = int(os.environ.get("BR_RECONCILE_KEYS", "50000"))
 _repair_stat_lock = threading.Lock()
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
@@ -593,6 +610,83 @@ class Store:
         self.read_batches = 0
         self.writes = 0
         self.deletes = 0
+        self._buckets = None          # (computed_at, nchars, {prefix: count})
+
+    def bucket_chars(self, target=BUCKET_TARGET):
+        """How many leading characters make a bucket, for this store's size.
+
+        Keys are a two-character tag plus uniform hex, so each extra
+        character divides the space by sixteen. Both sides must agree, so
+        the node that starts a reconciliation picks and the other answers at
+        whatever granularity it was asked for.
+        """
+        if BUCKET_CHARS:
+            return BUCKET_CHARS
+        n, chars = max(1, self.count()), 2
+        while n / (16 ** (chars - 2)) > target and chars < 8:
+            chars += 1
+        return chars
+
+    def bucket_counts(self, nchars=None, max_age=BUCKET_CACHE_S):
+        nchars = nchars or self.bucket_chars()
+        """How many keys sit under each key prefix.
+
+        Buckets are PREFIXES OF THE KEY, which is the whole trick. Keys are
+        `I:<hex>` and `R:<hex>` — uniform after the tag — so a bucket is a
+        contiguous range of the primary key and every question about it is
+        answered by the index the table already has. No extra column, no
+        extra index, and nothing to migrate on a store already holding
+        millions of rows.
+
+        The GROUP BY still walks the table, so the answer is cached: it is
+        wanted once per reconciliation, not once per round.
+        """
+        now = time.time()
+        got = self._buckets
+        if got and got[1] == nchars and now - got[0] < max_age:
+            return got[2]
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT substr(k,1,{int(nchars)}) AS b, COUNT(*) "
+                f"FROM kv GROUP BY b").fetchall()
+        out = {b: n for b, n in rows}
+        self._buckets = (now, nchars, out)
+        return out
+
+    @staticmethod
+    def bucket_range(prefix):
+        """[lo, hi) covering every key under a prefix.
+
+        The successor of the last character works for hex because 'g' sorts
+        after 'f' and before nothing else we store; doing it generically
+        means the scheme survives a key tag that is not hex.
+        """
+        return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+    def bucket_keys(self, prefix):
+        """Every key under a prefix, straight off the primary-key index."""
+        lo, hi = self.bucket_range(prefix)
+        with self.lock:
+            return [k for (k,) in self.db.execute(
+                "SELECT k FROM kv WHERE k >= ? AND k < ?", (lo, hi))]
+
+    def bucket_entries_except(self, prefix, have, limit=BUCKET_SEND_MAX):
+        """The entries under a prefix that `have` does not already list.
+
+        This is the point of the whole exercise: repair used to re-send the
+        contents of a range whether or not the far side had them.
+        """
+        lo, hi = self.bucket_range(prefix)
+        have = set(have)
+        out = []
+        with self.lock:
+            for k, v in self.db.execute(
+                    "SELECT k, v FROM kv WHERE k >= ? AND k < ?", (lo, hi)):
+                if k not in have:
+                    out.append([k, v])
+                    if len(out) >= limit:
+                        break
+        return out
 
     def disk_used(self):
         """Bytes this node occupies, as the operator's disk reports it —
@@ -906,6 +1000,23 @@ def _service_post(store, peers, hub, secret, path, data, quic=None):
                          "existed": existed}
         store.put(entries)
         return 200, {"stored": len(entries)}
+    if path == "/digest":
+        # How many keys this node holds under each key prefix. Membership
+        # gated like every other node-to-node path: it tells a peer which
+        # ranges disagree, which is the whole basis of not re-sending data
+        # the peer already has.
+        # The asker chooses the granularity, because it is the one that
+        # knows how big the disagreement is; answering at our own would give
+        # two nodes two different pictures of the same key space.
+        chars = int(data.get("chars") or store.bucket_chars())
+        chars = max(2, min(8, chars))
+        return 200, {"buckets": store.bucket_counts(chars),
+                     "chars": chars, "keys": store.count()}
+    if path == "/bucketkeys":
+        # The keys this node holds under one prefix. Only keys — never
+        # values — so the answer is a few kB and the asker learns nothing it
+        # could not already learn by holding the same replica.
+        return 200, {"keys": store.bucket_keys(str(data["prefix"]))}
     if path == "/mget":
         keys = data["keys"]
         values = store.mget(keys)
@@ -1330,6 +1441,72 @@ def _gossip_loop(peers: Peers, secret: str):
             pass                                       # peer down; TTL handles it
 
 
+def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
+    """Send a peer only what it is missing, by comparing key ranges.
+
+    Repair used to push the contents of a range whether or not the far side
+    already had them. Measured on the public network, doubling how fast we
+    could push moved the convergence rate not at all — the pipe was never
+    the constraint, the redundancy was.
+
+    Buckets are key prefixes, so both sides can count and list a range
+    straight off the primary-key index. Compare counts, and only where they
+    disagree ask for that bucket's key list and send the difference.
+
+    Returns (keys_sent, buckets_examined), or (None, 0) if the peer is too
+    old to answer — the caller falls back to the blind sweep, which matters
+    because a network updates one node at a time.
+    """
+    chars = store.bucket_chars()
+    tok = peers.ident.poll_token()
+    try:
+        theirs = post_any(addr, "/digest",
+                          json.dumps({"node_token": tok,
+                                      "chars": chars}).encode(), secret)
+    except OSError as e:
+        if "404" in str(e):
+            return None, 0            # peer predates reconciliation
+        raise
+    if theirs.get("chars") != chars:
+        return None, 0                # answered at another granularity
+    peer_counts = theirs.get("buckets") or {}
+    mine = store.bucket_counts(chars)
+
+    # Only ranges where we hold more than they do. Equal counts can still
+    # hide a difference, and that is deliberately left to the slow sweep:
+    # paying a round trip per bucket to find nothing is the cost this whole
+    # mechanism exists to avoid.
+    behind = sorted((n - peer_counts.get(b, 0), b) for b, n in mine.items()
+                    if n > peer_counts.get(b, 0))
+    behind.reverse()                  # biggest gaps first
+    sent = 0
+    for _, prefix in behind[:budget]:
+        if sent >= RECONCILE_KEYS:
+            break
+        try:
+            have = post_any(addr, "/bucketkeys",
+                            json.dumps({"prefix": prefix,
+                                        "node_token": peers.ident.poll_token()
+                                        }).encode(), secret).get("keys") or []
+            missing = store.bucket_entries_except(prefix, have)
+            if not missing:
+                continue
+            for i in range(0, len(missing), REPAIR_POST_MAX):
+                chunk = missing[i:i + REPAIR_POST_MAX]
+                post_any(addr, "/kv",
+                         json.dumps({"entries": chunk,
+                                     "node_token": peers.ident.poll_token()
+                                     }).encode(), secret)
+                sent += len(chunk)
+        except OSError:
+            break                     # peer is unwell; the sweep still runs
+    if sent:
+        with _repair_stat_lock:
+            stat["sent"][addr] += sent
+            stat["reconciled"] += sent
+    return sent, min(len(behind), budget)
+
+
 def _push_repair(addr, entries, peers, secret, stat):
     """Send one peer its share of a repair batch. Runs on its own thread.
 
@@ -1380,7 +1557,9 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
     cursor = store.get_meta("repair_cursor", "")
     last_poll, catching_up = 0.0, False
     stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
-            "since": time.time()}
+            "reconciled": 0, "since": time.time()}
+    no_digest = set()          # peers too old to reconcile; sweep them blind
+    behind_addrs = set()
     # `stop` exists so a test can end this thread. Without it every test that
     # exercised the loop left a daemon thread sweeping for the rest of the
     # run, which showed up as repair errors printed from a test that had
@@ -1419,7 +1598,7 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                 # wide with nothing logged — the tests caught it as "0 keys
                 # migrated", which is the only symptom there would have been.
                 try:
-                    behind = False
+                    behind = set()
                     for nid, e in live.items():
                         if nid == peers.ident.node_id:
                             continue
@@ -1427,9 +1606,10 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                         keys = (st or {}).get("keys")
                         if (keys is not None and mine > 0
                                 and keys < mine * REPAIR_BEHIND_RATIO):
-                            behind = True
-                            break
-                    catching_up = behind
+                            behind.add(nid)
+                    catching_up = bool(behind)
+                    behind_addrs = {addr_of[n] for n in behind
+                                    if n in addr_of}
                 except Exception as e:
                     print(f"repair: could not poll peers ({type(e).__name__}: "
                           f"{e}) — staying on the maintenance schedule",
@@ -1455,6 +1635,25 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                 for nid in ring.route(k):
                     if nid != peers.ident.node_id and nid in addr_of:
                         by_addr.setdefault(addr_of[nid], []).append([k, v])
+            # Reconcile with whoever is behind: send them what they lack
+            # instead of everything we hold. They come out of the blind push
+            # below for this round, which would otherwise re-send the very
+            # range they were just brought up to date on.
+            for addr in sorted(behind_addrs):
+                if addr in no_digest:
+                    continue
+                try:
+                    got, _ = _reconcile(addr, store, peers, secret, stat)
+                except OSError:
+                    continue
+                if got is None:
+                    no_digest.add(addr)
+                    print(f"repair: {addr} cannot reconcile (older node) — "
+                          f"falling back to the blind sweep for it",
+                          file=sys.stderr, flush=True)
+                else:
+                    by_addr.pop(addr, None)
+
             if by_addr:
                 # One pool for the whole loop would be tidier, but a round can
                 # be skipped entirely and peers come and go; a pool sized to

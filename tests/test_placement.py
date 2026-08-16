@@ -400,3 +400,110 @@ class TestRepairPushesPeersConcurrently(unittest.TestCase):
         import blindrange.node as node
         self.assertGreater(node.REPAIR_FANOUT, 1)
         self.assertLessEqual(node.REPAIR_FANOUT, 16)
+
+
+class TestReconciliation(unittest.TestCase):
+    """Repair must send what a peer lacks, not everything we hold.
+
+    Doubling push throughput on the public network moved the convergence
+    rate not at all: the pipe was never the constraint, re-sending data the
+    far side already had was. This is the fix, so the test that matters is
+    not "did it converge" but "how much of what it sent was needed".
+    """
+
+    def setUp(self):
+        import tempfile
+        import blindrange.node as node
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.node = node
+
+    def _store(self, keys):
+        import os
+        s = self.node.Store(os.path.join(self.tmp.name, f"s{len(keys)}.db"))
+        s.put([(k, "v" + k) for k in keys])
+        return s
+
+    @staticmethod
+    def _keys(n, start=0):
+        """Keys shaped like the real ones: a tag plus uniform hex.
+
+        Bucketing by key PREFIX is what lets both sides answer from the
+        primary-key index with no extra column and nothing to migrate, and
+        it assumes the characters after the tag are evenly spread. Real
+        keys are PRF outputs, so they are — the live 3.9M-key store splits
+        into 8,193 buckets with a median of 144. An earlier version of this
+        fixture used zero-padded counters, whose variation is all in the
+        TRAILING characters, and every key landed in one bucket.
+        """
+        import hashlib
+        return ["I:" + hashlib.sha256(str(i).encode()).hexdigest()[:32]
+                for i in range(start, start + n)]
+
+    def test_only_the_missing_entries_are_selected(self):
+        full = self._store(self._keys(500))
+        chars = full.bucket_chars()
+        have = self._keys(500)[:400]
+        wanted, redundant = 0, 0
+        for prefix in full.bucket_counts(chars):
+            got = full.bucket_entries_except(prefix, have)
+            for k, _ in got:
+                if k in set(have):
+                    redundant += 1
+                else:
+                    wanted += 1
+        self.assertEqual(redundant, 0, "re-sent keys the peer already had")
+        self.assertEqual(wanted, 100, "missed keys the peer lacked")
+
+    def test_granularity_follows_store_size(self):
+        """A fixed width was right for millions of keys and hopeless for a
+        small store, where it put about one key in each bucket and spent a
+        round trip per key."""
+        small, big = self._store(self._keys(50)), self._store(self._keys(20000))
+        self.assertLess(small.bucket_chars(), big.bucket_chars())
+        for st in (small, big):
+            counts = st.bucket_counts(st.bucket_chars())
+            avg = sum(counts.values()) / max(1, len(counts))
+            self.assertLess(avg, self.node.BUCKET_TARGET * 4,
+                            "buckets far coarser than the target")
+
+    def test_bucket_ranges_tile_the_keyspace_exactly(self):
+        """Every key must land in exactly one bucket, or reconciliation
+        silently skips whatever falls in the gap."""
+        st = self._store(self._keys(2000))
+        chars = st.bucket_chars()
+        seen = []
+        for prefix in st.bucket_counts(chars):
+            seen += st.bucket_keys(prefix)
+        self.assertEqual(sorted(seen), sorted(self._keys(2000)))
+        self.assertEqual(len(seen), len(set(seen)), "a key is in two buckets")
+
+    def test_counts_and_listing_agree(self):
+        st = self._store(self._keys(1000))
+        chars = st.bucket_chars()
+        for prefix, n in st.bucket_counts(chars).items():
+            self.assertEqual(len(st.bucket_keys(prefix)), n, prefix)
+
+    def test_skewed_keys_stay_correct_if_less_efficient(self):
+        """Prefix bucketing degrades gracefully when the assumption fails.
+
+        Keys that share a prefix all land in one bucket, so the saving goes
+        away — but the peer's key list still filters the send, so what
+        crosses the wire is still only what is missing. Slower, never wrong.
+        """
+        clumped = [f"I:{i:032x}" for i in range(300)]
+        st = self._store(clumped)
+        have = clumped[:250]
+        got = []
+        for prefix in st.bucket_counts(st.bucket_chars()):
+            got += st.bucket_entries_except(prefix, have)
+        self.assertEqual(sorted(k for k, _ in got), sorted(clumped[250:]))
+
+    def test_identical_stores_need_no_transfer(self):
+        """The steady state: two nodes holding the same thing should find
+        nothing to do, which is what makes maintenance nearly free."""
+        st = self._store(self._keys(800))
+        chars = st.bucket_chars()
+        counts = st.bucket_counts(chars)
+        behind = [b for b, n in counts.items() if n > counts.get(b, 0)]
+        self.assertEqual(behind, [])

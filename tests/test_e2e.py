@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.request
 from pathlib import Path
 
@@ -977,3 +978,84 @@ class TestQuicDirect(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReconcileOverTheWire(unittest.TestCase):
+    """The digest exchange, against real nodes over real HTTP.
+
+    The unit tests prove the selection is right. This proves the two
+    endpoints answer, that a node asks at its own granularity and gets an
+    answer at that granularity, and — the part rollout depends on — that a
+    peer which does not know these paths is detected and swept the old way
+    instead of being silently skipped.
+    """
+
+    def test_digest_and_bucketkeys_answer_and_agree(self):
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_digest_")
+        secret = "digestnet"
+        root = str(Path(__file__).resolve().parents[1])
+        port = 7761
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "blindrange.node", "--port", str(port),
+             "--data", f"{tmp}/n", "--secret", secret],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root,
+            env={**os.environ})
+        self.addCleanup(proc.kill)
+        addr = f"127.0.0.1:{port}"
+        wait_http(addr)          # raises if it never comes up
+
+        from blindrange import node as nd
+        entries = [[f"I:{i:03x}" + "0" * 29, f"v{i}"] for i in range(600)]
+        nd.post_any(addr, "/kv", json.dumps({"entries": entries}).encode(),
+                    secret)
+
+        d = nd.post_any(addr, "/digest",
+                        json.dumps({"chars": 4}).encode(), secret)
+        self.assertEqual(d["chars"], 4, "answered at another granularity")
+        self.assertEqual(sum(d["buckets"].values()), 600)
+
+        # Ask at a different granularity and the picture must still add up,
+        # or two nodes comparing the same key space would disagree.
+        coarse = nd.post_any(addr, "/digest",
+                             json.dumps({"chars": 3}).encode(), secret)
+        self.assertEqual(coarse["chars"], 3)
+        self.assertEqual(sum(coarse["buckets"].values()), 600)
+        self.assertLess(len(coarse["buckets"]), len(d["buckets"]))
+
+        prefix = sorted(d["buckets"])[0]
+        keys = nd.post_any(addr, "/bucketkeys",
+                           json.dumps({"prefix": prefix}).encode(),
+                           secret)["keys"]
+        self.assertEqual(len(keys), d["buckets"][prefix],
+                         "the listing and the count disagree")
+        self.assertTrue(all(k.startswith(prefix) for k in keys))
+
+    def test_a_peer_without_the_endpoint_falls_back(self):
+        """A network updates one node at a time. If reconciliation treated
+        an unknown path as 'nothing to send', a not-yet-updated peer would
+        quietly stop receiving repairs altogether."""
+        from blindrange import node as nd
+
+        def missing(addr, path, body, secret, **kw):
+            raise OSError("HTTP 404 from somewhere/digest")
+
+        class Peers:
+            class ident:
+                @staticmethod
+                def poll_token():
+                    return {}
+
+        with unittest.mock.patch.object(nd, "post_any", missing):
+            sent, looked = nd._reconcile("1.2.3.4:1", DummyStore(), Peers(),
+                                         "s", {"sent": {}, "reconciled": 0})
+        self.assertIsNone(sent, "a 404 must mean 'fall back', not 'done'")
+
+
+class DummyStore:
+    def bucket_chars(self):
+        return 4
+
+    def count(self):
+        return 10
