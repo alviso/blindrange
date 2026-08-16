@@ -127,6 +127,11 @@ BUCKET_SEND_MAX = int(os.environ.get("BR_BUCKET_SEND_MAX", "5000"))
 # monopolise a sweep, and so the round still ends in seconds.
 RECONCILE_BUCKETS = int(os.environ.get("BR_RECONCILE_BUCKETS", "400"))
 RECONCILE_KEYS = int(os.environ.get("BR_RECONCILE_KEYS", "50000"))
+# Prefixes per /bucketkeys call, and a ceiling on what one answer carries.
+# Asking one bucket at a time cost a round trip each, which over a relay
+# turned a single round into hundreds of sequential trips.
+BUCKET_REQUEST_MAX = int(os.environ.get("BR_BUCKET_REQUEST_MAX", "64"))
+BUCKET_KEYS_MAX = int(os.environ.get("BR_BUCKET_KEYS_MAX", "40000"))
 _repair_stat_lock = threading.Lock()
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
@@ -1031,10 +1036,24 @@ def _service_post(store, peers, hub, secret, path, data, quic=None):
         return 200, {"buckets": store.bucket_counts(chars),
                      "chars": chars, "keys": store.count()}
     if path == "/bucketkeys":
-        # The keys this node holds under one prefix. Only keys — never
-        # values — so the answer is a few kB and the asker learns nothing it
+        # The keys this node holds under these prefixes. Only keys — never
+        # values — so the answer stays small and the asker learns nothing it
         # could not already learn by holding the same replica.
-        return 200, {"keys": store.bucket_keys(str(data["prefix"]))}
+        #
+        # Takes a LIST. One prefix per request meant a round trip per
+        # bucket, and against a relayed peer a single reconciliation round
+        # became ~800 sequential round trips and stopped finishing at all.
+        prefixes = data.get("prefixes")
+        if prefixes is None:
+            prefixes = [data["prefix"]]          # older callers
+        out, total = {}, 0
+        for pre in list(prefixes)[:BUCKET_REQUEST_MAX]:
+            ks = store.bucket_keys(str(pre))
+            out[str(pre)] = ks
+            total += len(ks)
+            if total >= BUCKET_KEYS_MAX:
+                break                            # bound the response
+        return 200, {"buckets": out, "keys": out.get(str(prefixes[0]), [])}
     if path == "/mget":
         keys = data["keys"]
         values = store.mget(keys)
@@ -1498,19 +1517,24 @@ def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
                     if n > peer_counts.get(b, 0))
     behind.reverse()                  # biggest gaps first
     sent = 0
-    for _, prefix in behind[:budget]:
+    wanted = [b for _, b in behind[:budget]]
+    for i in range(0, len(wanted), BUCKET_REQUEST_MAX):
         if sent >= RECONCILE_KEYS:
             break
+        group = wanted[i:i + BUCKET_REQUEST_MAX]
         try:
-            have = post_any(addr, "/bucketkeys",
-                            json.dumps({"prefix": prefix,
-                                        "node_token": peers.ident.poll_token()
-                                        }).encode(), secret).get("keys") or []
-            missing = store.bucket_entries_except(prefix, have)
-            if not missing:
-                continue
-            for i in range(0, len(missing), REPAIR_POST_MAX):
-                chunk = missing[i:i + REPAIR_POST_MAX]
+            got = post_any(addr, "/bucketkeys",
+                           json.dumps({"prefixes": group,
+                                       "node_token": peers.ident.poll_token()
+                                       }).encode(), secret).get("buckets")
+            if got is None:
+                return None, 0        # peer answers the one-prefix shape only
+            missing = []
+            for prefix in group:
+                missing += store.bucket_entries_except(prefix,
+                                                       got.get(prefix, []))
+            for j in range(0, len(missing), REPAIR_POST_MAX):
+                chunk = missing[j:j + REPAIR_POST_MAX]
                 post_any(addr, "/kv",
                          json.dumps({"entries": chunk,
                                      "node_token": peers.ident.poll_token()

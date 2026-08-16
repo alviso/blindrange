@@ -1059,3 +1059,73 @@ class DummyStore:
 
     def count(self):
         return 10
+
+
+class TestBucketKeysBatching(unittest.TestCase):
+    """One prefix per request is a round trip per bucket.
+
+    Against a relayed peer that turned a single reconciliation round into
+    hundreds of sequential round trips, and the round stopped finishing at
+    all — the seed went silent for six minutes with no sweep completing.
+    """
+
+    def test_many_prefixes_come_back_in_one_answer(self):
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_batch_")
+        secret = "batchnet"
+        root = str(Path(__file__).resolve().parents[1])
+        port = 7763
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "blindrange.node", "--port", str(port),
+             "--data", f"{tmp}/n", "--secret", secret],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root,
+            env={**os.environ})
+        self.addCleanup(proc.kill)
+        addr = f"127.0.0.1:{port}"
+        wait_http(addr)
+
+        from blindrange import node as nd
+        entries = [[f"I:{i:03x}" + "0" * 29, f"v{i}"] for i in range(600)]
+        nd.post_any(addr, "/kv", json.dumps({"entries": entries}).encode(),
+                    secret)
+        d = nd.post_any(addr, "/digest", json.dumps({"chars": 4}).encode(),
+                        secret)
+        prefixes = sorted(d["buckets"])
+
+        got = nd.post_any(addr, "/bucketkeys",
+                          json.dumps({"prefixes": prefixes}).encode(),
+                          secret)["buckets"]
+        self.assertEqual(len(got), len(prefixes),
+                         "asked for every bucket at once, got fewer back")
+        self.assertEqual(sum(len(v) for v in got.values()), 600)
+        for pre, keys in got.items():
+            self.assertEqual(len(keys), d["buckets"][pre], pre)
+
+    def test_the_single_prefix_shape_still_answers(self):
+        """A node updates before its peers do; the old caller must not
+        silently receive an empty bucket and conclude there is nothing to
+        send."""
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_batch1_")
+        secret = "batchnet"
+        root = str(Path(__file__).resolve().parents[1])
+        port = 7764
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "blindrange.node", "--port", str(port),
+             "--data", f"{tmp}/n", "--secret", secret],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root,
+            env={**os.environ})
+        self.addCleanup(proc.kill)
+        addr = f"127.0.0.1:{port}"
+        wait_http(addr)
+
+        from blindrange import node as nd
+        nd.post_any(addr, "/kv", json.dumps(
+            {"entries": [[f"I:{i:03x}" + "0" * 29, "v"] for i in range(50)]}
+        ).encode(), secret)
+        out = nd.post_any(addr, "/bucketkeys",
+                          json.dumps({"prefix": "I:00"}).encode(), secret)
+        self.assertTrue(out["keys"], "the one-prefix shape returned nothing")
+        self.assertTrue(all(k.startswith("I:00") for k in out["keys"]))
