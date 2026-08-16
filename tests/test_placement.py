@@ -507,3 +507,42 @@ class TestReconciliation(unittest.TestCase):
         counts = st.bucket_counts(chars)
         behind = [b for b, n in counts.items() if n > counts.get(b, 0)]
         self.assertEqual(behind, [])
+
+
+class TestBucketCountsNeedNoScratchSpace(unittest.TestCase):
+    """Reconciliation must not need a writable temp directory.
+
+    `GROUP BY substr(k,1,n)` plans as "USE TEMP B-TREE FOR GROUP BY". Under
+    ProtectSystem=strict a node has nowhere to put one, and the public seed
+    failed every sweep with SQLite reporting "disk I/O error" on a host with
+    523G free — a true statement and a useless clue. Counting by seeking
+    from bucket to bucket touches only the primary-key index.
+    """
+
+    def test_no_query_in_the_counting_path_uses_a_temp_btree(self):
+        import os
+        import tempfile
+        import blindrange.node as node
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        st = node.Store(os.path.join(tmp.name, "kv.db"))
+        import hashlib
+        st.put([("I:" + hashlib.sha256(str(i).encode()).hexdigest()[:32],
+                 "v") for i in range(500)])
+
+        plans = []
+        for sql, params in (
+                ("SELECT k FROM kv ORDER BY k LIMIT 1", ()),
+                ("SELECT k FROM kv WHERE k >= ? ORDER BY k LIMIT 1", ("I:0",)),
+                ("SELECT COUNT(*) FROM kv WHERE k >= ? AND k < ?",
+                 ("I:0", "I:1"))):
+            plans += [r[-1] for r in
+                      st.db.execute("EXPLAIN QUERY PLAN " + sql, params)]
+        for p in plans:
+            self.assertNotIn("TEMP B-TREE", p.upper(),
+                             f"this plan needs scratch space: {p}")
+
+        # And the counts are still right, which is the only reason the plan
+        # matters.
+        counts = st.bucket_counts(4)
+        self.assertEqual(sum(counts.values()), 500)

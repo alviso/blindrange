@@ -645,11 +645,29 @@ class Store:
         got = self._buckets
         if got and got[1] == nchars and now - got[0] < max_age:
             return got[2]
+        # Deliberately NOT `GROUP BY substr(k,1,n)`. That plan is
+        # "USE TEMP B-TREE FOR GROUP BY", and a node under
+        # ProtectSystem=strict has nowhere to put a temp b-tree: on the
+        # public seed it failed every sweep with "disk I/O error" on a box
+        # with 523G free. Seeking bucket to bucket instead touches only the
+        # primary-key index, needs no scratch space, and visits only
+        # non-empty buckets. Measured on 3.9M keys: 1.5s against 0.65s for
+        # the GROUP BY, once a minute, for never needing a writable /tmp.
+        out, lo = {}, None
         with self.lock:
-            rows = self.db.execute(
-                f"SELECT substr(k,1,{int(nchars)}) AS b, COUNT(*) "
-                f"FROM kv GROUP BY b").fetchall()
-        out = {b: n for b, n in rows}
+            while True:
+                row = self.db.execute(
+                    "SELECT k FROM kv WHERE k >= ? ORDER BY k LIMIT 1",
+                    (lo,)).fetchone() if lo is not None else self.db.execute(
+                    "SELECT k FROM kv ORDER BY k LIMIT 1").fetchone()
+                if not row:
+                    break
+                prefix = row[0][:nchars]
+                blo, bhi = self.bucket_range(prefix)
+                out[prefix] = self.db.execute(
+                    "SELECT COUNT(*) FROM kv WHERE k >= ? AND k < ?",
+                    (blo, bhi)).fetchone()[0]
+                lo = bhi
         self._buckets = (now, nchars, out)
         return out
 

@@ -123,6 +123,10 @@ NoNewPrivileges=true
 # listed below fails silently at runtime instead of refusing to start.
 ProtectSystem=strict
 ReadWritePaths={rw}
+# A private, writable /tmp. Without one, anything that needs scratch space
+# fails at runtime under strict — SQLite reported "disk I/O error" on a box
+# with 523G free, which is a true statement and a terrible clue.
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
