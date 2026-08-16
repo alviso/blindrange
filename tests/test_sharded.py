@@ -251,3 +251,91 @@ class TestShardingActuallyLowersTheCeiling(ShardingCase):
         counts = [s["records"] for s in self.sharded.stats("amount", 0, 4095)]
         self.assertLess(max(counts), len(self.rows) * 0.5,
                         f"a shard holds most of the database: {counts}")
+
+
+class TestDescendingOrder(ShardingCase):
+    """`order="-field"` walks the range from the top.
+
+    Two things were wrong with newest-N queries. They returned the OLDEST
+    rows in the window, because an ascending walk with a limit stops as
+    soon as it has enough — at the wrong end. And they paid for a batch of
+    leaves per round trip until they got there, when the answer was in the
+    last leaf all along.
+    """
+
+    def test_descending_returns_the_newest_rows_not_the_oldest(self):
+        pred = [{"field": "amount", "lo": 0, "hi": 4095}]
+        top = [r["amount"] for r in
+               self.plain.query_stream(pred, limit=5, order="-amount")]
+        every = sorted((r["amount"] for r in self.plain.query_stream(pred)),
+                       reverse=True)
+        self.assertEqual(top, every[:5],
+                         "a descending limit did not return the top rows")
+
+    def test_descending_costs_fewer_round_trips(self):
+        """The reason to do it: an ascending walk pays batch after batch
+        before it reaches the end the caller actually asked about."""
+        pred = [{"field": "amount", "lo": 0, "hi": 4095}]
+        list(self.plain.query_stream(pred, limit=5, order="amount"))
+        up = self.plain.last_stats["batches"]
+        list(self.plain.query_stream(pred, limit=5, order="-amount"))
+        down = self.plain.last_stats["batches"]
+        self.assertLessEqual(down, up,
+                             f"descending took more batches ({down}) than "
+                             f"ascending ({up})")
+
+    def test_sharded_descending_is_globally_sorted(self):
+        """The merge has to strip the direction marker before looking the
+        value up — it asked rows for a key called "-amount" and the server
+        died on KeyError."""
+        pred = [{"field": "amount", "lo": 0, "hi": 4095}]
+        got = [r["amount"] for r in
+               self.sharded.query_stream(pred, order="-amount")]
+        self.assertEqual(got, sorted(got, reverse=True))
+        self.assertEqual(len(got), len(self.rows))
+
+    def test_sharded_descending_limit_matches_unsharded(self):
+        pred = [{"field": "amount", "lo": 0, "hi": 4095}]
+        a = [r["amount"] for r in
+             self.plain.query_stream(pred, limit=7, order="-amount")]
+        b = [r["amount"] for r in
+             self.sharded.query_stream(pred, limit=7, order="-amount")]
+        self.assertEqual(b, a)
+
+
+class TestConcurrentShardWalks(ShardingCase):
+    """Shard walks must overlap, not queue behind each other.
+
+    heapq.merge pulls from its inputs synchronously, so four shards took
+    four times as long as one: measured on the public network, an ordered
+    newest-5 query went from 5.6s unsharded to 19.7s over four shards. The
+    walks were serialised by the merge, not by anything inherent.
+    """
+
+    def test_abandoning_a_stream_does_not_leak_producers(self):
+        """A `limit` abandons every other shard's stream mid-walk. Without
+        a stop signal each one parks on a full queue forever, and every
+        query leaks threads."""
+        import threading
+        before = threading.active_count()
+        pred = [{"field": "amount", "lo": 0, "hi": 4095}]
+        for _ in range(5):
+            list(self.sharded.query_stream(pred, limit=2))
+        for _ in range(50):
+            if threading.active_count() <= before + len(self.sharded):
+                break
+            time.sleep(0.1)
+        self.assertLessEqual(threading.active_count(), before + len(self.sharded),
+                             "producer threads outlived their queries")
+
+    def test_a_shard_error_reaches_the_caller(self):
+        """Errors cross the thread boundary. A query that quietly skipped a
+        broken shard would return a confidently incomplete answer."""
+        class Boom:
+            def query_stream(self, *a, **k):
+                raise RuntimeError("shard on fire")
+                yield  # pragma: no cover
+
+        broken = ShardedOwner([Boom()], self.tmp)
+        with self.assertRaises(RuntimeError):
+            list(broken.query_stream([{"field": "amount", "lo": 0, "hi": 1}]))

@@ -1139,7 +1139,10 @@ class Owner:
         Walks ONE driving predicate's intervals — chosen as the most
         selective, using chain lengths already known from probing — and
         checks the other predicates after decryption, which the query path
-        does anyway. `order=<field>` yields rows sorted by that field.
+        does anyway. `order=<field>` yields rows sorted by that field, and
+        `order="-<field>"` sorts descending AND walks the range from the
+        top — the difference between paying for every leaf in the window
+        and stopping at the first one that fills the limit.
         `after` resumes from the cursor carried on a previously yielded row
         (rec["_cursor"]); pass it back to page through a large result.
 
@@ -1161,9 +1164,18 @@ class Owner:
         if not bounds:
             raise ValueError("no predicates")
 
-        driver = order or self._cheapest(bounds, writers)
+        # `order="-field"` walks the range from the top down. It matters far
+        # more than it sounds: an ordered walk costs one lookup per leaf, so
+        # "the newest 5 events in the last 25 days" ascending pays for all
+        # ~527 leaves in the window before it can know it has the last five.
+        # Descending, it stops at the first leaf that fills the limit.
+        desc = bool(order) and str(order).startswith("-")
+        order_field = str(order)[1:] if desc else order
+        driver = order_field or self._cheapest(bounds, writers)
         d_field, d_lo, d_hi = next(b for b in bounds if b[0] == driver)
         units = self._units(d_field, d_lo, d_hi, ordered=bool(order))
+        if desc:
+            units = list(reversed(units))
         start_unit, seen_in_unit = (after or {}).get("u", 0), \
             (after or {}).get("n", 0)
 
@@ -1188,8 +1200,9 @@ class Owner:
             # list, and replies now arrive in whatever order the network
             # returns them (hedged reads), so the sort must not depend on it.
             if order:
-                rows.sort(key=lambda r: (self._encode(order, r[order]),
-                                         r["_rid"]))
+                rows.sort(key=lambda r: (self._encode(order_field,
+                                                      r[order_field]),
+                                         r["_rid"]), reverse=desc)
             else:
                 rows.sort(key=lambda r: r["_rid"])
             for n, rec in enumerate(rows):

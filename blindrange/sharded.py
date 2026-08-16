@@ -44,6 +44,8 @@ as a bonus, never as the reason.
 """
 import concurrent.futures
 import hashlib
+import queue
+import threading
 import heapq
 import json
 import os
@@ -52,6 +54,9 @@ from pathlib import Path
 from .client import Owner
 
 MANIFEST = "shards.json"
+# Rows held per shard while a merge is in flight. Enough to keep every
+# shard's walk busy, small enough that streaming still means streaming.
+PREFETCH_DEPTH = int(os.environ.get("BR_SHARD_PREFETCH", "32"))
 
 
 def _fan(calls, workers=8):
@@ -67,6 +72,69 @@ def _fan(calls, workers=8):
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(calls), workers)) as pool:
         return [f.result() for f in [pool.submit(c) for c in calls]]
+
+
+_DONE = object()
+
+
+def _prefetch(make_stream, depth=PREFETCH_DEPTH):
+    """Run a shard's walk on its own thread, feeding a bounded queue.
+
+    An ordered query walks dyadic leaves one batch at a time, and each
+    batch is a network round trip. `heapq.merge` pulls from its inputs
+    synchronously, so four shards took four times as long as one — the
+    walks were serialised by the merge, not by anything inherent.
+
+    The queue is small on purpose: the point of streaming is that memory
+    follows batch size, and prefetching an unbounded amount would trade
+    the property away to fix the latency.
+
+    Returns (generator, stop). Call stop() when abandoning the stream, or
+    the producer sits blocked on a full queue forever — a `limit` that
+    stops early is the normal case here, not the exception.
+    """
+    q = queue.Queue(maxsize=depth)
+    halt = threading.Event()
+
+    def run():
+        gen = make_stream()
+        try:
+            for item in gen:
+                while not halt.is_set():
+                    try:
+                        q.put(item, timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+                if halt.is_set():
+                    break
+        except BaseException as e:                  # carry it to the reader
+            try:
+                q.put(e, timeout=1)
+            except queue.Full:
+                pass
+        finally:
+            close = getattr(gen, "close", None)
+            if close:
+                close()
+            try:
+                q.put(_DONE, timeout=1)
+            except queue.Full:
+                pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+    def out():
+        while True:
+            item = q.get()
+            if item is _DONE:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    return out(), halt.set
 
 
 class ShardedOwner:
@@ -179,21 +247,40 @@ class ShardedOwner:
         `order`, the per-shard streams are already sorted, so a heap merge
         gives a globally sorted stream without materialising anything.
         """
-        streams = []
-        for n, o in enumerate(self.shards):
-            def tagged(n=n, o=o):
+        def tagged(n, o):
+            def make():
                 for rec in o.query_stream(predicates, limit=limit,
                                           order=order, **kw):
                     rec["_rid"] = self._tag(n, rec["_rid"])
                     rec["_shard"] = n
                     yield rec
-            streams.append(tagged())
-        merged = (heapq.merge(*streams, key=lambda r: r[order]) if order
+            return make
+
+        streams, stops = [], []
+        for n, o in enumerate(self.shards):
+            gen, stop = _prefetch(tagged(n, o))
+            streams.append(gen)
+            stops.append(stop)
+        # `order="-field"` is a field name with a direction on the front,
+        # so the merge has to strip it before looking the value up and sort
+        # the other way. Without this the merge asked rows for a key called
+        # "-ts" and the server died on KeyError.
+        desc = bool(order) and str(order).startswith("-")
+        key_field = str(order)[1:] if desc else order
+        merged = (heapq.merge(*streams, key=lambda r: r[key_field],
+                              reverse=desc) if order
                   else _interleave(streams))
-        for i, rec in enumerate(merged):
-            if limit is not None and i >= limit:
-                return
-            yield rec
+        try:
+            for i, rec in enumerate(merged):
+                if limit is not None and i >= limit:
+                    return
+                yield rec
+        finally:
+            # Whether we finished, hit the limit, or the caller walked away
+            # mid-stream, every producer has to be told — otherwise each
+            # abandoned query leaves a thread parked on a full queue.
+            for stop in stops:
+                stop()
 
     def query(self, field, lo, hi):
         return list(self.query_stream([{"field": field, "lo": lo, "hi": hi}]))

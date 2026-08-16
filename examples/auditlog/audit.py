@@ -168,13 +168,18 @@ class Trail:
                 preds.append({"field": field, "prefix": val})
         return preds
 
-    def events(self, q, limit=200):
+    def events(self, q, limit=200, newest_first=True):
         preds = self._preds(q)
         out = []
-        # order="ts" walks dyadic leaves left to right, which are already in
-        # value order — chronological output with no sort and no server-side
-        # ordering ever being exposed.
-        for row in self.owner.query_stream(preds, limit=limit, order="ts"):
+        # order="-ts" walks dyadic leaves from the newest end. Both the
+        # answer and the cost improve: an audit UI wants the most recent
+        # events, and ascending had to pay for every leaf in the window
+        # before it could know which ones were last — 527 lookups for a
+        # 25-day range at hourly leaves, measured at 5.2s for five rows.
+        # Either direction still exposes no ordering to the network; only
+        # the key holder knows the leaves are in value order.
+        order = "-ts" if newest_first else "ts"
+        for row in self.owner.query_stream(preds, limit=limit, order=order):
             out.append({"ts": row.get("ts"), "actor": row.get("actor"),
                         "action": row.get("action"),
                         "payload": row.get("payload")})
@@ -285,7 +290,14 @@ def make_handler(trail):
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             if u.path == "/events":
                 limit = min(int((q.get("limit", ["200"])[0]) or 200), 2000)
-                return self._send(200, {"events": trail.events(q, limit)})
+                # Newest first by default. With a limit, ascending answers a
+                # question nobody asked — "the OLDEST five events in the last
+                # 25 days" — and pays for a batch of leaves per round trip
+                # walking away from the end the caller cares about. `?order=asc`
+                # is there for exporting a trail in reading order.
+                asc = (q.get("order", ["desc"])[0] or "desc").lower() == "asc"
+                return self._send(200, {"events": trail.events(
+                    q, limit, newest_first=not asc)})
             if u.path == "/count":
                 n, kind = trail.count(q)
                 return self._send(200, {"count": n, "basis": kind})

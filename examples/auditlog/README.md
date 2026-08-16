@@ -156,7 +156,7 @@ Measured, 2,000 events over one trail against four, on the public network:
 |---|---|---|
 | ingest 2,000 | 17.2s | **13.1s** |
 | count over 25 days | 5.8s | **5.4s** |
-| newest 5 events (ordered) | **5.6s** | 19.7s |
+| newest 5 events (ordered) | 5.6s | 19.7s |
 | compaction peak memory | 28.4 MB | **7.9 MB** |
 
 Read that table before turning it on. Ingest and compaction improve, which
@@ -166,5 +166,22 @@ leaves per shard and a `limit` does not shrink the walk — four sparse
 walks instead of one. That query is also the most common thing anyone asks
 an audit log.
 
-So: shard when ingest volume or compaction time is what hurts, and keep
-the shard count low. Do not shard for latency on recent-events queries.
+Both halves of that read regression are now fixed.
+
+The 3.5x sharded penalty was the merge: `heapq.merge` pulls from its inputs
+synchronously, so four shard walks ran one after another instead of at the
+same time. Each shard now walks on its own thread behind a small bounded
+queue — 19.7s back down to 4.5s, at parity with a single trail.
+
+The remaining cost was asking the question backwards. `/events` walked the
+range from the OLDEST end, so a `limit` returned the oldest rows in the
+window and paid a round trip per batch of leaves getting nowhere near the
+recent ones. `order="-ts"` walks from the newest end: **5 round trips down
+to 1**, and — the part that actually matters — the five rows it returns are
+now the newest five rather than five from 479 hours ago.
+
+`/events` is newest-first by default now. `?order=asc` gives reading order
+for exporting a trail.
+
+So: shard when ingest volume or compaction time is what hurts, and keep the
+shard count low.

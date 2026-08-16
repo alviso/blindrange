@@ -158,8 +158,17 @@ class TestAuditService(unittest.TestCase):
 
         ev = self.get("/events?limit=100")["events"]
         self.assertEqual(len(ev), 5)
-        self.assertEqual([e["ts"] for e in ev], sorted(e["ts"] for e in ev),
-                         "events must come back in time order")
+        # Newest first by default: an audit UI asks for recent events, and
+        # with a limit an ascending walk returns the OLDEST rows in the
+        # window — the wrong end, reached the expensive way.
+        times = [e["ts"] for e in ev]
+        self.assertEqual(times, sorted(times, reverse=True),
+                         "events must come back newest first")
+
+        # Reading order is still available for exporting a trail.
+        asc = [e["ts"] for e in self.get("/events?limit=100&order=asc")["events"]]
+        self.assertEqual(asc, sorted(asc), "?order=asc must ascend")
+        self.assertEqual(sorted(asc), sorted(times), "same rows either way")
 
     def test_02_filters(self):
         self.assertEqual(len(self.get("/events?actor=alice")["events"]), 2)
