@@ -287,13 +287,116 @@ class TestRepairLoopSurvivesItself(unittest.TestCase):
              unittest.mock.patch.object(node, "REPAIR_SETTLE", 0), \
              unittest.mock.patch.object(node.random, "random", lambda: 0.0), \
              unittest.mock.patch.object(sys, "stderr", err):
-            t = threading.Thread(target=run, daemon=True)
+            stop = threading.Event()
+            t = threading.Thread(
+                target=lambda: node._repair_loop(FakeStore(), FakePeers(), "s",
+                                                 stop=stop), daemon=True)
             t.start()
             _time.sleep(1.0)
+            alive = t.is_alive()
+        stop.set()
+        t.join(timeout=5)
 
-        self.assertTrue(t.is_alive(),
+        self.assertTrue(alive,
                         "the repair thread died on a sweep error — that is "
                         "exactly the silent replication stop this guards")
         self.assertGreater(len(calls), 3,
                            "it should keep retrying, not spin down")
         self.assertIn("sweep failed", err.getvalue())
+
+
+class TestRepairPushesPeersConcurrently(unittest.TestCase):
+    """Peers must be pushed to at the same time, not one after another.
+
+    Measured on the public network, a catch-up round took ~20s against a
+    5s interval: posting to three peers meant three sequential relay round
+    trips, so the sweep spent most of its life waiting instead of scanning,
+    and a node 900k keys behind gained ~1% an hour. Peers are independent,
+    so serialising them buys nothing.
+
+    Asserted by overlap rather than by wall-clock speedup, which would be
+    flaky on a loaded machine: if two posts were in flight at once, the
+    sends are concurrent.
+    """
+
+    def test_two_posts_are_in_flight_at_once(self):
+        import threading
+        import time as _time
+        import blindrange.node as node
+
+        spans, lock = [], threading.Lock()
+
+        def slow_post(addr, path, body, secret, **kw):
+            t0 = _time.time()
+            _time.sleep(0.25)
+            with lock:
+                spans.append((t0, _time.time()))
+            return {}
+
+        peer_ids = ["a" * 16, "b" * 16, "c" * 16]
+
+        class FakeRing:
+            def __init__(self, *a, **k):
+                pass
+
+            def route(self, key):
+                return peer_ids
+
+        class FakeIdent:
+            node_id = "z" * 16
+
+            def poll_token(self):
+                return {}
+
+        class FakeStore:
+            def get_meta(self, *a):
+                return ""
+
+            def set_meta(self, *a):
+                pass
+
+            def count(self):
+                return 10
+
+            def batch_after(self, cursor, size):
+                return [(f"k{i}", "v") for i in range(5)]
+
+        class FakePeers:
+            ident = FakeIdent()
+
+            def stable_since(self):
+                return 1e9
+
+            def live(self):
+                return {n: {"addr": f"{i}.0.0.1:1", "udp": ""}
+                        for i, n in enumerate(peer_ids)}
+
+        with unittest.mock.patch.object(node, "Ring", FakeRing), \
+             unittest.mock.patch.object(node, "post_any", slow_post), \
+             unittest.mock.patch.object(node, "_peer_stats", lambda *a: None), \
+             unittest.mock.patch.object(node, "REPAIR_EVERY", 0.01), \
+             unittest.mock.patch.object(node.random, "random", lambda: 0.0), \
+             unittest.mock.patch.object(node, "REPAIR_SETTLE", 0):
+            stop = threading.Event()
+            t = threading.Thread(
+                target=lambda: node._repair_loop(FakeStore(), FakePeers(), "s",
+                                                 stop=stop), daemon=True)
+            t.start()
+            _time.sleep(1.0)
+            stop.set()
+            t.join(timeout=5)
+
+        with lock:
+            got = list(spans)
+        self.assertGreaterEqual(len(got), 2, "no posts were made")
+        overlap = any(a[0] < b[1] and b[0] < a[1]
+                      for i, a in enumerate(got) for b in got[i + 1:])
+        self.assertTrue(overlap,
+                        "every post finished before the next began — the "
+                        "peers are being pushed to serially again")
+
+    def test_fanout_is_bounded(self):
+        """Unbounded would open a connection per peer on a big network."""
+        import blindrange.node as node
+        self.assertGreater(node.REPAIR_FANOUT, 1)
+        self.assertLessEqual(node.REPAIR_FANOUT, 16)

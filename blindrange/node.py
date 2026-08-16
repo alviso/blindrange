@@ -43,6 +43,7 @@ involvement. Rate is tunable (BR_REPAIR_EVERY seconds, BR_REPAIR_BATCH keys).
 Transparency: GET /intel shows a sample of everything this operator can see.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -101,6 +102,15 @@ _repair_fail = {}                  # addr -> (consecutive failures, last log)
 # nothing" produced identical logs — which is exactly the state the network
 # was in while a node sat 900k keys behind.
 REPAIR_LOG_EVERY = float(os.environ.get("BR_REPAIR_LOG_EVERY", "60"))
+# Peers are pushed to concurrently. Serially, a round took ~20s against a
+# 5s interval — measured on the public network, where posting a catch-up
+# batch to three peers meant three sequential relay round trips and the
+# sweep spent most of its time waiting rather than scanning. Peers are
+# independent, so there is nothing to order between them; chunks WITHIN a
+# peer stay sequential, so one slow node still gets a coherent stream and
+# one failure still stops that peer rather than hammering it.
+REPAIR_FANOUT = int(os.environ.get("BR_REPAIR_FANOUT", "4"))
+_repair_stat_lock = threading.Lock()
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
 DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
@@ -1320,7 +1330,47 @@ def _gossip_loop(peers: Peers, secret: str):
             pass                                       # peer down; TTL handles it
 
 
-def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
+def _push_repair(addr, entries, peers, secret, stat):
+    """Send one peer its share of a repair batch. Runs on its own thread.
+
+    Chunked, because a catch-up sweep sizes its batch for the whole store
+    and one post of that many entries is a different animal from the
+    trickle a maintenance sweep sends: the big ones time out, and this
+    used to swallow that as `except OSError: pass`, so a peer could
+    receive nothing while the logs stayed clean.
+    """
+    sent = 0
+    for i in range(0, len(entries), REPAIR_POST_MAX):
+        chunk = entries[i:i + REPAIR_POST_MAX]
+        try:
+            post_any(addr, "/kv",
+                     json.dumps({"entries": chunk,
+                                 "node_token": peers.ident.poll_token()
+                                 }).encode(), secret)
+            sent += len(chunk)
+        except OSError as e:
+            # Log at most once a minute per peer. Silence here makes a
+            # stalled catch-up look exactly like a healthy one.
+            with _repair_stat_lock:
+                n, last = _repair_fail.get(addr, (0, 0.0))
+                n += 1
+                if time.time() - last > 60:
+                    print(f"repair: {addr} rejected {len(chunk)} keys "
+                          f"({type(e).__name__}: {str(e)[:80]}) — "
+                          f"{n} failure(s) since it last accepted any",
+                          file=sys.stderr, flush=True)
+                    last = time.time()
+                _repair_fail[addr] = (n, last)
+            break            # that peer is unwell; move on
+    if sent:
+        with _repair_stat_lock:
+            _repair_fail.pop(addr, None)
+            stat["sent"][addr] += sent
+    return sent
+
+
+def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
+                 stop=None):
     # The cursor MUST outlive the process. It used to be a local reset to ""
     # on every start, so each restart swept the keyspace from the beginning
     # again — harmless when a node ran for weeks, and quietly crippling once
@@ -1331,7 +1381,11 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
     last_poll, catching_up = 0.0, False
     stat = {"scanned": 0, "sent": Counter(), "rounds": 0,
             "since": time.time()}
-    while True:
+    # `stop` exists so a test can end this thread. Without it every test that
+    # exercised the loop left a daemon thread sweeping for the rest of the
+    # run, which showed up as repair errors printed from a test that had
+    # already passed.
+    while not (stop is not None and stop.is_set()):
         # A crash in here is indistinguishable from a healthy
         # quiet network: the thread dies, replication stops, and
         # nothing is logged. That has now happened twice — once
@@ -1401,34 +1455,16 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
                 for nid in ring.route(k):
                     if nid != peers.ident.node_id and nid in addr_of:
                         by_addr.setdefault(addr_of[nid], []).append([k, v])
-            for addr, entries in by_addr.items():
-                # Chunk. A catch-up sweep sizes its batch for the whole store,
-                # and one post of that many entries is a different animal from
-                # the trickle a maintenance sweep sends: the big ones time out,
-                # and this used to swallow that as `except OSError: pass`, so a
-                # peer could receive nothing while the logs stayed clean.
-                for i in range(0, len(entries), REPAIR_POST_MAX):
-                    chunk = entries[i:i + REPAIR_POST_MAX]
-                    try:
-                        post_any(addr, "/kv",
-                                 json.dumps({"entries": chunk,
-                                             "node_token": peers.ident.poll_token()
-                                             }).encode(), secret)
-                        _repair_fail.pop(addr, None)
-                        stat["sent"][addr] += len(chunk)
-                    except OSError as e:
-                        # Log at most once a minute per peer. Silence here makes
-                        # a stalled catch-up look exactly like a healthy one.
-                        n, last = _repair_fail.get(addr, (0, 0.0))
-                        n += 1
-                        if time.time() - last > 60:
-                            print(f"repair: {addr} rejected {len(chunk)} keys "
-                                  f"({type(e).__name__}: {str(e)[:80]}) — "
-                                  f"{n} failure(s) since it last accepted any",
-                                  file=sys.stderr, flush=True)
-                            last = time.time()
-                        _repair_fail[addr] = (n, last)
-                        break        # that peer is unwell; move on
+            if by_addr:
+                # One pool for the whole loop would be tidier, but a round can
+                # be skipped entirely and peers come and go; a pool sized to
+                # the work is cheap next to the relay round trips it hides.
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(len(by_addr), REPAIR_FANOUT)) as pool:
+                    list(pool.map(
+                        lambda kv: _push_repair(kv[0], kv[1], peers, secret,
+                                                stat),
+                        list(by_addr.items())))
 
             el = time.time() - stat["since"]
             if el >= REPAIR_LOG_EVERY:
