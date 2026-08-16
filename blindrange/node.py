@@ -1138,6 +1138,12 @@ def _peer_stats(nid, e, secret, hub, self_id):
         return None
 
 
+def _age_cell(age):
+    """'4.2s' while a node is answering, '6m ago' once it is not — a
+    seconds counter into the hundreds reads as a number, not a duration."""
+    return f"{age}s" if age < 90 else f"{int(age // 60)}m ago"
+
+
 def _possession_cell(m):
     """The aggregate, plus the newest audit when the two disagree.
 
@@ -1348,7 +1354,7 @@ def status_fragment(rows, total):
         f"{' · modified' if str(r.get('version', '')).endswith('+dirty') else ''}"
         f"{' · CANNOT SELF-UPDATE' if r.get('update_blocked') else ''}"
         f"</td>"
-        f"<td class='num'>{r['age']}s</td>"
+        f"<td class='num'>{_age_cell(r['age'])}</td>"
         f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
         f"</tr>" for r in rows)
     return (f"{audit_badge(rows)}"

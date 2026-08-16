@@ -207,3 +207,56 @@ class TestRecencyWeightedPossession(unittest.TestCase):
         self._load("n", [(1.0, 1.0), (0.2, 1.0)])
         self.assertNotIn("latest", node._possession_cell(
             status.possession()["n"]))
+
+
+class TestRosterLinger(unittest.TestCase):
+    """A node missing from one refresh must not vanish from the page.
+
+    Gossip forgets a peer after a missed heartbeat or two, so a relay
+    hiccup erased nodes from the roster for a minute and put them back —
+    churn that never happened. Missing nodes stay for ROSTER_LINGER,
+    marked, with their age visible, and only then disappear.
+    """
+
+    def setUp(self):
+        status.ROSTER.clear()
+
+    @staticmethod
+    def row(nid, **kw):
+        return {"id": nid, "mode": "relay tenant", "keys": 10,
+                "version": "v", "build": 1, "age": 0.5, **kw}
+
+    def test_a_briefly_missing_node_stays_marked(self):
+        t = 1000.0
+        status.merge_roster([self.row("aa"), self.row("bb")], t)
+        got = status.merge_roster([self.row("aa")], t + 60)
+        by = {r["id"]: r for r in got}
+        self.assertIn("bb", by, "one missed refresh erased the node")
+        self.assertTrue(by["bb"]["down"])
+        self.assertEqual(by["bb"]["mode"], "not answering")
+        self.assertAlmostEqual(by["bb"]["age"], 60, delta=1)
+        self.assertFalse(by["aa"].get("down"))
+
+    def test_it_drops_after_the_linger_expires(self):
+        t = 1000.0
+        status.merge_roster([self.row("aa"), self.row("bb")], t)
+        got = status.merge_roster([self.row("aa")],
+                                  t + status.ROSTER_LINGER + 1)
+        self.assertEqual([r["id"] for r in got], ["aa"])
+
+    def test_a_returning_node_is_fresh_again(self):
+        t = 1000.0
+        status.merge_roster([self.row("aa")], t)
+        status.merge_roster([], t + 120)
+        got = status.merge_roster([self.row("aa")], t + 180)
+        self.assertFalse(got[0].get("down"), "a returned node stayed marked")
+
+    def test_a_lingering_node_earns_nothing(self):
+        """The linger is presentation. Payout weight must still require a
+        node that answers — a ghost keeping its share would pay for
+        absence."""
+        rows = [self.row("aa"), dict(self.row("bb"), down=True,
+                                     mode="not answering")]
+        live = [r for r in rows
+                if r.get("mode") != "down" and not r.get("down")]
+        self.assertEqual([r["id"] for r in live], ["aa"])

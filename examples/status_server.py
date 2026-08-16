@@ -88,6 +88,44 @@ from blindrange import merkle, receipt  # noqa: E402
 REPORTS = collections.defaultdict(collections.deque)   # node_id -> (ts, rate)
 REPORT_WINDOW = 500
 REPORT_MAX_AGE = float(os.environ.get("BR_REPORT_MAX_AGE", "21600"))  # 6h
+# How long a node that stopped answering stays on the page, marked, before
+# it is dropped. Gossip forgets a peer after a missed heartbeat or two, so
+# a relay hiccup ERASED a node from the roster for a minute and then put it
+# back — which reads as churn that never happened. Vanishing is the one
+# thing a status page should never do silently: show "last seen 3m ago"
+# and let the reader decide what it means.
+ROSTER_LINGER = float(os.environ.get("BR_ROSTER_LINGER", "600"))
+ROSTER = {}                       # node id -> {"row": last row, "last": ts}
+
+def merge_roster(fresh, now):
+    """Fresh rows, plus a marked row for anyone who recently vanished.
+
+    A node the seed's gossip has just forgotten reappears within a minute
+    almost every time — a missed relay heartbeat, an update restart. The
+    page erasing and re-adding it reads as churn that never happened, and
+    "vanished" is the one thing a status page should never report
+    silently. So a missing node stays, marked `not answering` with its
+    age climbing, and is only dropped after ROSTER_LINGER of silence —
+    long enough that its disappearance means something.
+    """
+    for row in fresh:
+        ROSTER[row["id"]] = {"row": row, "last": now}
+    merged = []
+    for nid, kept in sorted(ROSTER.items()):
+        age = now - kept["last"]
+        if age < 1:
+            merged.append(kept["row"])
+        elif age < ROSTER_LINGER:
+            ghost = dict(kept["row"])
+            ghost["down"] = True
+            ghost["mode"] = "not answering"
+            ghost["age"] = round(age, 1)
+            merged.append(ghost)
+        else:
+            ROSTER.pop(nid, None)
+    return merged
+
+
 REPORT_BODY_MAX = int(os.environ.get("BR_REPORT_BODY_MAX",
                                      str(256_000)))
 REPORT_QUANTILE = 0.25
@@ -469,9 +507,14 @@ def refresh_loop(node_addr, every=15):
         try:
             with urllib.request.urlopen(
                     f"http://{node_addr}/status.json", timeout=20) as r:
-                SNAPSHOT["data"] = json.loads(r.read())
+                data = json.loads(r.read())
                 SNAPSHOT["error"] = None
-                record_activity(SNAPSHOT["data"].get("nodes") or [])
+                # Activity rates come from FRESH reports only; a lingering
+                # row's counters are stale and would read as a stall.
+                record_activity(data.get("nodes") or [])
+                data["nodes"] = merge_roster(data.get("nodes") or [],
+                                             time.time())
+                SNAPSHOT["data"] = data
         except Exception as e:                       # keep the last good one
             SNAPSHOT["error"] = f"{type(e).__name__}: {e}"
         SNAPSHOT["at"] = time.time()
@@ -507,7 +550,8 @@ def with_shares(data):
     """
     seen = possession()
     rows = data.get("nodes", [])
-    live = [r for r in rows if r.get("mode") != "down"]
+    live = [r for r in rows
+            if r.get("mode") != "down" and not r.get("down")]
     weights = {}
     for r in rows:
         m = seen.get(r["id"])
