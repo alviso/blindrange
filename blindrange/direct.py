@@ -32,6 +32,7 @@ Set BR_NO_QUIC=1 to disable (nodes: no QUIC listener; clients: never dial).
 import asyncio
 import json
 import os
+import sys
 import socket
 import ssl
 import threading
@@ -65,6 +66,35 @@ from cryptography.x509.oid import NameOID
 
 MAGIC = b"BRP1"
 ALPN = ["blindrange/1"]
+DEBUG = os.environ.get("BR_QUIC_DEBUG", "") == "1"
+
+
+def _fire(fut, what):
+    """Take the result of a fire-and-forget coroutine, so Python does not.
+
+    A Future whose exception is never retrieved gets reported from a
+    destructor: three lines of "Future exception was never retrieved" with
+    no traceback, no context, and no timestamp relationship to the thing
+    that failed. On the public heartbeat those lines arrived every few
+    seconds and buried the "cycle failed" messages that explained why it
+    had stopped compacting.
+
+    Every one of these paths is a QUIC optimisation that falls back to the
+    relay, so a failure is genuinely not worth interrupting anyone over —
+    but "not worth reporting loudly" is not the same as "unreadable spam",
+    and it is certainly not the same as discarded. BR_QUIC_DEBUG=1 shows
+    them.
+    """
+    def done(f):
+        try:
+            f.result()
+        except Exception as e:                 # noqa: BLE001 - optimisation
+            if DEBUG:
+                print(f"quic: {what} failed ({type(e).__name__}: {e})",
+                      file=sys.stderr, flush=True)
+    fut.add_done_callback(done)
+
+
 DISABLED = (os.environ.get("BR_NO_QUIC", "") == "1"
             or _AIOQUIC_ERROR is not None)
 if _AIOQUIC_ERROR is not None:
@@ -152,7 +182,8 @@ class _ServeProtocol(QuicConnectionProtocol):
             buf += event.data
             if event.end_stream:
                 data = bytes(self._bufs.pop(event.stream_id))
-                asyncio.ensure_future(self._respond(event.stream_id, data))
+                _fire(asyncio.ensure_future(
+                    self._respond(event.stream_id, data)), "respond")
 
     async def _respond(self, stream_id, data):
         loop = asyncio.get_event_loop()
@@ -275,7 +306,8 @@ class NodeQuic:
             for _ in range(count):
                 self._server._transport.sendto(burst, target)
                 await asyncio.sleep(gap)
-        asyncio.run_coroutine_threadsafe(_punch(), self._loop)
+        _fire(asyncio.run_coroutine_threadsafe(_punch(), self._loop),
+              "punch")
 
 
 # -------------------------------------------------------------- client side
@@ -299,7 +331,9 @@ class DirectPath:
                 await self._cm.__aexit__(None, None, None)
             except Exception:
                 pass
-        asyncio.run_coroutine_threadsafe(_close(), self._dialer._loop)
+        _fire(asyncio.run_coroutine_threadsafe(_close(),
+                                               self._dialer._loop),
+              "close")
 
 
 class Dialer:

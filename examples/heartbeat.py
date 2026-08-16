@@ -28,6 +28,13 @@ every one, because on the live network inserting 25,000 records took 11s
 and compacting them took 565s. Net storage stays flat; what it consumes is
 bandwidth, CPU and write capacity.
 
+Every TWO cycles, not five. Five was cheaper per cycle and much more
+expensive when it mattered: a day of skipped compactions left 333,000
+tombstoned rows, the delete phase went from ~20s to 481s because finding
+live rows meant walking past all of them, and the catch-up compaction
+needed 2.78 GB of RAM. Tombstone backlog does not hurt in proportion to
+its size.
+
   python3 examples/heartbeat.py --records 5000
   python3 examples/heartbeat.py --records 2000 --once
 """
@@ -105,8 +112,14 @@ def main():
     ap.add_argument("--account", default=os.environ.get("BR_ACCOUNT", ""))
     ap.add_argument("--records", type=int, default=5_000,
                     help="records per cycle")
-    ap.add_argument("--compact-every", type=int, default=5,
+    ap.add_argument("--compact-every", type=int, default=2,
                     help="reclaim space every N cycles (0 = never)")
+    ap.add_argument("--shards", type=int, default=1,
+                    help="spread the load across N independent databases. "
+                         "Compaction rewrites an epoch in memory, and this "
+                         "workload is the one that proved it: 333,000 rows "
+                         "took 2.78 GB. With >1 the --state path is a "
+                         "DIRECTORY.")
     ap.add_argument("--pause", type=float, default=30.0,
                     help="seconds between cycles")
     ap.add_argument("--once", action="store_true")
@@ -115,12 +128,21 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    if os.path.exists(a.state):
+    schema = {"ts": {"type": "int", "bits": 22, "leaf_width": 4096}}
+    if a.shards > 1:
+        from blindrange.sharded import ShardedOwner
+        if os.path.exists(os.path.join(a.state, "shards.json")):
+            owner = ShardedOwner.open(a.state, a.passphrase,
+                                      bootstrap=[a.bootstrap])
+        else:
+            owner = ShardedOwner.create(a.state, a.passphrase, schema,
+                                        bootstrap=[a.bootstrap],
+                                        shards=a.shards,
+                                        network_secret=a.secret)
+    elif os.path.exists(a.state):
         owner = Owner.open(a.state, a.passphrase, bootstrap=[a.bootstrap])
     else:
-        owner = Owner.create(a.state, a.passphrase,
-                             {"ts": {"type": "int", "bits": 22,
-                                     "leaf_width": 4096}},
+        owner = Owner.create(a.state, a.passphrase, schema,
                              bootstrap=[a.bootstrap], network_secret=a.secret)
     if a.account:
         owner.configure_tokens(a.issuer, a.account)
