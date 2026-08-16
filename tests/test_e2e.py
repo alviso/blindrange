@@ -1129,3 +1129,97 @@ class TestBucketKeysBatching(unittest.TestCase):
                           json.dumps({"prefix": "I:00"}).encode(), secret)
         self.assertTrue(out["keys"], "the one-prefix shape returned nothing")
         self.assertTrue(all(k.startswith("I:00") for k in out["keys"]))
+
+
+class TestCompactionSurvivesACrash(unittest.TestCase):
+    """A compaction that dies must not wedge the database forever.
+
+    This is not hypothetical. The public heartbeat was SIGKILLed
+    mid-compaction by a systemd stop timeout, and from then on every cycle
+    failed with "a compaction is already in flight". It reclaimed nothing
+    for the rest of the day while its store kept growing, and there was no
+    way out short of editing the state file: the open marker had no owner,
+    no timestamp, and no expiry.
+    """
+
+    def setUp(self):
+        import os
+        self.tmp = tempfile.mkdtemp(prefix="blindrange_crashcompact_")
+        self.port = 7791
+        self.secret = "crashnet"
+        root = str(Path(__file__).resolve().parents[1])
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "blindrange.node", "--port", str(self.port),
+             "--data", f"{self.tmp}/n", "--secret", self.secret],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root,
+            env={**os.environ})
+        self.addr = f"127.0.0.1:{self.port}"
+        wait_http(self.addr)
+        self.addCleanup(self.proc.kill)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+        self.schema = {"amount": {"type": "int", "bits": 20,
+                                  "leaf_width": 64}}
+        self.owner = Owner.create(f"{self.tmp}/o.brdb", "pw", self.schema,
+                                  [self.addr], network_secret=self.secret)
+        self.owner.insert_many([{"amount": i * 7 % 4096, "row": i}
+                                for i in range(120)])
+        self.owner.drain()
+
+    def _abandon_a_compaction(self):
+        """Do exactly what the crash did: win the slot, advance the epoch,
+        then stop before draining or sealing."""
+        E = self.owner._refresh_epoch()
+        slot = self.owner._st["epoch_len"] + 1
+        self.owner._put_nx(self.owner._sys_key(b"epoch", slot),
+                           self.owner._sys_encode(f"open:{E + 1}"))
+        self.owner._st["epoch_len"] = slot
+        self.owner._st["epoch"] = E + 1
+        self.owner._st["chains"] = {}
+        self.owner._save()
+        return E
+
+    def test_an_abandoned_compaction_wedges_without_resume(self):
+        """The symptom, pinned: refusal, and a message that names the fix."""
+        self._abandon_a_compaction()
+        with self.assertRaises(RuntimeError) as cm:
+            self.owner.compact()
+        self.assertIn("resume=True", str(cm.exception),
+                      "the error must say how to recover, since nothing "
+                      "else will finish it")
+
+    def test_resume_finishes_it_and_loses_nothing(self):
+        self._abandon_a_compaction()
+        stats = self.owner.compact(resume=True)
+        self.assertTrue(stats["resumed"])
+        self.assertGreater(stats["entries"], 0)
+        rows = sorted(r["row"] for r in self.owner.query("amount", 0, 4095))
+        self.assertEqual(rows, list(range(120)),
+                         "resuming a compaction lost or duplicated rows")
+
+    def test_compacting_again_after_a_resume_is_normal(self):
+        """The wedge must actually clear, not just let one call through."""
+        self._abandon_a_compaction()
+        self.owner.compact(resume=True)
+        stats = self.owner.compact()
+        self.assertFalse(stats["resumed"])
+        rows = sorted(r["row"] for r in self.owner.query("amount", 0, 4095))
+        self.assertEqual(rows, list(range(120)))
+
+    def test_a_clean_crash_resumes_by_itself_next_time(self):
+        """With the ownership marker written, a crashed compaction is
+        recognised as ours and finished without anyone passing a flag."""
+        E = self.owner._refresh_epoch()
+        slot = self.owner._st["epoch_len"] + 1
+        self.owner._put_nx(self.owner._sys_key(b"epoch", slot),
+                           self.owner._sys_encode(f"open:{E + 1}"))
+        self.owner._st["epoch_len"] = slot
+        self.owner._st["epoch"] = E + 1
+        self.owner._st["chains"] = {}
+        self.owner._st["compacting"] = E + 1      # what compact() now records
+        self.owner._save()
+
+        stats = self.owner.compact()              # no flag needed
+        self.assertTrue(stats["resumed"])
+        rows = sorted(r["row"] for r in self.owner.query("amount", 0, 4095))
+        self.assertEqual(rows, list(range(120)))

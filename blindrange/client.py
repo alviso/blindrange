@@ -1442,7 +1442,7 @@ class Owner:
             entries[w].sort()
         return entries, old_keys
 
-    def compact(self):
+    def compact(self, resume=False):
         """Merge all writers' chains into single per-label streams under a new
         epoch, dropping tombstoned entries, then delete the old epoch's keys.
 
@@ -1456,21 +1456,48 @@ class Owner:
         insert-if-absent slot, and losing that race aborts cleanly."""
         import time as _time
         E = self._refresh_epoch()
-        if len(self._epochs()) > 1:
-            raise RuntimeError("a compaction is already in flight")
         writers = self._refresh_writers()
         me = self._st["writer"]
-        new_E = E + 1
 
-        slot = self._st["epoch_len"] + 1
-        if not self._put_nx(self._sys_key(b"epoch", slot),
-                            self._sys_encode(f"open:{new_E}")):
-            self._refresh_epoch()
-            raise RuntimeError("another compaction won the epoch slot")
-        self._st["epoch_len"] = slot
-        self._st["epoch"] = new_E
-        self._st["chains"] = {}
-        self._save()
+        # An unsealed previous epoch means a compaction opened and never
+        # sealed. Until now that was permanent: two epochs exist, every
+        # later compact() refused, and the database never reclaimed another
+        # byte. It happened for real — the heartbeat was SIGKILLed
+        # mid-compaction by a stop timeout and stopped compacting for good,
+        # while its store grew all day.
+        #
+        # Resuming is safe because everything after the slot claim is
+        # idempotent by construction: the drain re-walks until two passes
+        # agree, the rewrite is keyed by (epoch, writer, index) so redoing
+        # it overwrites identical values, and the seal is insert-if-absent.
+        # `mine` is the evidence that WE own the unsealed epoch — it is
+        # written after winning the slot and cleared after sealing, so a
+        # compaction another writer is running is still refused.
+        mine = self._st.get("compacting")
+        resuming = len(self._epochs()) > 1 and (mine == E or resume)
+        if len(self._epochs()) > 1 and not resuming:
+            raise RuntimeError(
+                f"a compaction is already in flight (epoch {E - 1} opened "
+                f"but never sealed). If the process that started it died, "
+                f"call compact(resume=True) to finish it — nothing else "
+                f"will, and no space is reclaimed until it completes.")
+
+        if resuming:
+            # Pick up where it stopped: the epoch below ours is the one
+            # left open, and our epoch is the one it was moving into.
+            new_E, E = E, E - 1
+        else:
+            new_E = E + 1
+            slot = self._st["epoch_len"] + 1
+            if not self._put_nx(self._sys_key(b"epoch", slot),
+                                self._sys_encode(f"open:{new_E}")):
+                self._refresh_epoch()
+                raise RuntimeError("another compaction won the epoch slot")
+            self._st["epoch_len"] = slot
+            self._st["epoch"] = new_E
+            self._st["chains"] = {}
+            self._st["compacting"] = new_E
+            self._save()
 
         # drain epoch E: re-walk until a pass sees nothing new
         entries, old_keys = self._walk_epoch(E, writers)
@@ -1519,8 +1546,10 @@ class Owner:
             self._st["chains"][w] = max(self._st["chains"].get(w, 0), c)
         self._st["remote"] = {}
         self._st["tombs"] = {"counts": {}, "rids": []}
+        self._st.pop("compacting", None)
         self._save()
-        return {"labels": len(new_chains), "entries": kept, "dropped": dropped}
+        return {"labels": len(new_chains), "entries": kept, "dropped": dropped,
+                "resumed": bool(resuming)}
 
 
     # ------------------------------------------------------------- audit
