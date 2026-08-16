@@ -52,6 +52,7 @@ import hmac
 import json
 import math
 import os
+import random
 import ssl
 import threading
 import time
@@ -1655,6 +1656,9 @@ class Owner:
 
     # Sample sizes are fixed, never chosen by the caller, so a report
     # cannot encode how much data the reporter holds.
+    # Groups carried per report. Bounds the payload no matter how large
+    # the network grows, and keeps every report the same size.
+    REPORT_GROUPS = 12
     REPORT_SAMPLE = 100
 
     def audit_report(self):
@@ -1697,8 +1701,18 @@ class Owner:
             nodes[nid] = {"sampled": v["responsible"],
                           "verified": v["verified"],
                           "latency_ms": v["latency_ms"]}
+        # A FIXED number of proof groups, for the same reason the sample
+        # size is fixed. Carrying every group made a report grow with the
+        # reporter's view of the network, which is both a small leak and —
+        # once the public network reached five nodes — larger than the
+        # aggregator would accept: submissions started failing with HTTP
+        # 413, no proofs were published for hours, and every node's
+        # possession quietly expired and took its payout share with it.
+        proofs = list(audit.get("proofs", []))
+        if len(proofs) > self.REPORT_GROUPS:
+            proofs = random.sample(proofs, self.REPORT_GROUPS)
         out = {"kind": "blindrange-audit", "v": 1, "nodes": nodes,
-               "proofs": audit.get("proofs", [])}
+               "proofs": proofs}
         out["pow"] = receipt.solve(out)
         return out
 

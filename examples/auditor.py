@@ -79,9 +79,23 @@ def main():
               "or unreachable; nothing published", file=sys.stderr, flush=True)
         return 1
 
-    out = tok.fetch_json(a.status.rstrip("/") + "/report", report, timeout=60)
-    print(f"published {groups} groups covering {len(report['nodes'])} nodes: "
-          f"{json.dumps(out)}", flush=True)
+    size = len(json.dumps(report).encode())
+    try:
+        out = tok.fetch_json(a.status.rstrip("/") + "/report", report,
+                             timeout=60)
+    except Exception as e:
+        # Name the consequence, not just the error. A rejected report is
+        # invisible for hours and then arrives as every node's possession
+        # expiring and its payout share going to zero — which reads as the
+        # nodes misbehaving rather than as the aggregator refusing us.
+        print(f"report REJECTED ({type(e).__name__}: {str(e)[:120]}) — "
+              f"{groups} groups, {size:,} bytes. Nothing was published, so "
+              f"possession will expire for every node this covered and "
+              f"their shares will fall to zero until a report lands.",
+              file=sys.stderr, flush=True)
+        return 1
+    print(f"published {groups} groups covering {len(report['nodes'])} nodes "
+          f"in {size:,} bytes: {json.dumps(out)}", flush=True)
     return 0
 
 

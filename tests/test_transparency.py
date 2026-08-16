@@ -142,3 +142,64 @@ class TestAggregatorLog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReportSizeIsBounded(unittest.TestCase):
+    """A report must not grow with the size of the network.
+
+    The sample size is fixed so the numbers cannot encode how much data the
+    reporter holds — but the proof list was not, so a report grew with how
+    many nodes the reporter could see. That is a small leak on its own, and
+    once the public network reached five nodes it became a functional
+    break: submissions bounced with HTTP 413, nothing was published for
+    hours, and every node's possession expired and took its payout share
+    with it while the page showed a bare dash.
+    """
+
+    def test_group_cap_is_a_fixed_small_number(self):
+        from blindrange.client import Owner
+        self.assertGreater(Owner.REPORT_GROUPS, 1)
+        self.assertLessEqual(Owner.REPORT_GROUPS, 32)
+
+    def test_a_report_fits_the_aggregator_limit_with_room(self):
+        """Built from a proof list far larger than any real network would
+        produce, the report must still fit — with headroom, because the
+        alternative fails silently for hours."""
+        import importlib.util
+        import json
+        import os
+        import random
+        from pathlib import Path
+        from blindrange.client import Owner
+
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "status_server", root / "examples" / "status_server.py")
+        status = importlib.util.module_from_spec(spec)
+        import sys as _sys
+        _sys.modules["status_server"] = status
+        spec.loader.exec_module(status)
+
+        def receipt_blob():
+            hx = lambda n: os.urandom(n).hex()      # noqa: E731
+            return {"v": 1, "node_id": hx(8), "beacon": 2978075,
+                    "nonce": hx(16), "asked": 23, "kdigest": hx(32),
+                    "served": 23, "vdigest": hx(32), "pub": hx(32),
+                    "sig": hx(64)}
+
+        # 200 groups of 3 receipts — far beyond any plausible network.
+        proofs = [{hx: {"verified": 23, "receipt": receipt_blob()}
+                   for hx in (os.urandom(8).hex() for _ in range(3))}
+                  for _ in range(200)]
+        capped = random.sample(proofs, Owner.REPORT_GROUPS)
+        body = json.dumps({"kind": "blindrange-audit", "v": 1,
+                           "nodes": {os.urandom(8).hex():
+                                     {"sampled": 40, "verified": 40,
+                                      "latency_ms": 12.0}
+                                     for _ in range(20)},
+                           "proofs": capped,
+                           "pow": {"nonce": 123456, "bits": 22}}).encode()
+        self.assertLess(len(body), status.REPORT_BODY_MAX / 2,
+                        f"a capped report is {len(body):,} bytes against a "
+                        f"{status.REPORT_BODY_MAX:,} limit — too close for "
+                        f"a failure whose only symptom is silence")

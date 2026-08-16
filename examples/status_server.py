@@ -88,6 +88,8 @@ from blindrange import merkle, receipt  # noqa: E402
 REPORTS = collections.defaultdict(collections.deque)   # node_id -> (ts, rate)
 REPORT_WINDOW = 500
 REPORT_MAX_AGE = float(os.environ.get("BR_REPORT_MAX_AGE", "21600"))  # 6h
+REPORT_BODY_MAX = int(os.environ.get("BR_REPORT_BODY_MAX",
+                                     str(256_000)))
 REPORT_QUANTILE = 0.25
 # Possession is a claim about NOW. Reports already expire for that reason;
 # this applies the same principle continuously instead of as a cliff, so a
@@ -652,8 +654,13 @@ def make_handler(node_addr):
                 self.send_error(404)
                 return
             n = int(self.headers.get("Content-Length", 0))
-            if n > 64_000:
-                self.send_error(413)
+            # Headroom, but still bounded: proof-of-work is what makes
+            # submission expensive, and this only stops someone streaming
+            # gigabytes before the puzzle is checked. 64,000 was tight
+            # enough that honest reports from a five-node network started
+            # bouncing, which took every node's possession with it.
+            if n > REPORT_BODY_MAX:
+                self.send_error(413, f"report exceeds {REPORT_BODY_MAX} bytes")
                 return
             try:
                 out = record_report(json.loads(self.rfile.read(n) or b"{}"))
