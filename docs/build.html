@@ -114,13 +114,61 @@ is worth thirty seconds.</p>
 }</code></pre>
 
 <table>
-<tr><th>key</th><th>what it does</th></tr>
-<tr><td><code>bits</code></td><td>size of the value domain. 2²⁰ covers
-amounts up to about a million.</td></tr>
-<tr><td><code>leaf_width</code></td><td><b>the resolution the network can
-distinguish.</b> The only number with a privacy consequence.</td></tr>
-<tr><td><code>chars</code></td><td>text only: how many leading characters
-are indexed, at 5 bits each, which is what makes prefix search work.</td></tr>
+<tr><th>key</th><th>what it is</th><th>example</th></tr>
+<tr>
+  <td><code>type</code></td>
+  <td><code>"int"</code> for numbers and anything you can turn into one
+      (timestamps, day numbers, cents). <code>"str"</code> for
+      prefix-searchable text.</td>
+  <td><code>"int"</code></td>
+</tr>
+<tr>
+  <td><code>bits</code></td>
+  <td>Size of the value domain: values run 0 … 2<sup>bits</sup>−1. Pick the
+      smallest that fits — every extra bit is another index level per
+      record. For <code>"str"</code> it must be
+      <code>chars × 5</code>.</td>
+  <td><code>20</code> (up to ~1,048,575)</td>
+</tr>
+<tr>
+  <td><code>leaf_width</code></td>
+  <td><b>The resolution the network can distinguish</b>, and the only key
+      here with a privacy consequence. <b>Must be a power of two</b>; a
+      value that is not gets snapped down, so choose deliberately.</td>
+  <td><code>64</code></td>
+</tr>
+<tr>
+  <td><code>chars</code></td>
+  <td><code>"str"</code> only: how many leading characters are indexed, at
+      5 bits each. Beyond that the value is stored but not searchable.</td>
+  <td><code>6</code></td>
+</tr>
+</table>
+
+<p class="lead">Starting points for the fields most applications actually
+have:</p>
+<table>
+<tr><th>field</th><th>spec</th><th>what the network can tell</th></tr>
+<tr>
+  <td>money, to the cent, up to ~$10k</td>
+  <td><code>{"type": "int", "bits": 20, "leaf_width": 64}</code></td>
+  <td>which 64-cent band</td>
+</tr>
+<tr>
+  <td>unix timestamp, second precision</td>
+  <td><code>{"type": "int", "bits": 31, "leaf_width": 4096}</code></td>
+  <td>which ~1.1-hour window</td>
+</tr>
+<tr>
+  <td>date as a day number</td>
+  <td><code>{"type": "int", "bits": 16, "leaf_width": 16}</code></td>
+  <td>which 16-day window</td>
+</tr>
+<tr>
+  <td>status, category, short tag</td>
+  <td><code>{"type": "str", "bits": 30, "chars": 6, "leaf_width": 16}</code></td>
+  <td>a coarse band of the first 6 characters</td>
+</tr>
 </table>
 
 <div class="note"><b>Why coarser is better on both axes.</b> A query is
@@ -135,18 +183,74 @@ not queryable, and nothing about them is indexed. In the example,
 <code>customer</code> is carried along and never appears on any node.</p>
 
 <h2 id="connect"><span class="n">3</span>Create the database</h2>
-<pre><code class="from-quickstart">db = Owner.create(a.state, a.passphrase, schema,
-                  bootstrap=[a.bootstrap],
-                  network_secret=a.secret)</code></pre>
-<p>and on later runs:</p>
-<pre><code class="from-quickstart">db = Owner.open(a.state, a.passphrase, bootstrap=[a.bootstrap])</code></pre>
+<pre><code class="from-quickstart">state_path = a.state                  # local file; your keys live here
+passphrase = a.passphrase             # unlocks it; never leaves this box
+bootstrap = [a.bootstrap]             # any live peer, to find the rest
+network_secret = a.secret             # which network you are joining
+
+db = Owner.create(state_path, passphrase, schema,
+                  bootstrap=bootstrap,
+                  network_secret=network_secret)</code></pre>
+
+<p>With real values in place of the script's arguments:</p>
+<pre>db = Owner.create(
+    <span class="k">"orders.brdb"</span>,                        <span class="c"># state_path</span>
+    <span class="k">"correct horse battery staple"</span>,       <span class="c"># passphrase</span>
+    schema,                                <span class="c"># from step 2</span>
+    bootstrap=[<span class="k">"seed.blindrange.dev:7501"</span>],  <span class="c"># any live peer</span>
+    network_secret=<span class="k">"blindrange-public"</span>,      <span class="c"># which network</span>
+)</pre>
+
+<table>
+<tr><th>parameter</th><th>what it is</th><th>example</th></tr>
+<tr>
+  <td><code>state_path</code></td>
+  <td>Path to the local file holding your master key, schema, writer id and
+      chain counters. Encrypted at rest with scrypt + AES-GCM. <b>This is
+      the file to back up</b> — it is the database, as far as you are
+      concerned; the network only has ciphertext.</td>
+  <td><code>"orders.brdb"</code></td>
+</tr>
+<tr>
+  <td><code>passphrase</code></td>
+  <td>Unlocks that file. Never sent anywhere, by anything. It is stretched
+      with scrypt, so a weak one is slow to attack rather than safe.</td>
+  <td><code>"correct horse battery staple"</code></td>
+</tr>
+<tr>
+  <td><code>schema</code></td>
+  <td>The dict from step 2. Validated here, so a bad
+      <code>leaf_width</code> fails at create rather than at query time.
+      Field names may not begin with <code>@</code>.</td>
+  <td><code>schema</code></td>
+</tr>
+<tr>
+  <td><code>bootstrap</code></td>
+  <td>A list of <code>host:port</code> for <b>any</b> live peer. One is
+      enough — gossip finds the rest, and the list you pass is merged into
+      the one already stored, so peers accumulate rather than replace.</td>
+  <td><code>["seed.blindrange.dev:7501"]</code></td>
+</tr>
+<tr>
+  <td><code>network_secret</code></td>
+  <td>Which network you are joining. It is an HMAC membership check —
+      anti-vandal, <b>not access control</b>, and the public one is
+      published. Defaults to <code>""</code>, which is its own network.</td>
+  <td><code>"blindrange-public"</code></td>
+</tr>
+</table>
+
+<p>Reopening takes neither the schema nor the secret — both live in the
+state file:</p>
+<pre><code class="from-quickstart">db = Owner.open(state_path, passphrase, bootstrap=bootstrap)</code></pre>
 
 <div class="note warn"><b>Nobody can recover this for you.</b> The
-passphrase never leaves your process. It unlocks a local state file holding
-the master key, and every index key on the network is an HMAC under that
-key. Lose both the state file and the passphrase and the data is gone —
-that is the same property that stops the storage provider reading it, seen
-from the other side.</div>
+passphrase never leaves your process. It unlocks the state file holding the
+master key, and every index key on the network is an HMAC under that key.
+Lose both the file and the passphrase and the data is gone — that is the
+same property that stops the storage provider reading it, seen from the
+other side. Back up <code>state_path</code>; the network is not a backup of
+it.</div>
 
 <h2 id="create"><span class="n">4</span>Create — writing records</h2>
 <pre><code class="from-quickstart">db.insert_many(rows)

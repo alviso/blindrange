@@ -66,14 +66,23 @@ def main():
     # HMAC under that key, so nodes see pseudorandom labels and nothing
     # else. Losing the state file AND the passphrase loses the data — no
     # one can recover it for you, which is the point.
-    if os.path.exists(a.state):
-        db = Owner.open(a.state, a.passphrase, bootstrap=[a.bootstrap])
-        print(f"   reopened {a.state}")
+    # Named locals rather than a.state / a.passphrase, because these lines
+    # are quoted in the guide and argparse attribute names teach nobody
+    # anything.
+    state_path = a.state                  # local file; your keys live here
+    passphrase = a.passphrase             # unlocks it; never leaves this box
+    bootstrap = [a.bootstrap]             # any live peer, to find the rest
+    network_secret = a.secret             # which network you are joining
+
+    if os.path.exists(state_path):
+        # No schema and no secret on reopen: both are inside the state file.
+        db = Owner.open(state_path, passphrase, bootstrap=bootstrap)
+        print(f"   reopened {state_path}")
     else:
-        db = Owner.create(a.state, a.passphrase, schema,
-                          bootstrap=[a.bootstrap],
-                          network_secret=a.secret)
-        print(f"   created {a.state} · joined via {a.bootstrap}")
+        db = Owner.create(state_path, passphrase, schema,
+                          bootstrap=bootstrap,
+                          network_secret=network_secret)
+        print(f"   created {state_path} · joined via {a.bootstrap}")
     print(f"   {len(db.network())} nodes visible")
 
     # ---------------------------------------------------------------- 3
