@@ -118,6 +118,15 @@
              padding:12px 14px; font-size:13.5px; color:var(--dim); }
   .privacy b { color:var(--txt); font-weight:normal; }
   .note { font-size:13px; color:var(--dim); }
+  .tabs { display:flex; gap:6px; margin-bottom:-1px; flex-wrap:wrap; }
+  .tab { border:1px solid var(--line); border-bottom:none;
+         border-radius:8px 8px 0 0; padding:7px 14px; font-size:13px;
+         color:var(--dim); cursor:pointer; background:#12161d; }
+  .tab.on { color:var(--acc); border-color:var(--acc);
+            border-bottom-color:transparent; background:var(--panel); }
+  .tab:focus { outline:none; }
+  .panel { display:none; } .panel.on { display:block; }
+  .panel pre { border-radius:0 10px 10px 10px; }
   @media (max-width:560px) { .row label { min-width:100%; } }
 </style>
 </head>
@@ -337,9 +346,33 @@ of it, plus the attack harness we run against our own design, is on the
 and no configuration: if your node isn't reachable it diagnoses that itself
 and becomes a relay tenant of a peer, then clients punch a direct QUIC path
 to you when they can.</p>
-<pre>pip install -e .
-blindrange-node --port 7501 --data ~/.br/n1 \
-    --seed seed.blindrange.dev:7501 --secret blindrange-public</pre>
+<div class="tabgroup">
+<div class="tabs">
+  <button class="tab on" data-t="nmac">macOS / Linux</button>
+  <button class="tab" data-t="nwin">Windows</button>
+</div>
+<div class="panel on" id="nmac"><pre>python3 -m venv .venv &amp;&amp; .venv/bin/pip install -e ".[quic]"
+
+.venv/bin/blindrange-node --port 7501 --data ~/.blindrange/n1 \
+    --seed seed.blindrange.dev:7501 --secret blindrange-public \
+    --max-disk 20GB --auto-update</pre></div>
+<div class="panel" id="nwin"><pre>py -m venv .venv
+.venv\Scripts\python -m pip install -e ".[quic]"
+
+.venv\Scripts\python -m blindrange.node --port 7501 ^
+    --data $env:USERPROFILE\.blindrange\n1 ^
+    --seed seed.blindrange.dev:7501 --secret blindrange-public ^
+    --max-disk 20GB --auto-update</pre></div>
+</div>
+<p class="dim"><code>--max-disk</code> takes <code>20GB</code> or a
+percentage like <code>5%</code> of the drive. Past it the node stops
+accepting writes; <b>data it already holds is never deleted</b> to get under
+a limit you lower, since that would destroy replicas — it just stops taking
+more and shrinks as the network moves data elsewhere. <code>--auto-update</code>
+is optional and means the node runs whatever we publish next; leave it off
+if you would rather pull by hand. If <code>aioquic</code> has no wheel for
+your Python, drop <code>[quic]</code> — you lose direct peer paths, not the
+node.</p>
 <p class="dim">That "secret" is published deliberately: on an open network it
 only turns away drive-by scanners and carries no security role —
 confidentiality comes from keys that never leave the owner's machine.</p>
@@ -582,6 +615,17 @@ document.getElementById("size").oninput = draw;
 draw();
 </script>
 
+<script>
+document.querySelectorAll('.tab').forEach(function (t) {
+  t.onclick = function () {
+    var g = t.closest('.tabgroup');
+    g.querySelectorAll('.tab').forEach(function (x) { x.classList.remove('on'); });
+    g.querySelectorAll('.panel').forEach(function (x) { x.classList.remove('on'); });
+    t.classList.add('on');
+    document.getElementById(t.dataset.t).classList.add('on');
+  };
+});
+</script>
 <script>
 // Live figures from the public network. Deliberately fails quiet: if the
 // status server is unreachable the panel says so rather than showing zeros,

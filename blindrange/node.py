@@ -82,6 +82,14 @@ REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "0"))   # 0 = adaptive
 # batch from the store instead, targeting a complete sweep in this many
 # hours.
 REPAIR_SWEEP_H = float(os.environ.get("BR_REPAIR_SWEEP_H", "3"))
+# A three-hour sweep is right for maintenance and far too slow for backfill.
+# Measured when a fourth node joined: it gained 54 keys/s against peers at
+# 1.6M, an eight-hour convergence — while a single batch to that same node
+# went through at 32,000 keys/s, so repair was using half a percent of the
+# link. When a peer is visibly behind, sweep on this schedule instead.
+REPAIR_CATCHUP_H = float(os.environ.get("BR_REPAIR_CATCHUP_H", "0.25"))
+REPAIR_BEHIND_RATIO = float(os.environ.get("BR_REPAIR_BEHIND_RATIO", "0.9"))
+REPAIR_PEER_POLL = float(os.environ.get("BR_REPAIR_PEER_POLL", "60"))
 REPAIR_BATCH_MAX = int(os.environ.get("BR_REPAIR_BATCH_MAX", "20000"))
 REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
@@ -143,6 +151,7 @@ UPDATE_MAX_DEFER = float(os.environ.get("BR_UPDATE_MAX_DEFER", "3600"))
 
 
 _UPDATE_BROKEN = [""]
+UPDATE_BLOCKED_REASON = [""]      # surfaced in /stats and on the status page
 _INFLIGHT = [0]
 _LAST_OP = [0.0]
 _OP_LOCK = threading.Lock()
@@ -257,6 +266,11 @@ def _update_loop(secret):
                 # logged. A node that cannot update must be noisy about it.
                 why = (pull.stderr or pull.stdout or "").strip().splitlines()
                 msg = why[-1] if why else f"git exited {pull.returncode}"
+                # Also publish it. A warning that only reaches the journal
+                # is one nobody reads: this node sat three versions behind
+                # for an hour having said so once, an hour earlier, while
+                # the dashboard showed a cheerful "behind" and no reason.
+                UPDATE_BLOCKED_REASON[0] = msg
                 if _UPDATE_BROKEN[0] != msg:
                     _UPDATE_BROKEN[0] = msg
                     print(f"auto-update BLOCKED: {msg} "
@@ -264,6 +278,7 @@ def _update_loop(secret):
                           file=sys.stderr, flush=True)
                 continue
             _UPDATE_BROKEN[0] = ""
+            UPDATE_BLOCKED_REASON[0] = ""
             after = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                                    capture_output=True, text=True,
                                    timeout=20).stdout.strip()
@@ -978,6 +993,8 @@ def status_rows(store, peers, secret, hub):
         rows.append({"id": nid, "mode": "relay tenant" if is_via(e["addr"])
                      else "directly reachable", "keys": keys, "version": ver,
                      "build": build or 0,
+                     "update_blocked": (UPDATE_BLOCKED_REASON[0] if nid == me
+                                        else (stats or {}).get("update_blocked", "")),
                      "writes": (store.writes if nid == me
                                 else (stats or {}).get("writes", 0)) or 0,
                      "deletes": (store.deletes if nid == me
@@ -1139,6 +1156,7 @@ def status_fragment(rows, total):
         f"{'not reporting' if r.get('version') == 'unknown' else r.get('version', '?')}"
         f"{' · behind' if r.get('behind') else ''}"
         f"{' · modified' if str(r.get('version', '')).endswith('+dirty') else ''}"
+        f"{' · CANNOT SELF-UPDATE' if r.get('update_blocked') else ''}"
         f"</td>"
         f"<td class='num'>{r['age']}s</td>"
         f"<td class='num share'>{r['share'] if r.get('share') is not None else '—'}</td>"
@@ -1231,6 +1249,7 @@ def service_get(store, peers, path, query, quic=None, status=None):
                      "writes": store.writes, "deletes": store.deletes,
                      "disk_used": store.disk_used(),
                      "disk_cap": store.cap_bytes, "full": store.is_full(),
+                     "update_blocked": UPDATE_BLOCKED_REASON[0],
                      "peers": len(peers.live()),
                      "mode": "tenant" if is_via(peers.addr) else "direct",
                      "quic": quic is not None, "udp": peers.udp,
@@ -1264,7 +1283,7 @@ def _gossip_loop(peers: Peers, secret: str):
             pass                                       # peer down; TTL handles it
 
 
-def _repair_loop(store: Store, peers: Peers, secret: str):
+def _repair_loop(store: Store, peers: Peers, secret: str, hub=None):
     # The cursor MUST outlive the process. It used to be a local reset to ""
     # on every start, so each restart swept the keyspace from the beginning
     # again — harmless when a node ran for weeks, and quietly crippling once
@@ -1272,6 +1291,7 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
     # sweep interrupted every five minutes never gets past its first few
     # percent, so a newly joined node stops filling and nothing says why.
     cursor = store.get_meta("repair_cursor", "")
+    last_poll, catching_up = 0.0, False
     while True:
         time.sleep(REPAIR_EVERY + random.random())
         if peers.stable_since() < REPAIR_SETTLE:
@@ -1286,12 +1306,40 @@ def _repair_loop(store: Store, peers: Peers, secret: str):
                     groups={nid: failure_group(e["addr"], e.get("udp", ""))
                             for nid, e in live.items()})
         addr_of = {nid: e["addr"] for nid, e in live.items()}
+        mine = store.count()
+        # Is anyone visibly behind? Checked on a slow poll, because it costs
+        # a /stats round trip per peer and the answer changes slowly.
+        now_t = time.time()
+        if now_t - last_poll > REPAIR_PEER_POLL:
+            last_poll = now_t
+            # Never let this decision kill the loop. Reaching for peer stats
+            # without the relay hub in scope raised NameError on the first
+            # poll, the repair thread died, and replication stopped network
+            # wide with nothing logged — the tests caught it as "0 keys
+            # migrated", which is the only symptom there would have been.
+            try:
+                behind = False
+                for nid, e in live.items():
+                    if nid == peers.ident.node_id:
+                        continue
+                    st = _peer_stats(nid, e, secret, hub, peers.ident.node_id)
+                    keys = (st or {}).get("keys")
+                    if (keys is not None and mine > 0
+                            and keys < mine * REPAIR_BEHIND_RATIO):
+                        behind = True
+                        break
+                catching_up = behind
+            except Exception as e:
+                print(f"repair: could not poll peers ({type(e).__name__}: "
+                      f"{e}) — staying on the maintenance schedule",
+                      file=sys.stderr, flush=True)
+                catching_up = False
         if REPAIR_BATCH:
             size = REPAIR_BATCH
         else:
-            rounds = max(1.0, REPAIR_SWEEP_H * 3600 / max(0.1, REPAIR_EVERY))
-            size = int(min(REPAIR_BATCH_MAX,
-                           max(200, store.count() / rounds)))
+            hours = REPAIR_CATCHUP_H if catching_up else REPAIR_SWEEP_H
+            rounds = max(1.0, hours * 3600 / max(0.1, REPAIR_EVERY))
+            size = int(min(REPAIR_BATCH_MAX, max(200, mine / rounds)))
         batch = store.batch_after(cursor, size)
         if not batch:                       # wrapped: start the next sweep
             cursor = ""
@@ -1623,7 +1671,7 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
                          daemon=True).start()
     threading.Thread(target=_gossip_loop, args=(peers, secret),
                      daemon=True).start()
-    threading.Thread(target=_repair_loop, args=(store, peers, secret),
+    threading.Thread(target=_repair_loop, args=(store, peers, secret, hub),
                      daemon=True).start()
     threading.Thread(target=_vacuum_loop, args=(store,), daemon=True).start()
     threading.Thread(target=_reachability_loop,

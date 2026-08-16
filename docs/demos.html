@@ -74,7 +74,10 @@ do: <b>see whether it works</b>, <b>put real data in</b>, or <b>check the
 claims yourself</b> — including the attacks we run against our own design.</div>
 
 <pre><span class="c"># all of these assume the package and, optionally, the public network</span>
-git clone https://github.com/alviso/blindrange &amp;&amp; cd blindrange &amp;&amp; pip install -e .</pre>
+git clone https://github.com/alviso/blindrange &amp;&amp; cd blindrange
+python3 -m venv .venv &amp;&amp; .venv/bin/pip install -e .
+<span class="c"># then run the demos with .venv/bin/python3. A venv is not politeness:
+# most current Pythons refuse to install into the system one at all.</span></pre>
 
 <h2>See whether it works</h2>
 <div class="why">Sixty seconds, no account, nothing stored anywhere you care

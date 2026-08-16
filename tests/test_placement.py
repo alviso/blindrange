@@ -193,3 +193,44 @@ class TestRepairCursorDurability(unittest.TestCase):
         st.put([("R:a", "v")])
         st.set_meta("repair_cursor", "R:a")
         self.assertEqual([k for k, _ in st.batch_after("", 100)], ["R:a"])
+
+
+class TestRepairCatchup(unittest.TestCase):
+    """Repair has two jobs with different urgencies.
+
+    Keeping a settled network converged is maintenance and can take hours.
+    Filling a node that just joined is backfill, and at maintenance pace it
+    took eight hours while using half a percent of the available link — the
+    node fell further behind than it caught up.
+    """
+
+    def test_catchup_is_much_faster_than_maintenance(self):
+        import blindrange.node as node
+        self.assertLess(node.REPAIR_CATCHUP_H, node.REPAIR_SWEEP_H)
+        self.assertGreaterEqual(node.REPAIR_SWEEP_H / node.REPAIR_CATCHUP_H, 4,
+                                "catch-up must be materially faster")
+
+    def test_batch_sizes_differ_by_the_same_factor(self):
+        import blindrange.node as node
+        keys = 1_000_000
+
+        def batch(hours):
+            rounds = max(1.0, hours * 3600 / node.REPAIR_EVERY)
+            return min(node.REPAIR_BATCH_MAX, max(200, keys / rounds))
+
+        self.assertGreater(batch(node.REPAIR_CATCHUP_H),
+                           batch(node.REPAIR_SWEEP_H) * 3)
+
+    def test_behind_threshold_is_a_real_gap_not_noise(self):
+        """Nodes are never exactly equal — churn and timing see to that. The
+        trigger has to ignore ordinary drift or every node is always
+        'catching up' and the slow sweep never applies."""
+        import blindrange.node as node
+        self.assertLess(node.REPAIR_BEHIND_RATIO, 1.0)
+        self.assertGreaterEqual(node.REPAIR_BEHIND_RATIO, 0.5)
+
+    def test_peer_polling_is_throttled(self):
+        """Deciding this costs a /stats round trip per peer, and the answer
+        changes slowly."""
+        import blindrange.node as node
+        self.assertGreaterEqual(node.REPAIR_PEER_POLL, 10)

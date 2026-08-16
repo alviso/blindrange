@@ -199,7 +199,8 @@ always-on seed:
 ```bash
 pip install -e .
 blindrange-node --port 7501 --data ~/.blindrange/n1 \
-    --seed seed.blindrange.dev:7501 --secret blindrange-public
+    --seed seed.blindrange.dev:7501 --secret blindrange-public \
+    --max-disk 20GB
 ```
 
 No port forwarding needed: if your machine isn't reachable, it self-assembles
@@ -256,6 +257,42 @@ one party ran six: keys with every replica captured fell from **26.8% to
 0.4%**. Where the network is genuinely homogeneous — three nodes in one
 subnet, which is ours today — it still places a full replica set rather
 than refusing to write.
+
+### Windows
+
+```powershell
+py -m venv .venv
+.venv\Scripts\python -m pip install -e ".[quic]"
+
+.venv\Scripts\python -m blindrange.node --port 7501 `
+    --data $env:USERPROFILE\.blindrange\n1 `
+    --seed seed.blindrange.dev:7501 --secret blindrange-public `
+    --max-disk 20GB --auto-update
+```
+
+Call the venv's Python directly rather than activating — it sidesteps
+PowerShell's execution policy, and there is no activation state to forget.
+If `aioquic` has no wheel for your Python version, drop `[quic]`: you lose
+direct peer-to-peer paths, not the node. Windows Defender will ask to allow
+Python on the network; declining leaves the node reachable only via a relay.
+
+With `--auto-update`, Windows runs the node under a small supervisor
+process, because it has no call that replaces a running process in place.
+On an update you will see the node restart and the shell keep hold of it —
+Ctrl+C still stops both.
+
+### Disk use
+
+`--max-disk` accepts `20GB` or a percentage of the drive such as `5%`. Past
+the limit a node returns 507 and stops accepting writes, **including
+node-to-node repair** — repair is how most data arrives, so exempting it
+would make the limit decorative. Data already stored is never deleted to
+get under a limit you lower: that would destroy replicas. The node stops
+accepting and shrinks as the network migrates data elsewhere.
+
+Storage is reclaimed automatically. SQLite reuses free pages but never
+returns them, so a churning node's file grows well past the data it holds —
+measured at 1053 MB for 195 MB of live data before this was fixed.
 
 Nodes are **self-healing**: each continuously walks its own keys in small
 batches (tunable via `BR_REPAIR_EVERY` / `BR_REPAIR_BATCH`) and re-pushes
