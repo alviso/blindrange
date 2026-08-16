@@ -179,7 +179,8 @@ measured and published</b>.</div>
 </div>
 
 <div class="btns">
-  <a class="btn primary" href="/build">Build on it</a>
+  <a class="btn primary" href="/build">Build on it — SQL</a>
+  <a class="btn" href="/build-python">Build on it — Python</a>
   <a class="btn" href="https://github.com/alviso/blindrange">GitHub</a>
   <a class="btn" href="/demos">Demos</a>
   <a class="btn" href="/audit">Audit log</a>
@@ -332,10 +333,12 @@ case where there is no trade: append-only is what the index already is,
 tamper-evidence falls out of per-record AEAD, and the queries audit logs
 actually use are the three this index is fastest at. For most data "the
 vendor can read it" is tolerated; for an audit trail it is a liability.</p>
-<p><a href="/build"><b>Build on it →</b></a> nine steps from an empty
-directory to an application whose storage provider cannot read it: schema
-design, connecting, and every CRUD operation. The samples are quoted from a
-script the test suite runs, so the guide cannot drift from working code.</p>
+<p><a href="/build"><b>Build on it →</b></a> CREATE TABLE, INSERT,
+SELECT, UPDATE, DELETE — familiar verbs over storage that cannot read any
+of it. Shaped like SQL, deliberately not SQL: everything the engine cannot
+do is refused with the reason, and every sample is quoted from a script
+the test suite runs. The <a href="/build-python">Python guide</a> is the
+same ground with the full API.</p>
 
 <p><a href="/audit"><b>blindrange-audit →</b></a> ships from Vector, Fluent
 Bit or the OpenTelemetry Collector with configuration alone, has no delete

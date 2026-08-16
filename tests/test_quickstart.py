@@ -58,23 +58,41 @@ class TestQuickstartRuns(unittest.TestCase):
         self.assertFalse(os.path.exists(f"{self.tmp}/qs.brdb"),
                          "it left its state file behind")
 
-    def test_the_guide_quotes_code_that_exists(self):
-        """Every python line the page shows must appear in the script.
+    def test_the_sql_quickstart_runs_too(self):
+        out = subprocess.run(
+            [sys.executable, "examples/sql_quickstart.py",
+             "--state", f"{self.tmp}/sqlqs",
+             "--bootstrap", f"127.0.0.1:{PORT}", "--secret", "qs"],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=600)
+        self.assertEqual(out.returncode, 0,
+                         f"sql_quickstart failed:\n{out.stdout[-2000:]}\n"
+                         f"{out.stderr[-2000:]}")
+        for phrase in ("CREATE TABLE", "rows_affected", "refused:",
+                       "cleaned up"):
+            self.assertIn(phrase, out.stdout, f"missing: {phrase}")
 
-        The point of quoting a runnable file is lost the moment the page
-        carries a snippet nobody executes.
+    def test_the_guides_quote_code_that_exists(self):
+        """Every line either page shows must appear in its paired script.
+
+        The point of quoting a runnable file is lost the moment a page
+        carries a snippet nobody executes. Two guides, two scripts, one
+        rule.
         """
-        page = (ROOT / "docs" / "build.html").read_text()
-        script = (ROOT / "examples" / "quickstart.py").read_text()
-        quoted = re.findall(r'<code class="from-quickstart">(.*?)</code>',
-                            page, re.S)
-        self.assertTrue(quoted, "the page quotes nothing from the script")
         import html as _html
-        for block in quoted:
-            for line in block.splitlines():
-                line = _html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
-                if not line or line.startswith("#"):
-                    continue
-                self.assertIn(line, script,
-                              f"the page shows a line the script does not "
-                              f"contain: {line!r}")
+        pairs = [("docs/build.html", "examples/sql_quickstart.py"),
+                 ("docs/build-python.html", "examples/quickstart.py")]
+        for page_path, script_path in pairs:
+            page = (ROOT / page_path).read_text()
+            script = (ROOT / script_path).read_text()
+            quoted = re.findall(
+                r'<code class="from-quickstart">(.*?)</code>', page, re.S)
+            self.assertTrue(quoted, f"{page_path} quotes nothing")
+            for block in quoted:
+                for line in block.splitlines():
+                    line = _html.unescape(
+                        re.sub(r"<[^>]+>", "", line)).strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    self.assertIn(line, script,
+                                  f"{page_path} shows a line missing from "
+                                  f"{script_path}: {line!r}")
