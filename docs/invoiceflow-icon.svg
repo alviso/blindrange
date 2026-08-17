@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- InvoiceFlow app icon: an invoice sheet whose last line flows off
+       the page. Tile matches the app's primary hsl(222 47% 11%); the
+       flow line is the PDF accent blue #3b82f6. Flat colors on purpose:
+       gradients rasterize unreliably across SVG renderers. -->
+  <rect width="512" height="512" rx="114" fill="#0f172a"/>
+  <!-- sheet with folded corner -->
+  <path d="M166 112 h116 l70 70 v202 a22 22 0 0 1 -22 22 H166 a22 22 0 0 1 -22 -22 V134 a22 22 0 0 1 22 -22 Z"
+        fill="#f8fafc"/>
+  <path d="M282 112 l70 70 h-54 a16 16 0 0 1 -16 -16 Z" fill="#cbd5e1"/>
+  <!-- ruled item lines -->
+  <rect x="178" y="216" width="130" height="16" rx="8" fill="#cbd5e1"/>
+  <rect x="178" y="254" width="102" height="16" rx="8" fill="#cbd5e1"/>
+  <!-- the last line flows off the invoice -->
+  <path d="M178 306 h92 c56 0 74 -16 98 -58 12 -21 24 -34 42 -44"
+        fill="none" stroke="#3b82f6" stroke-width="28" stroke-linecap="round"/>
+</svg>

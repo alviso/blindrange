@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Built on blindrange</title>
+<meta name="description" content="Applications running on the public network — storage that cannot read their data. Each entry says what is real: what it stores, what it measured, what it cost.">
+<meta property="og:title" content="Built on blindrange">
+<meta property="og:description" content="Applications running on the public network, described the way we describe everything: what is real, what was measured, what it cost.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/apps">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:34px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code { color:var(--warn); }
+  .app { background:var(--panel); border:1px solid var(--line);
+         border-radius:12px; padding:22px 24px; margin:18px 0;
+         display:flex; gap:20px; align-items:flex-start; }
+  .app img { width:64px; height:64px; border-radius:14px; flex:none;
+             margin-top:4px; }
+  .app h2 { font-size:22px; margin:0 0 2px; }
+  .app h2 a { color:var(--txt); }
+  .app h2 a:hover { color:var(--acc); text-decoration:none; }
+  .what { color:var(--dim); font-size:14px; margin-bottom:10px; }
+  .stats { display:flex; flex-wrap:wrap; gap:8px 18px; font-size:13px;
+           color:var(--dim); margin-top:12px; }
+  .stats b { color:var(--ok); font-weight:normal; }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--acc); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim);
+          margin:26px 0 0; }
+  .note b { color:var(--txt); font-weight:normal; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+  @media (max-width:560px) { .app { flex-direction:column; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Built on <span>blindrange</span></h1>
+<div class="tag">Applications running on the public network, described the
+way we describe everything here: <b>what is real, what was measured, what
+it cost.</b></div>
+
+<div class="app">
+  <img src="/invoiceflow-icon.svg" alt="InvoiceFlow icon" width="64" height="64">
+  <div>
+    <h2><a href="https://invoiceflow.tech">InvoiceFlow</a></h2>
+    <div class="what">Invoicing for small businesses — FastAPI + React,
+    live at <a href="https://invoiceflow.tech">invoiceflow.tech</a>.</div>
+    <p>The first production application to run on this network with
+    <b>no other database behind it</b>. The cutover was earned, not
+    announced: dual mode first, every record written to MongoDB and
+    blindrange side by side with count verification at each step, then a
+    final drill that killed the network for 40 seconds in production —
+    reads kept answering from the local mirror, and the one write caught
+    in the outage landed when the network returned. Then Mongo was
+    retired. The app keeps its keys; invoices cross the wire sealed; the
+    nodes store records they cannot read.</p>
+    <p>It also shaped the engine. The local-first mirror,
+    <code>KEY</code> columns, network-atomic sequences, one-barrier
+    batching and the refusing-absence-from-silence rule each exist
+    because this migration hit the wall they remove.</p>
+    <div class="stats">
+      <span>reads <b>0.4–0.6s</b> end-to-end (mirror-local)</span>
+      <span>invoice create <b>0.8s</b> (was 9s pre-batching)</span>
+      <span>40s total network loss: <b>zero user impact</b></span>
+      <span>Mongo retired <b>2026-08-17</b></span>
+    </div>
+  </div>
+</div>
+
+<div class="note"><b>Building something on blindrange?</b> The arrangement
+InvoiceFlow got is available to you too: hit a wall, report it, and the
+wall becomes an engine feature with your measurement in the commit
+message. <a href="https://github.com/alviso/blindrange/issues">Tell us
+what you hit</a> — or start from
+<a href="/build">the build guide</a>.</div>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/build">the SQL guide</a> ·
+<a href="/build-python">the Python guide</a> ·
+<a href="/build-node">the Node.js guide</a> ·
+<a href="/demos">demos</a> ·
+<a href="https://status.blindrange.dev/">live network</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>

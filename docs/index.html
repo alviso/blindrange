@@ -353,23 +353,14 @@ and an off-site backup demo built on it whose catalog stays searchable. All
 of it, plus the attack harness we run against our own design, is on the
 <a href="/demos"><b>demos page →</b></a></p>
 
-<h2 id="built">Built with blindrange</h2>
-<p><a href="https://invoiceflow.tech"><b>InvoiceFlow →</b></a> a production
-invoicing app (FastAPI&nbsp;+&nbsp;React) and the <b>first application to
-run on this network with no other database behind it</b>. The cutover was
-earned, not announced: dual mode first, every record written to MongoDB
-and blindrange side by side, count verification at each step, and
-a final drill that killed the network for 40 seconds in production — reads
-kept answering from the local mirror, and the one write caught in the
-outage landed when the network returned. Then Mongo was retired. The app
-keeps its keys; invoices cross the wire sealed; the nodes store records
-they cannot read.</p>
-<p>It is also the application that shaped the engine. The local-first
-mirror, <code>KEY</code> columns, network-atomic sequences and the
-refusing-absence-from-silence rule each exist because this migration hit
-the wall they remove. Building here? That arrangement is available to you
-too — <a href="https://github.com/alviso/blindrange/issues">tell us what
-you hit</a>.</p>
+<h2 id="built">Built on blindrange</h2>
+<p><a href="https://invoiceflow.tech"><b>InvoiceFlow</b></a> is the first
+production application to run on this network with <b>no other database
+behind it</b> — invoices sealed on machines that cannot read them, reads
+at local speed, and a cutover proven by a drill that killed the network
+for 40 seconds in production without a user noticing. The full story,
+with the numbers and what building it taught the engine, is on the
+<a href="/apps"><b>Built on blindrange page →</b></a></p>
 
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding
