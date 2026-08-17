@@ -47,10 +47,12 @@ query_multi([...]) — an AND of range/prefix predicates, intersected on
 record ids before any ciphertext is fetched. Results carry "_rid", the handle
 delete_many() takes.
 """
+import copy
 import hashlib
 import hmac
 import json
 import math
+from contextlib import contextmanager
 import os
 import random
 import ssl
@@ -618,6 +620,48 @@ class Owner:
                            f"within {timeout}s — extreme contention or an "
                            f"unreachable network")
 
+    def next_values(self, name, n, timeout=30):
+        """Claim n sequence values in parallel waves: the latency of one
+        claim instead of n. Same contract as next_value — unique across
+        writers, monotonic, never reused — plus one more gap source worth
+        naming: values reserved here and never used (a crash, an
+        abandoned pool) are spent. Invoice numbering tolerates explained
+        gaps; that is why sequences promise uniqueness, not density.
+
+        Born from a field measurement: an invoice-create route paying
+        one ~0.2-1s round trip PER NUMBER was the difference between a
+        9-second and a sub-second request. Reserve a block, hand the
+        numbers out locally, claim again when the block runs dry.
+        """
+        if n <= 0:
+            return []
+        kind = b"seq:" + str(name).encode()
+        seqs = self._st.setdefault("seqs", {})
+        i = int(seqs.get(str(name), 0))
+        i = max(i, self._discover_ends(
+            {"s": ((lambda j: self._sys_key(kind, j)), i)})["s"])
+        me = self._st["writer"]
+        payload = self._sys_encode(f"claimed:{me}")
+        won = []
+        deadline = time.time() + timeout
+        while len(won) < n and time.time() < deadline:
+            cands = list(range(i + 1, i + 1 + (n - len(won))))
+            i = cands[-1]
+            futs = {self.pool.submit(self._put_nx, self._sys_key(kind, j),
+                                     payload): j for j in cands}
+            for f in as_completed(futs):
+                if f.result():
+                    won.append(futs[f])
+            seqs[str(name)] = i
+        if len(won) < n:
+            self._save()
+            raise TimeoutError(
+                f"claimed {len(won)} of {n} values for sequence {name!r} "
+                f"within {timeout}s — extreme contention or an unreachable "
+                f"network (the {len(won)} are spent, not lost)")
+        self._save()
+        return sorted(won)
+
     # ------------------------------------------------------------ mirror
     def enable_mirror(self, sync_every=None):
         """Local-first mode: keep a complete local copy of this database's
@@ -765,6 +809,9 @@ class Owner:
         Outstanding un-awaited writes are capped, otherwise returning early
         just moves the bottleneck from the network into memory.
         """
+        if getattr(self, "_batch_puts", None) is not None:
+            self._batch_puts.extend(kv_pairs)
+            return
         want = max(1, min(int(self.write_acks), self.ring.replicas))
         by_node = {}
         for k, v in kv_pairs:
@@ -826,6 +873,49 @@ class Owner:
         self._inflight = set()
         self.flush_wallet()
 
+    @contextmanager
+    def batch(self):
+        """One quorum barrier for a whole request.
+
+        Every insert/update/delete inside the block is prepared normally
+        but its network writes are collected instead of sent; leaving the
+        block flushes them as ONE replicated write. A route that makes
+        seven engine calls pays seven barriers without this and one with
+        it — measured on the first production app, that is a 9-second
+        request against a sub-second one.
+
+        The contract, stated where it bites:
+        * Reads inside the block do NOT see the block's own writes —
+          they are not on the network or in the mirror yet. Read after
+          the block, or before the write.
+        * An exception inside the block sends NOTHING and rolls the
+          chain counters back — no holes, as if the block never ran.
+        * If the FLUSH itself fails, semantics are exactly today's
+          mid-route failure: quorum-acked keys exist, zero-acked raise.
+        * put_nx and sequences are network arbitration and cannot be
+          deferred; they still travel inside the block.
+        * One batch at a time, one thread writing. Nesting raises.
+        """
+        if getattr(self, "_batch_puts", None) is not None:
+            raise RuntimeError("batch() does not nest")
+        snap_chains = copy.deepcopy(self._st["chains"])
+        snap_tombs = copy.deepcopy(self._st["tombs"])
+        self._batch_puts, self._batch_dels = [], []
+        try:
+            yield self
+        except BaseException:
+            self._st["chains"] = snap_chains
+            self._st["tombs"] = snap_tombs
+            self._batch_puts = self._batch_dels = None
+            self._save()
+            raise
+        puts, dels = self._batch_puts, self._batch_dels
+        self._batch_puts = self._batch_dels = None
+        if puts:
+            self._put(puts)
+        if dels:
+            self._delete(dels)
+
     def _put_nx(self, key, value):
         """Insert-if-absent on all replicas. False if any replica already had
         the key (a concurrent writer won the slot)."""
@@ -862,6 +952,10 @@ class Owner:
         scale — measured on a live network, a compaction reporting 1,000,000
         entries dropped freed nothing at all.
         """
+        if (getattr(self, "_batch_dels", None) is not None
+                and not getattr(self, "_delete_everywhere", False)):
+            self._batch_dels.extend(keys)
+            return
         PROBE_EXTRA = 3
         keys = list(keys)
         for start in range(0, len(keys), self.CHUNK):

@@ -903,8 +903,12 @@ class Connection:
                 new[c + "@plain"] = str(changes[c])
                 new[c] = o.key_bucket(c, str(changes[c]))
             replacements.append(new)
-        o.delete_many([r["_rid"] for r in rows])
-        o.insert_many(replacements)
+        # One quorum barrier for the delete+insert pair instead of two:
+        # same crash exposure as the sequential form (a mid-flight failure
+        # can leave a visible duplicate, never a hole), half the latency.
+        with o.batch():
+            o.delete_many([r["_rid"] for r in rows])
+            o.insert_many(replacements)
         self._dirty.add(name)
         self._maybe_compact(name)
         return [{"rows_affected": len(rows)}]
