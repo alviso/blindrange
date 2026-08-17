@@ -1,6 +1,6 @@
 {
   "name": "blindrange",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Range queries over storage that cannot read your data. SQL-shaped statements over the blindrange network; runs the reference client, so there is nothing to drift.",
   "license": "MIT",
   "repository": {
@@ -21,11 +21,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@alviso/blindrange-python-darwin-arm64": "0.1.0",
-    "@alviso/blindrange-python-darwin-x64": "0.1.0",
-    "@alviso/blindrange-python-linux-x64": "0.1.0",
-    "@alviso/blindrange-python-linux-arm64": "0.1.0",
-    "@alviso/blindrange-python-win32-x64": "0.1.0"
+    "@alviso/blindrange-python-darwin-arm64": "0.1.1",
+    "@alviso/blindrange-python-darwin-x64": "0.1.1",
+    "@alviso/blindrange-python-linux-x64": "0.1.1",
+    "@alviso/blindrange-python-linux-arm64": "0.1.1",
+    "@alviso/blindrange-python-win32-x64": "0.1.1"
   },
   "keywords": [
     "encrypted",

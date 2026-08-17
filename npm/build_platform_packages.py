@@ -171,6 +171,24 @@ def assemble(tag, triple, assets, urls, wheel, version):
             (shutil.rmtree(victim, ignore_errors=True)
              if victim.is_dir() else victim.unlink())
 
+    # npm tarballs cannot carry symlinks — npm pack silently drops them,
+    # which shipped a package whose python/bin/python3 (a symlink to
+    # python3.12) simply did not exist after install. ENOENT at spawn, in
+    # the clean-room test, on the very first try. Materialize every
+    # symlink as a copy of its target before packing; bytes are bytes.
+    import os
+    for path in sorted(pkg.rglob("*")):
+        if path.is_symlink():
+            target = path.resolve()
+            if target.is_file():
+                data = target.read_bytes()
+                mode = target.stat().st_mode
+                path.unlink()
+                path.write_bytes(data)
+                os.chmod(path, mode)
+            else:
+                path.unlink()          # dir symlinks: none we need
+
     exe = ("python/python.exe" if tag.startswith("win32")
            else "python/bin/python3")
     (pkg / "index.js").write_text(
