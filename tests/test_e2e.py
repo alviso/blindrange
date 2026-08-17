@@ -160,17 +160,26 @@ class TestE2E(unittest.TestCase):
         # membership has genuinely buried the dead, which is what real
         # recovery looks like.
         import blindrange.client as _c
-        dead = {f"127.0.0.1:{BASE + 2}", f"127.0.0.1:{BASE + 4}"}
+        dead_ports = {str(BASE + 2), str(BASE + 4)}
+
+        def still_dead_in_view():
+            # by PORT, not exact string: the corpses' roster entries can
+            # carry whatever address form they gossiped last (loopback,
+            # pre-discovery 0.0.0.0) — an exact-string check went blind
+            # across one such change and buried nobody
+            return {a for a in self.owner._addr_of.values()
+                    if a.rsplit(":", 1)[-1] in dead_ports}
+
         old_live = _c.PEER_LIVE_S
         _c.PEER_LIVE_S = 12          # fixture nodes purge at 15s anyway
         try:
             deadline = time.time() + 60
             while time.time() < deadline:
                 self.owner.refresh_membership()
-                if not dead & set(self.owner._addr_of.values()):
+                if not still_dead_in_view():
                     break
                 time.sleep(1)
-            self.assertFalse(dead & set(self.owner._addr_of.values()),
+            self.assertFalse(still_dead_in_view(),
                              "the dead pair never left membership")
         finally:
             _c.PEER_LIVE_S = old_live
@@ -185,10 +194,10 @@ class TestE2E(unittest.TestCase):
         deadline = time.time() + 90
         while time.time() < deadline:
             self.owner.refresh_membership()
-            if not dead & set(self.owner._addr_of.values()):
+            if not still_dead_in_view():
                 break
             time.sleep(1)
-        self.assertFalse(dead & set(self.owner._addr_of.values()),
+        self.assertFalse(still_dead_in_view(),
                          "the dead pair re-entered the default-threshold view")
 
     def test_05_node_join_via_gossip(self):
@@ -208,17 +217,22 @@ class TestE2E(unittest.TestCase):
         # serve a corpse (purge runs on merge, /peers serves the raw
         # snapshot) re-admitted the dead here and carried them into every
         # later test. The CI refusals named exactly this pair.
-        dead = {f"127.0.0.1:{BASE + 2}", f"127.0.0.1:{BASE + 4}"}
+        dead_ports = {str(BASE + 2), str(BASE + 4)}
+
+        def zombies():
+            return {a for a in self.owner._addr_of.values()
+                    if a.rsplit(":", 1)[-1] in dead_ports}
+
         deadline = time.time() + 30
         while time.time() < deadline:
             self.owner.refresh_membership()
-            got = set(self.owner._addr_of.values())
-            if f"127.0.0.1:{port}" in got and not dead & got:
+            if (f"127.0.0.1:{port}" in self.owner._addr_of.values()
+                    and not zombies()):
                 break
             time.sleep(0.5)
         self.assertIn(f"127.0.0.1:{port}",
                       self.owner._addr_of.values())
-        self.assertFalse(dead & set(self.owner._addr_of.values()),
+        self.assertFalse(zombies(),
                          "the dead pair re-entered the view in test_05")
         self.assert_query("amount", 100_000, 300_000)   # failover + read-repair
 

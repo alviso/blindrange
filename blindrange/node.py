@@ -901,6 +901,34 @@ class Peers:
         self.contacts = set()              # bare seed addrs (no identity yet)
         self.changed_at = time.time()
 
+    def _advertisable(self):
+        """False while our own address is unspecified (bound wide,
+        public address not yet discovered): gossiping 0.0.0.0:port would
+        hand every peer a phantom that resolves to THEMSELVES. We stay
+        out of the roster until we have an address someone else can
+        dial; discovery takes seconds."""
+        if is_via(self.addr):
+            return True
+        host = self.addr.rsplit(":", 1)[0] if ":" in self.addr else ""
+        return host not in ("", "0.0.0.0", "::")
+
+    def _stamp_self(self):
+        if self._advertisable():
+            self.table[self.ident.node_id] = self.ident.heartbeat(
+                self.addr, self.udp)
+        else:
+            # Bound wide, public address not yet discovered. Advertise
+            # loopback rather than 0.0.0.0 (a phantom that resolves to
+            # the DIALER) and rather than nothing (a solo node — every
+            # new network's first node — has no peer to discover
+            # through and would stay invisible forever). Loopback is
+            # the pre-discovery truth: reachable exactly where the old
+            # 127.0.0.1 default was, upgraded the moment a peer tells
+            # us our real address.
+            port = self.addr.rsplit(":", 1)[-1]
+            self.table[self.ident.node_id] = self.ident.heartbeat(
+                f"127.0.0.1:{port}", self.udp)
+
     def merge(self, other: dict):
         now = time.time()
         with self.lock:
@@ -919,8 +947,7 @@ class Peers:
                     if not cur:
                         self.changed_at = now
                     self.table[nid] = e
-            self.table[self.ident.node_id] = self.ident.heartbeat(
-                self.addr, self.udp)
+            self._stamp_self()
             dead = [nid for nid, e in self.table.items()
                     if now - e["ts"] / 1000 > PEER_TTL
                     and nid != self.ident.node_id]
@@ -930,8 +957,7 @@ class Peers:
 
     def snapshot(self):
         with self.lock:
-            self.table[self.ident.node_id] = self.ident.heartbeat(
-                self.addr, self.udp)
+            self._stamp_self()
             return dict(self.table)
 
     def live(self):
@@ -1034,14 +1060,18 @@ def post_any(addr, path, payload: bytes, secret: str, timeout=5):
 # --------------------------------------------------------------- services
 # Request handling shared by the HTTP server and the tenant envelope loop.
 
-def service_post(store, peers, hub, secret, path, data, quic=None):
+def service_post(store, peers, hub, secret, path, data, quic=None,
+                 client_ip=None):
     if path in DATA_PATHS:
         with _op():
-            return _service_post(store, peers, hub, secret, path, data, quic)
-    return _service_post(store, peers, hub, secret, path, data, quic)
+            return _service_post(store, peers, hub, secret, path, data,
+                                 quic, client_ip)
+    return _service_post(store, peers, hub, secret, path, data, quic,
+                         client_ip)
 
 
-def _service_post(store, peers, hub, secret, path, data, quic=None):
+def _service_post(store, peers, hub, secret, path, data, quic=None,
+                  client_ip=None):
     if path == "/kv":
         entries = [(k, v) for k, v in data["entries"]]
         # Capacity is checked BEFORE the token gate, so a write we are going
@@ -1116,8 +1146,16 @@ def _service_post(store, peers, hub, secret, path, data, quic=None):
     if path == "/dialback":
         target = data.get("addr", "")
         asker = data.get("node_id", "")
+        observed = client_ip or ""
         if is_via(target):
             return 400, {"error": "dialback is for direct addresses"}
+        thost = target.rsplit(":", 1)[0] if ":" in target else ""
+        if thost in ("", "0.0.0.0", "::"):
+            # Nothing to probe -- but an unspecified address means
+            # the asker is really asking "what is my address?", and
+            # the answerer is the one party who can see it.
+            return 200, {"reachable": False, "probed": False,
+                         "observed": observed}
         # reachable only if the node that ANSWERS at the address is the node
         # that ASKED — otherwise the probe hit someone else (classic case: a
         # loopback advertise makes the prober dial its own node) and the
@@ -1128,7 +1166,8 @@ def _service_post(store, peers, hub, secret, path, data, quic=None):
             ok = bool(asker) and answered == asker
         except (OSError, ValueError):
             ok = False
-        return 200, {"reachable": ok}
+        return 200, {"reachable": ok, "probed": True,
+                     "observed": observed}
     if path == "/punch":
         # fired over the reliable relay path: open our NAT toward the caller
         target = data.get("udp", "")
@@ -1875,12 +1914,14 @@ def _vacuum_loop(store):
                   file=sys.stderr, flush=True)
 
 
-def _reachability_loop(store, peers, hub, secret, direct_addr):
+def _reachability_loop(store, peers, hub, secret, direct_addr,
+                       pinned=False):
     """Self-assembly: determine own reachability by dialback, become a relay
     tenant when unreachable, revert when reachable again."""
     ident = peers.ident
     time.sleep(DIALBACK_FIRST)
     relay_nid = None
+    port = direct_addr.rsplit(":", 1)[-1]
     while True:
         candidates = peers.live_direct()
         if candidates:
@@ -1891,11 +1932,42 @@ def _reachability_loop(store, peers, hub, secret, direct_addr):
                                            "node_id": ident.node_id}).encode(),
                                secret)
                 reachable = got.get("reachable", False)
+                observed = got.get("observed", "")
             except OSError:
                 reachable = None                       # probe failed; no info
-            if reachable is True and is_via(peers.addr):
-                peers.addr = direct_addr               # NAT opened up: go direct
+                observed = ""
+            # Self-discovery: a bind address is not an advertise. When the
+            # operator pinned nothing (--advertise absent), the advertised
+            # address starts as the bind — useless for dialback — but the
+            # probed peer SEES our real address and tells us. Adopt it if
+            # a second dialback proves it reachable. This is what makes
+            # "two commands" true on a server: two operators started their
+            # first two servers with the documented commands and both
+            # silently became relay tenants for want of this.
+            if (reachable is False and not pinned and observed
+                    and f"{observed}:{port}" != direct_addr):
+                cand = f"{observed}:{port}"
+                try:
+                    got2 = post_any(probe["addr"], "/dialback",
+                                    json.dumps(
+                                        {"addr": cand,
+                                         "node_id": ident.node_id}).encode(),
+                                    secret)
+                    if got2.get("reachable"):
+                        print(f"[reachability] discovered own public "
+                              f"address {cand} (as seen by "
+                              f"{probe['addr']}, dialback confirmed)",
+                              flush=True)
+                        direct_addr = cand
+                        reachable = True
+                except OSError:
+                    pass
+            if reachable is True and peers.addr != direct_addr:
+                peers.addr = direct_addr               # go (or return) direct
                 relay_nid = None
+                print(f"[reachability] dialback from {probe['addr']} "
+                      f"succeeded — DIRECT mode as {direct_addr}",
+                      flush=True)
             elif reachable is False:
                 pool = {n: e for n, e in candidates.items()}
                 if relay_nid not in pool and pool:
@@ -1904,6 +1976,26 @@ def _reachability_loop(store, peers, hub, secret, direct_addr):
                     via = f"via:{pool[relay_nid]['addr']}/{ident.node_id}"
                     if peers.addr != via:
                         peers.addr = via
+                        # The decision was always honest; now it is also
+                        # loud. A silent demotion cost a server operator
+                        # the direct mode one firewall rule away.
+                        seen = (f" (peers see you as {observed}; "
+                                f"{observed}:{port} did not answer)"
+                                if observed else "")
+                        print(
+                            f"[reachability] {direct_addr} is NOT "
+                            f"reachable from outside{seen} (dialback via "
+                            f"{probe['addr']} failed) — becoming a relay "
+                            f"tenant of {pool[relay_nid]['addr']}. On a "
+                            f"home connection this is normal and needs "
+                            f"nothing from you. On a SERVER it usually "
+                            f"means a firewall is eating inbound {port}: "
+                            f"open TCP and UDP {port} (firewalld: "
+                            f"firewall-cmd --add-port={port}/tcp "
+                            f"--add-port={port}/udp --permanent && "
+                            f"firewall-cmd --reload; ufw: ufw allow "
+                            f"{port}) and this node will return to "
+                            f"direct mode on its own.", flush=True)
                         threading.Thread(
                             target=_tenant_loop,
                             args=(store, peers, hub, secret,
@@ -2036,7 +2128,8 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
                 return
             data = json.loads(raw) if raw else {}
             code, obj = service_post(store, peers, hub, secret, path, data,
-                                     quic=quic)
+                                     quic=quic,
+                                     client_ip=self.client_address[0])
             self._json(obj, code)
 
         def do_GET(self):
@@ -2071,6 +2164,7 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
         issuer="", max_disk=""):
     os.makedirs(data_dir, exist_ok=True)
     addr = advertise or f"{host}:{port}"
+    pinned = bool(advertise)
     ident = Identity(data_dir)
     try:
         total = shutil.disk_usage(data_dir).total
@@ -2122,7 +2216,7 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
                      daemon=True).start()
     threading.Thread(target=_vacuum_loop, args=(store,), daemon=True).start()
     threading.Thread(target=_reachability_loop,
-                     args=(store, peers, hub, secret, addr),
+                     args=(store, peers, hub, secret, addr, pinned),
                      daemon=True).start()
     # Bind with a short retry. On a re-exec the outgoing process may not
     # have released the port yet — on Windows especially, where the
@@ -2151,8 +2245,15 @@ def run(host, port, data_dir, seeds, secret="", advertise=None,
 
 def main():
     ap = argparse.ArgumentParser(description="blindrange blind storage node")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="bind address (0.0.0.0 to serve a LAN)")
+    # Default is all interfaces because a storage node exists to be
+    # reached: the old 127.0.0.1 default silently forced every server
+    # started with the documented two commands into relay-tenant mode
+    # (loopback can never pass dialback) — two real operators hit it on
+    # their first two nodes. Behind NAT, binding wide costs nothing; a
+    # deliberate loopback node is still one flag away.
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address (default 0.0.0.0; use 127.0.0.1 "
+                         "for a deliberately local node)")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--data", required=True, type=os.path.expanduser,
                     help="data directory for this node")

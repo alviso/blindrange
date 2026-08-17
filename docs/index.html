@@ -395,6 +395,25 @@ and anything before pip 21 predates the packaging standard this project uses
 found</code>, which is true and completely unhelpful. If that still fails
 with a message about the Python version, the interpreter is too old and
 needs replacing rather than persuading.</p>
+<p class="dim"><b>Old Linux (Python older than 3.10)?</b> Don't fight the
+distro — drop in a prebuilt modern Python with
+<a href="https://docs.astral.sh/uv/">uv</a> (works on anything with glibc
+2.17+, i.e. CentOS 7 / Ubuntu 18.04 and newer):</p>
+<pre>curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e ".[quic]"</pre>
+<p class="dim"><b>Server joined as a relay tenant?</b> That is the
+reachability self-check being honest with you: something is stopping
+inbound 7501. On a datacenter machine that is usually the distro
+firewall — open TCP and UDP 7501 (firewalld: <code>firewall-cmd
+--add-port=7501/tcp --add-port=7501/udp --permanent &amp;&amp;
+firewall-cmd --reload</code>; ufw: <code>ufw allow 7501</code>) and the
+node returns to direct mode by itself within a minute — it re-checks
+continuously. (Nodes older than today's build also bound to loopback by
+default, which made tenancy certain on any server; the default is now
+all interfaces, and the node's log states which mode it is in and
+why.)</p>
 <p class="dim"><code>--max-disk</code> takes <code>20GB</code> or a
 percentage like <code>5%</code> of the drive. Past it the node stops
 accepting writes; <b>data it already holds is never deleted</b> to get under
