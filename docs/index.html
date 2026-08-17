@@ -353,6 +353,21 @@ and an off-site backup demo built on it whose catalog stays searchable. All
 of it, plus the attack harness we run against our own design, is on the
 <a href="/demos"><b>demos page →</b></a></p>
 
+<h2 id="built">Built with blindrange</h2>
+<p><a href="https://invoiceflow.tech"><b>InvoiceFlow →</b></a> a production
+invoicing app (FastAPI&nbsp;+&nbsp;React) migrating off MongoDB onto this
+public network. It runs in <b>dual mode</b> today — every record is written
+to both stores, reads flip as the verification drills pass — because that
+is what an honest cutover looks like, and we would rather show you one than
+claim it finished early. The app keeps its keys; invoices cross the wire
+sealed; the nodes store records they cannot read.</p>
+<p>It is also the application that shaped the engine. The local-first
+mirror, <code>KEY</code> columns, network-atomic sequences and the
+refusing-absence-from-silence rule each exist because this migration hit
+the wall they remove. Building here? That arrangement is available to you
+too — <a href="https://github.com/alviso/blindrange/issues">tell us what
+you hit</a>.</p>
+
 <h2 id="node" class="e">Run a node</h2>
 <p>Two commands. It works from behind a home router with no port forwarding
 and no configuration: if your node isn't reachable it diagnoses that itself
