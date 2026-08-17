@@ -25,6 +25,10 @@ def main():
     ap.add_argument("--bootstrap", default="seed.blindrange.dev:7501")
     ap.add_argument("--issuer", default="https://tokens.blindrange.dev")
     ap.add_argument("--account", default=os.environ.get("BR_ACCOUNT", ""))
+    ap.add_argument("--everything", action="store_true",
+                    help="sweep LIVE epochs too. Only for a database you "
+                         "have already drop()ped — on a live one this is "
+                         "data loss.")
     a = ap.parse_args()
     if not a.passphrase:
         import getpass
@@ -34,7 +38,7 @@ def main():
     if a.account:
         o.configure_tokens(a.issuer, a.account)
     t0 = time.time()
-    out = o.purge_orphans(verbose=True)
+    out = o.purge_orphans(verbose=True, everything=a.everything)
     mins = (time.time() - t0) / 60
     print(f"purged in {mins:.0f} min: {out['chain_keys_removed']:,} chain "
           f"keys and {out['blobs_removed']:,} blobs across epochs "

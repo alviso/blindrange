@@ -176,3 +176,42 @@ class TestGuards(PurgeCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEverythingMode(PurgeCase):
+    """everything=True is the post-drop() sweep: live epochs included,
+    nothing protected, in-flight markers ignored. On a live database that
+    is data loss, which is why it is a word you type and never a fallback."""
+
+    def test_sweeps_the_live_epoch_of_a_dead_database(self):
+        o = Owner.create(
+            f"{self.tmp}/dead.brdb", "pw",
+            {"amount": {"type": "int", "bits": 10, "leaf_width": 32}},
+            [f"127.0.0.1:{PORT}"], network_secret=SECRET)
+        o.insert_many([{"amount": i, "n": i} for i in range(50)])
+        o.drain()
+        self.assertTrue(o.query("amount", 0, 1023))
+
+        out = o.purge_orphans(everything=True)
+        self.assertGreater(out["chain_keys_removed"], 0)
+        self.assertEqual(o.query("amount", 0, 1023), [],
+                         "everything=True left live keys behind")
+
+    def test_ignores_an_inflight_marker(self):
+        o = Owner.create(
+            f"{self.tmp}/dead2.brdb", "pw",
+            {"amount": {"type": "int", "bits": 10, "leaf_width": 32}},
+            [f"127.0.0.1:{PORT}"], network_secret=SECRET)
+        o.insert_many([{"amount": i} for i in range(20)])
+        o.drain()
+        E = o._refresh_epoch()
+        slot = o._st["epoch_len"] + 1
+        o._put_nx(o._sys_key(b"epoch", slot), o._sys_encode(f"open:{E + 1}"))
+        o._st["epoch_len"] = slot
+        o._st["epoch"] = E + 1
+        o._st["chains"] = {}
+        o._save()
+        with self.assertRaises(RuntimeError):
+            o.purge_orphans()                       # the guard still guards
+        out = o.purge_orphans(everything=True)      # the dead path does not
+        self.assertGreater(out["chain_keys_removed"], 0)

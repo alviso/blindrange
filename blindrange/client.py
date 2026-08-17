@@ -1796,7 +1796,7 @@ class Owner:
     PURGE_MAX_LABELS = 65_536
     PURGE_FULL_DEPTH = 8
 
-    def purge_orphans(self, verbose=False):
+    def purge_orphans(self, verbose=False, everything=False):
         """Find and delete every key a crashed compaction stranded.
 
         purge_epochs() above re-walks dead epochs the way compaction did,
@@ -1839,23 +1839,35 @@ class Owner:
         is then still live for readers — finish it first with
         compact(resume=True).
         """
+        # `everything=True` is for a database you have already drop()ped:
+        # it sweeps LIVE epochs too, protects no rids, and ignores an
+        # in-flight compaction — because on a dead database "in flight"
+        # only means the crash happened mid-compaction, and resuming a
+        # multi-hour rewrite purely to then delete its output would be
+        # faithful, expensive nonsense. On a live database this flag is
+        # data loss, which is why it is a word you must type and not a
+        # fallback the guard quietly takes.
         self._refresh_epoch()
-        if len(self._epochs()) > 1:
+        if not everything and len(self._epochs()) > 1:
             raise RuntimeError(
                 "a compaction is in flight (or died mid-flight), so the "
                 "previous epoch is still live for readers. Finish it with "
-                "compact(resume=True), then purge.")
+                "compact(resume=True), then purge — or, if this database "
+                "was already drop()ped, purge_orphans(everything=True) "
+                "sweeps live epochs too.")
         writers = self._refresh_writers() or [self._st["writer"]]
         current = self._st["epoch"]
-        if current == 0:
+        if current == 0 and not everything:
             return {"epochs": [], "chain_keys_removed": 0,
-                    "blobs_removed": 0, "beyond_gallop": 0}
+                    "blobs_removed": 0, "beyond_gallop": 0,
+                    "coverage": "full"}
 
         say = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
         live_entries = self._walk_epoch(current, writers)[0]
         live_rids = set()
-        for rids in live_entries.values():
-            live_rids.update(rids)
+        if not everything:
+            for rids in live_entries.values():
+                live_rids.update(rids)
 
         # Which labels to sweep. A field's full label set is 2^(mlvl+1) —
         # 2,046 for a 22-bit field at leaf 4096, over a million for a
@@ -1908,7 +1920,7 @@ class Owner:
         epochs_touched = []
         dead_rids = set()
         coverage = "full"
-        for E in range(0, current):
+        for E in range(0, current + (1 if everything else 0)):
             found_keys = []
             for field, spec in list(self._st["schema"].items()) + [(TOMB, None)]:
                 if field != TOMB:
