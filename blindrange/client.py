@@ -105,6 +105,9 @@ class Owner:
         self._no_direct_until = {}         # node_id -> retry-after ts
         self.direct_requests = 0           # served over punched QUIC paths
         self.path_map = {}                 # node_id -> ("quic"|"relay", ts)
+        self._mirror = None
+        self._sync_stop = threading.Event()
+        self._tls = threading.local()      # per-thread mirror bypass
         self.refresh_membership()
 
     @classmethod
@@ -542,6 +545,97 @@ class Owner:
             raise ConnectionError(f"relayed request failed: {out}")
         return json.loads(b64decode(out["body_b64"]))
 
+    # ------------------------------------------------------------ mirror
+    def enable_mirror(self, sync_every=None):
+        """Local-first mode: keep a complete local copy of this database's
+        encrypted keys, answer reads from it, and reconcile with the
+        network in the background.
+
+        This is the practicality feature. The first real application
+        measured 1.5-2s point reads and 4-10s page loads against the
+        public network, because with the WAN in the read path, proving a
+        key ABSENT waits for the slowest NAT'd replica — and most of what
+        an index does is prove absence. With the mirror, reads (hits,
+        absence, counts, cold opens) are local; only writes touch the
+        network, and only for what the network is actually for:
+        durability on machines that cannot read the data.
+
+        Freshness contract: your own writes are always current
+        (write-through). Other writers' data is as fresh as the last sync
+        pass; while no pass has completed recently, misses fall back to
+        the network — the pre-mirror behaviour. Correctness degrades to
+        slowness, never to wrong answers. sync() forces a pass when you
+        need to see a teammate's write right now.
+        """
+        from .mirror import Mirror
+        if self._mirror is None:
+            self._mirror = Mirror(self._path + ".mirror")
+            every = float(sync_every if sync_every is not None
+                          else os.environ.get("BR_MIRROR_SYNC_S", "20"))
+            t = threading.Thread(target=self._sync_loop, args=(every,),
+                                 daemon=True)
+            t.start()
+        return self._mirror
+
+    def close(self):
+        """Stop the sync thread and release the mirror. Optional — both are
+        daemon-safe — but a clean close avoids a noisy last gasp when the
+        interpreter tears down mid-pass."""
+        self._sync_stop.set()
+        if self._mirror is not None:
+            self._mirror.close()
+            self._mirror = None
+
+    def sync(self):
+        """One reconcile pass: walk everything reachable in the current
+        epoch(s) with warm caches and land it in the mirror. Uses the same
+        machinery queries use, so it cannot disagree with them."""
+        if self._mirror is None:
+            return
+        # The pass must SEE the network, not its own cache: discovery reads
+        # through a fresh mirror report new chain entries as absent, and
+        # the sync that was meant to find growth becomes the reason it
+        # never can. Bypass is per-thread, so application queries running
+        # concurrently keep their locality.
+        self._tls.bypass_mirror = True
+        try:
+            self._sync_inner()
+        finally:
+            self._tls.bypass_mirror = False
+
+    def _sync_inner(self):
+        writers = self._refresh_writers(force=True)
+        self._refresh_epoch(force=True)
+        for E in self._epochs():
+            entries, keys = self._walk_epoch(E, writers)
+            if keys:
+                got = self._mget(keys)
+                self._mirror.put_many(list(got.items()))
+            rids = {r for lst in entries.values() for r in lst}
+            blob_keys = ["R:" + r for r in rids]
+            if blob_keys:
+                have = self._mirror.get_many(blob_keys)
+                missing = [k for k in blob_keys if k not in have]
+                if missing:
+                    got = self._mget(missing)
+                    self._mirror.put_many(list(got.items()))
+        self._refresh_tombs(writers)
+        self._mirror.mark_synced()
+
+    def _sync_loop(self, every):
+        while not self._sync_stop.is_set():
+            try:
+                self.sync()
+            except RuntimeError as e:
+                if "after shutdown" in str(e):
+                    return          # interpreter exit race; nothing to say
+                print(f"mirror sync failed (RuntimeError: "
+                      f"{str(e)[:100]}) — will retry", flush=True)
+            except Exception as e:      # background: loud, never fatal
+                print(f"mirror sync failed ({type(e).__name__}: "
+                      f"{str(e)[:100]}) — will retry", flush=True)
+            self._sync_stop.wait(every)
+
     def _put(self, kv_pairs):
         """Replicated write that returns once each key has `write_acks`
         confirmations, leaving the rest in flight (hedged writes).
@@ -598,6 +692,11 @@ class Owner:
                     continue
         if any(n == 0 for n in acks.values()):
             raise ConnectionError("write not durable: some keys got zero ACKs")
+        if self._mirror is not None:
+            # Write-through AFTER the durability floor: the mirror must
+            # never hold a key the network rejected, or a local read would
+            # show a row that dies with this machine.
+            self._mirror.put_many(list(kv_pairs))
 
     def _track(self, futures):
         """Keep un-awaited writes bounded so early return cannot balloon."""
@@ -633,6 +732,13 @@ class Owner:
                     won = False
             except OSError:
                 continue
+        if self._mirror is not None:
+            if won:
+                self._mirror.put_many([(key, value)])
+            else:
+                # Somebody else's value won; ours is a lie. Forget it and
+                # let read-through fetch the winner.
+                self._mirror.delete_many([key])
         return won
 
     CHUNK = 4000          # keys per request; see _delete
@@ -660,8 +766,41 @@ class Owner:
                     for a, ks in by_node.items()]
             for j in jobs:
                 _ok(j)
+        if self._mirror is not None:
+            self._mirror.delete_many(list(keys))
 
     def _mget(self, keys):
+        """Mirror-first read; the network only sees what the mirror lacks.
+
+        Every read in the system funnels through here — queries, gallop
+        probes, counts, blob fetches — so this one branch is what makes
+        local-first local. The honest-absence rule: a miss is reported as
+        absent only while the mirror is FRESH (a completed sync pass
+        within the staleness window). A stale mirror falls back to asking
+        the network for the missing keys, which is exactly the pre-mirror
+        behaviour: correctness degrades to slowness, never to wrong
+        answers. Own writes never miss at all — they are written through.
+        """
+        keys = list(keys)
+        if (self._mirror is not None and keys
+                and not getattr(self._tls, "bypass_mirror", False)):
+            local = self._mirror.get_many(keys)
+            missing = [k for k in keys if k not in local]
+            if not missing:
+                self._mirror.hits += len(keys)
+                return local
+            if self._mirror.fresh():
+                self._mirror.hits += len(local)
+                self._mirror.misses += len(missing)
+                return local
+            got = self._mget_network(missing)
+            if got:
+                self._mirror.put_many(list(got.items()))
+            local.update(got)
+            return local
+        return self._mget_network(keys)
+
+    def _mget_network(self, keys):
         """Replica lookup in two parallel phases, with hedged reads.
 
         Every replica is asked at once, but we stop waiting the moment every
@@ -831,8 +970,9 @@ class Owner:
         if not force and now - getattr(self, "_epoch_checked", 0) \
                 < self.SYS_REFRESH_S:
             return self._st["epoch"]
-        self._epoch_checked = now
-        return self._refresh_epoch_now()
+        out = self._refresh_epoch_now()
+        self._epoch_checked = time.monotonic()
+        return out
 
     def _refresh_epoch_now(self):
         """One probe (typically) against the on-network epoch chain, whose
@@ -881,11 +1021,16 @@ class Owner:
     def _refresh_writers(self, force=False):
         now = time.monotonic()
         if not force and now - getattr(self, "_writers_checked", 0) \
-                < self.SYS_REFRESH_S:
+                < self.SYS_REFRESH_S and hasattr(self, "_writers_cache"):
             return self._writers_cache
-        self._writers_checked = now
-        self._writers_cache = self._refresh_writers_now()
-        return self._writers_cache
+        # Compute, THEN stamp. Stamped-first, a concurrent caller landing
+        # inside the TTL window read a cache that did not exist yet — the
+        # background autocompact thread and a foreground query raced on
+        # exactly that, and the loser died on AttributeError.
+        out = self._refresh_writers_now()
+        self._writers_cache = out
+        self._writers_checked = time.monotonic()
+        return out
 
     def _refresh_writers_now(self):
         """Learn any new writers from the on-network registry chain."""

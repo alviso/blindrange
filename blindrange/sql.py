@@ -226,6 +226,7 @@ class Connection:
         self._lock = threading.Lock()
         self.autocompact = True
         self.autocompact_threshold = self.AUTOCOMPACT_THRESHOLD
+        self.mirror = os.environ.get("BR_SQL_MIRROR", "1") != "0"
 
     # -- table plumbing ---------------------------------------------------
 
@@ -252,6 +253,12 @@ class Connection:
                            bootstrap=self._bootstrap)
             if self._account:
                 o.configure_tokens(self._issuer, self._account)
+            if self.mirror:
+                # Local-first is the default at this layer because this
+                # layer is the door application builders come through, and
+                # the first application proved that WAN-in-the-read-path
+                # is the tax that makes everything else unattractive.
+                o.enable_mirror()
             self._tables[name] = o
         return self._tables[name]
 
@@ -296,6 +303,9 @@ class Connection:
     def close(self):
         for name in list(self._dirty):
             self._flush(name)
+        for o in self._tables.values():
+            if hasattr(o, "close"):
+                o.close()
 
     # -- entry point ------------------------------------------------------
 
@@ -413,6 +423,8 @@ class Connection:
                          network_secret=self._secret)
         if self._account:
             o.configure_tokens(self._issuer, self._account)
+        if self.mirror:
+            o.enable_mirror()
         self._tables[name] = o
         self._meta_path(name).write_text(json.dumps({"columns": columns}))
         return [{"created": name}]
