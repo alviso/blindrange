@@ -262,3 +262,33 @@ class TestGarbageOpsSuppressReadRepair(PurgeCase):
         self.assertTrue(self.owner._repair_reads,
                         "read-repair must stay on outside garbage ops — "
                         "it is a durability feature, not a bug")
+
+
+class TestGarbageDeletesGoEverywhere(PurgeCase):
+    """Route-targeted deletion misses off-route stragglers, and the node
+    sweeps re-spread from them forever — a 15M-key scrub measured the
+    network GROWING while it deleted. Garbage ops broadcast."""
+
+    def test_purge_deletes_reach_every_live_node(self):
+        o = self.owner
+        self.forge_chain("amount|3|2", 0, range(1, 6))
+        targets = set()
+        real = o._post
+
+        def spy(addr, path, payload):
+            if path == "/delete":
+                targets.add(addr)
+            return real(addr, path, payload)
+
+        with unittest.mock.patch.object(o, "_post", side_effect=spy):
+            out = o.purge_orphans()
+        self.assertGreater(out["chain_keys_removed"], 0)
+        self.assertEqual(targets, set(o._addr_of.values()),
+                         "a garbage delete skipped a live node — that node "
+                         "becomes the seed of eternal resurrection")
+        self.assertFalse(getattr(o, "_delete_everywhere", False),
+                         "broadcast mode leaked past the operation")
+
+    def test_ordinary_deletes_stay_route_targeted(self):
+        """N-times delete traffic is a garbage-op price, not a default."""
+        self.assertFalse(getattr(self.owner, "_delete_everywhere", False))

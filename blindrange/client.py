@@ -866,11 +866,26 @@ class Owner:
         keys = list(keys)
         for start in range(0, len(keys), self.CHUNK):
             by_node = {}
-            for k in keys[start:start + self.CHUNK]:
-                for nid in self.ring.route(k, self.ring.replicas + PROBE_EXTRA):
-                    addr = self._addr(nid)
-                    if addr:
-                        by_node.setdefault(addr, []).append(k)
+            chunk = keys[start:start + self.CHUNK]
+            if getattr(self, "_delete_everywhere", False):
+                # Garbage mode: this key set is being erased from the
+                # WORLD, not re-homed. Route-targeted deletion misses
+                # copies on off-route nodes — every ring change since the
+                # data was written stranded copies where today's routes
+                # never look, and the node sweeps re-spread from those
+                # stragglers forever. A 15M-key scrub measured the network
+                # GROWING while it deleted. Garbage deletion goes to every
+                # live node, so the sweeps have nothing left to spread.
+                for addr in set(self._addr_of.values()):
+                    by_node[addr] = list(chunk)
+            else:
+                for k in chunk:
+                    for nid in self.ring.route(k,
+                                               self.ring.replicas
+                                               + PROBE_EXTRA):
+                        addr = self._addr(nid)
+                        if addr:
+                            by_node.setdefault(addr, []).append(k)
             jobs = [self.pool.submit(self._post, a, "/delete", {"keys": ks})
                     for a, ks in by_node.items()]
             for j in jobs:
@@ -2203,10 +2218,12 @@ class Owner:
         with no way left to name them.
         """
         self._repair_reads = False
+        self._delete_everywhere = True
         try:
             return self._drop_inner(confirm)
         finally:
             self._repair_reads = True
+            self._delete_everywhere = False
 
     def _drop_inner(self, confirm=False):
         if not confirm:
@@ -2322,10 +2339,12 @@ class Owner:
         # Garbage must not be read-repaired back to life by our own
         # probes — see the gate in _mget_network.
         self._repair_reads = False
+        self._delete_everywhere = True
         try:
             return self._purge_inner(verbose, everything)
         finally:
             self._repair_reads = True
+            self._delete_everywhere = False
 
     def _purge_inner(self, verbose=False, everything=False):
         # `everything=True` is for a database you have already drop()ped:

@@ -317,6 +317,7 @@ class TestDegradedNetworkIntegrity(unittest.TestCase):
             procs[2].kill()
             time.sleep(1)
             synced_before = o.mirror_status()["synced_at"]
+            mirror_keys_before = o._mirror.count()
             o.SYS_REFRESH_S = 0               # no cached system answers
 
             # 1) a fresh single-writer mirror keeps serving — locally,
@@ -335,7 +336,14 @@ class TestDegradedNetworkIntegrity(unittest.TestCase):
                              "degraded network — the exact mechanism that "
                              "turned an outage into silent data loss")
 
-            # 3) with the mirror out of the way, concluding reads fail
+            # 3) the mirror NEVER loses a row it held: a degraded pass
+            #    may abort, but it may not shrink the local copy — "must
+            #    never serve absence for a row it once held" is the
+            #    consumer's acceptance clause, verbatim
+            self.assertEqual(o._mirror.count(), mirror_keys_before,
+                             "the outage removed rows from the mirror")
+
+            # 4) with the mirror out of the way, concluding reads fail
             #    LOUDLY rather than returning fewer rows
             m, o._mirror = o._mirror, None
             try:
@@ -345,6 +353,39 @@ class TestDegradedNetworkIntegrity(unittest.TestCase):
                         o.count("amount", 0, 4095)
             finally:
                 o._mirror = m
+
+            # 5) recovery: the dead return, a pass concludes again, and
+            #    everything is still there
+            for i, port in [(1, 7854), (2, 7855)]:
+                procs[i] = subprocess.Popen(
+                    [sys.executable, "-m", "blindrange.node", "--port",
+                     str(port), "--data", f"{tmp}/n{i}", "--secret", "dg",
+                     "--seed", "127.0.0.1:7853"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=str(ROOT), env={**os.environ})
+                for _ in range(80):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/stats", timeout=1)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+            deadline = time.time() + 30
+            recovered = False
+            while time.time() < deadline:
+                try:
+                    o.refresh_membership()
+                    o.sync()
+                    recovered = True
+                    break
+                except Exception:
+                    time.sleep(1)
+            self.assertTrue(recovered, "sync never recovered after the "
+                                       "nodes returned")
+            self.assertGreater(o.mirror_status()["synced_at"],
+                               synced_before)
+            got = {r["n"] for r in o.query("amount", 0, 4095)}
+            self.assertEqual(got, set(range(40)))
         finally:
             for pr in procs:
                 pr.kill()
