@@ -399,7 +399,11 @@ class Owner:
                     if e["age"] <= PEER_LIVE_S:
                         found[nid] = e["addr"]
                         if e.get("udp"):
-                            udp[nid] = e["udp"]
+                            # .get: a roster ghost (a lingering not-answering node) carries
+            # whatever fields it was remembered with, and one absent field
+            # crashed a 4-hour scrub three hours in. Membership refresh
+            # must survive every row shape the roster can legally serve.
+            udp[nid] = e.get("udp", "")
                 answers += 1
                 if answers >= 2:        # merge two views; one may be stale
                     break
