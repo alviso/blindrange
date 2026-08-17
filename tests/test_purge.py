@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.request
 from base64 import b64encode
 from pathlib import Path
@@ -215,3 +216,49 @@ class TestEverythingMode(PurgeCase):
             o.purge_orphans()                       # the guard still guards
         out = o.purge_orphans(everything=True)      # the dead path does not
         self.assertGreater(out["chain_keys_removed"], 0)
+
+
+class TestGarbageOpsSuppressReadRepair(PurgeCase):
+    """Mass deletion and read-repair must not fight.
+
+    Live finding: _delete is best-effort per replica; a straggler that
+    missed its delete still answers probes, the primary honestly answers
+    empty, and read-repair writes the deleted key back. A 15M-key scrub
+    watched 4.5M keys resurrected by its own probe storms. drop() and
+    purge_orphans() now turn read-repair off for their duration.
+    """
+
+    def test_purge_probes_never_write(self):
+        o = self.owner
+        self.forge_chain("amount|3|1", 0, range(1, 12))
+        writes = []
+        real = o._post
+
+        def spy(addr, path, payload):
+            if path == "/kv":
+                writes.append(len(payload.get("entries", [])))
+            return real(addr, path, payload)
+
+        seen_flag = []
+        real_inner = o._purge_inner
+
+        def inner_spy(*a, **k):
+            seen_flag.append(o._repair_reads)
+            return real_inner(*a, **k)
+
+        with unittest.mock.patch.object(o, "_post", side_effect=spy), \
+             unittest.mock.patch.object(o, "_purge_inner",
+                                        side_effect=inner_spy):
+            o.purge_orphans()
+        self.assertEqual(seen_flag, [False],
+                         "read-repair was ON inside the purge — the wrap "
+                         "is not actually wrapping")
+        self.assertEqual(sum(writes), 0,
+                         "a purge WROTE keys — read-repair resurrecting "
+                         "the garbage it is deleting")
+        self.assertTrue(o._repair_reads, "flag not restored")
+
+    def test_ordinary_reads_still_repair(self):
+        self.assertTrue(self.owner._repair_reads,
+                        "read-repair must stay on outside garbage ops — "
+                        "it is a durability feature, not a bug")

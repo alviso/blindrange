@@ -107,6 +107,7 @@ class Owner:
         self.path_map = {}                 # node_id -> ("quic"|"relay", ts)
         self._mirror = None
         self._sync_stop = threading.Event()
+        self._repair_reads = True          # off during drop/purge — see there
         self._tls = threading.local()      # per-thread mirror bypass
         self.refresh_membership()
 
@@ -956,14 +957,22 @@ class Owner:
         missing = fan(0, R, list(keys))
         if missing:
             fan(R, R + PROBE_EXTRA, missing)
-        by_primary = {}
-        for k in out:
-            primary = route[k][0] if route[k] else None
-            if (primary and primary in replied
-                    and primary not in holders.get(k, ())):
-                by_primary.setdefault(primary, []).append([k, out[k]])
-        for a, e in by_primary.items():
-            self.pool.submit(self._post, a, "/kv", {"entries": e})
+        # Read-repair is a durability feature with one sharp edge, found
+        # live: during a MASS DELETE, a replica that missed its
+        # best-effort delete still holds the key, the primary honestly
+        # answers without it — and this block writes the deleted key
+        # back. The scrubbing that removed 15M junk keys watched 4.5M of
+        # them return, resurrected by its own probes. Garbage operations
+        # (drop, purge) turn the flag off for their duration.
+        if self._repair_reads:
+            by_primary = {}
+            for k in out:
+                primary = route[k][0] if route[k] else None
+                if (primary and primary in replied
+                        and primary not in holders.get(k, ())):
+                    by_primary.setdefault(primary, []).append([k, out[k]])
+            for a, e in by_primary.items():
+                self.pool.submit(self._post, a, "/kv", {"entries": e})
         return out
 
     def _direct_path(self, nid, relay):
@@ -2110,6 +2119,13 @@ class Owner:
         gone too — but drop first, or the keys stay on the nodes forever
         with no way left to name them.
         """
+        self._repair_reads = False
+        try:
+            return self._drop_inner(confirm)
+        finally:
+            self._repair_reads = True
+
+    def _drop_inner(self, confirm=False):
         if not confirm:
             raise ValueError("drop() erases everything; pass confirm=True")
         writers = self._refresh_writers()
@@ -2220,6 +2236,15 @@ class Owner:
         is then still live for readers — finish it first with
         compact(resume=True).
         """
+        # Garbage must not be read-repaired back to life by our own
+        # probes — see the gate in _mget_network.
+        self._repair_reads = False
+        try:
+            return self._purge_inner(verbose, everything)
+        finally:
+            self._repair_reads = True
+
+    def _purge_inner(self, verbose=False, everything=False):
         # `everything=True` is for a database you have already drop()ped:
         # it sweeps LIVE epochs too, protects no rids, and ignores an
         # in-flight compaction — because on a dead database "in flight"
