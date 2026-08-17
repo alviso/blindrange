@@ -72,6 +72,18 @@ def main():
     run("DELETE FROM orders WHERE day > 208")
     run("SELECT COUNT(*) FROM orders")
 
+    # -- documents and counters ---------------------------------------------
+    run("CREATE TABLE docs ("
+        "  id     KEY,"
+        "  body   STORED"
+        ")")
+    run("INSERT INTO docs (id, body) VALUES ('doc-1', 'hello')")
+    run("INSERT INTO docs (body) VALUES ('auto-id')")
+    run("SELECT * FROM docs WHERE id = 'doc-1'")
+    run("SELECT NEXT VALUE FOR invoice_no")
+    run("SELECT NEXT VALUE FOR invoice_no")
+    run("DROP TABLE docs")
+
     # -- and the boundary, on purpose ---------------------------------------
     run("SELECT * FROM orders JOIN other ON 1", expect_refusal=True)
     run("SELECT SUM(amount) FROM orders", expect_refusal=True)

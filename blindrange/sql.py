@@ -35,8 +35,8 @@ What you never have to think about here:
 
 Grammar, in full — if a statement is not here, it is refused:
 
-  CREATE TABLE t (col INT BITS n BLUR w, col TEXT(chars) BLUR w,
-                  col STORED, ...)
+  CREATE TABLE t (col KEY, col INT BITS n BLUR w,
+                  col TEXT(chars) BLUR w, col STORED, ...)
   DROP TABLE t
   SHOW TABLES        · DESCRIBE t
   INSERT INTO t (cols) VALUES (v, ...), (v, ...)
@@ -44,6 +44,7 @@ Grammar, in full — if a statement is not here, it is refused:
          [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
   UPDATE t SET col = v, ... [WHERE ...]
   DELETE FROM t [WHERE ...]
+  SELECT NEXT VALUE FOR name     -- network-atomic counter: 1, 2, 3…
   COMPACT t          · PRAGMA AUTOCOMPACT ON|OFF
                      · PRAGMA AUTOCOMPACT_THRESHOLD n
 
@@ -76,6 +77,7 @@ _TOKEN = re.compile(
     r")")
 
 _KEYWORDS = {
+    "KEY", "NEXT", "VALUE", "FOR",
     "CREATE", "TABLE", "DROP", "SHOW", "TABLES", "DESCRIBE", "INSERT",
     "INTO", "VALUES", "SELECT", "FROM", "WHERE", "AND", "OR", "ORDER",
     "BY", "ASC", "DESC", "LIMIT", "UPDATE", "SET", "DELETE", "BETWEEN",
@@ -368,7 +370,14 @@ class Connection:
         columns, schema = {}, {}
         while True:
             col = p.eat("ident", "a column name")
-            if p.try_kw("INT"):
+            if p.try_kw("KEY"):
+                # An opaque handle: HMAC-bucketed under the table's own
+                # master, exact-match only, auto-generated when omitted.
+                # The one thing the network learns is that two rows share
+                # a handle; there is no order and no range to leak.
+                columns[col] = {"type": "key", "bits": 20}
+                schema[col] = {"type": "int", "bits": 20, "leaf_width": 4}
+            elif p.try_kw("INT"):
                 if not p.try_kw("BITS"):
                     raise Unsupported(
                         f"{col}: INT needs BITS — how large can the value "
@@ -474,6 +483,7 @@ class Connection:
     # -- WHERE ------------------------------------------------------------
 
     def _where(self, p, name):
+        self._owner_for_where = self._owner(name)
         """Conjunctions only, into (predicates, postfilters).
 
         Postfilters run client-side after decryption — the query path does
@@ -492,6 +502,25 @@ class Connection:
             spec = meta.get(col)
             if spec is None:
                 raise Unsupported(f"no column {col!r} on this table")
+            if spec["type"] == "key":
+                if not p.eat_op("="):
+                    raise Unsupported(
+                        f"{col} is a KEY: an opaque handle with no order. "
+                        f"Only `{col} = 'value'` is meaningful — ranges and "
+                        f"prefixes would be asking the hash to be sorted.")
+                v = p.peek("num")
+                if v is not None:
+                    p.i += 1
+                else:
+                    v = p.eat("str", "a value")
+                b = self._owner_for_where.key_bucket(col, v)
+                self._narrow(bounds, col, b, b,
+                             {"type": "int"})
+                posts.append(lambda r, c=col, vv=v:
+                             str(r.get(c + "@plain")) == str(vv))
+                if not p.try_kw("AND"):
+                    break
+                continue
             if spec["type"] == "stored":
                 raise Unsupported(
                     f"{col} is STORED, not indexed — nothing about it exists "
@@ -595,8 +624,9 @@ class Connection:
             if c not in meta:
                 raise Unsupported(f"no column {c!r} on {name} — declared "
                                   f"columns: {', '.join(meta)}")
+        key_cols = [c for c, sp in meta.items() if sp["type"] == "key"]
         indexed = [c for c, s in meta.items() if s["type"] != "stored"]
-        missing = [c for c in indexed if c not in cols]
+        missing = [c for c in indexed if c not in cols and c not in key_cols]
         if missing:
             raise Unsupported(
                 f"INSERT must provide every indexed column ({', '.join(missing)} "
@@ -624,14 +654,38 @@ class Connection:
                 raise Unsupported(f"{len(cols)} columns but {len(vals)} values")
             row = dict(zip(cols, vals))
             for c in indexed:
+                if c in key_cols:
+                    continue
                 self._check_value(c, meta[c], row[c])
             rows.append(row)
             if not p.eat_op(","):
                 break
         p.done()
-        self._owner(name).insert_many(rows)
+        o = self._owner(name)
+        generated = []
+        final = []
+        for row in rows:
+            fr = {}
+            for k, v in row.items():
+                if k not in key_cols:
+                    fr[k] = v
+            for c in key_cols:
+                plain = str(row.get(c) or "") or os.urandom(12).hex()
+                if c not in row or row.get(c) in ("", None):
+                    generated.append(plain)
+                # The indexed column carries the BUCKET; the real handle
+                # rides sealed under a shadow name and is what reads
+                # compare and return. The network sees a pseudorandom
+                # bucket shared by rows with equal handles — nothing more.
+                fr[c + "@plain"] = plain
+                fr[c] = o.key_bucket(c, plain)
+            final.append(fr)
+        o.insert_many(final)
         self._dirty.add(name)
-        return [{"rows_affected": len(rows)}]
+        result = {"rows_affected": len(rows)}
+        if generated:
+            result["ids"] = generated
+        return [result]
 
     @staticmethod
     def _check_value(col, spec, v):
@@ -652,6 +706,22 @@ class Connection:
         # projection ------------------------------------------------------
         agg = None
         cols = []
+        if p.try_kw("NEXT", "VALUE", "FOR"):
+            seq = p.eat("ident", "a sequence name")
+            if not p.try_kw("FROM") and True:
+                pass
+            p.done()
+            # Sequences are per-table-directory but not per-table: they
+            # live in the FIRST table's keyspace so every table (and every
+            # writer of it) draws from the same counter. One table is the
+            # common case; name your sequences distinctly if you have many.
+            names = self._names()
+            if not names:
+                raise Unsupported("NEXT VALUE FOR needs at least one table "
+                                  "to exist — the counter lives in the "
+                                  "database's keyspace")
+            self._flush(names[0])
+            return [{"value": self._owner(names[0]).next_value(seq)}]
         if p.try_kw("COUNT"):
             if not (p.eat_op("(") and p.eat_op("*") and p.eat_op(")")):
                 raise Unsupported("COUNT takes (*) — counting a column "
@@ -694,6 +764,11 @@ class Connection:
             if spec is None or spec["type"] == "stored":
                 raise Unsupported(f"ORDER BY needs an indexed column; "
                                   f"{order!r} is not one")
+            if spec["type"] == "key":
+                raise Unsupported(
+                    f"{order} is a KEY: an opaque handle with no order. "
+                    f"Sorting by it would return hash order and look like "
+                    f"it meant something.")
             desc = bool(p.try_kw("DESC")) or (p.try_kw("ASC") and False)
         if p.try_kw("LIMIT"):
             limit = p.eat("num", "a row count")
@@ -735,9 +810,13 @@ class Connection:
 
     @staticmethod
     def _project(rec, cols, meta):
+        def val(c):
+            if meta.get(c, {}).get("type") == "key":
+                return rec.get(c + "@plain")
+            return rec.get(c)
         if not cols or cols == ["*"]:
-            return {c: rec.get(c) for c in meta}
-        return {c: rec.get(c) for c in cols}
+            return {c: val(c) for c in meta}
+        return {c: val(c) for c in cols}
 
     def _count(self, o, name, meta, preds, posts):
         # One clean range and no client-side filters: the index answers
@@ -809,10 +888,20 @@ class Connection:
         if not rows:
             return [{"rows_affected": 0}]
         replacements = []
+        key_cols = {c for c, sp in meta.items() if sp["type"] == "key"}
         for r in rows:
+            # Keep the @plain shadows: they carry KEY handles inside the
+            # sealed record, and dropping them on rewrite silently severed
+            # every row from its own id — an UPDATE that succeeded and then
+            # made the row unfindable by the handle it was found with.
             new = {k: v for k, v in r.items()
-                   if k in meta and not k.startswith("_")}
-            new.update(changes)
+                   if (k in meta or k.endswith("@plain"))
+                   and not k.startswith("_")}
+            new.update({k: v for k, v in changes.items()
+                        if k not in key_cols})
+            for c in key_cols & set(changes):
+                new[c + "@plain"] = str(changes[c])
+                new[c] = o.key_bucket(c, str(changes[c]))
             replacements.append(new)
         o.delete_many([r["_rid"] for r in rows])
         o.insert_many(replacements)

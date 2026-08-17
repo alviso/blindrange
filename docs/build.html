@@ -77,6 +77,7 @@ which the test suite runs. Prefer the full API? —
   <li><a href="#select">SELECT</a> — WHERE, ORDER BY, LIMIT</li>
   <li><a href="#aggregate">COUNT and APPROX SUM</a> — nothing decrypted</li>
   <li><a href="#update">UPDATE and DELETE</a> — what happens underneath</li>
+  <li><a href="#docs-ctr">Documents and counters</a> — KEY and NEXT VALUE</li>
   <li><a href="#refused">What is refused, and why</a> — read this one</li>
   <li><a href="#further">Going further</a></li>
 </ol>
@@ -207,7 +208,30 @@ want manual control, <code>COMPACT orders</code> to force one). Automating
 this is recent and deliberate: compaction now survives its own crash and
 resumes, so a process dying mid-compaction no longer wedges anything.</p>
 
-<h2 id="refused"><span class="n">7</span>What is refused, and why</h2>
+<h2 id="docs-ctr"><span class="n">7</span>Documents and counters</h2>
+<p>Two things applications always need, built in so nobody reinvents
+them:</p>
+<pre><code class="from-quickstart">CREATE TABLE docs (
+  id     KEY,
+  body   STORED
+)</code></pre>
+<pre><code class="from-quickstart">INSERT INTO docs (id, body) VALUES ('doc-1', 'hello')</code></pre>
+<pre><code class="from-quickstart">SELECT * FROM docs WHERE id = 'doc-1'</code></pre>
+<p>A <code>KEY</code> is an opaque handle: exact-match lookup, no BLUR
+decision to make, auto-generated (and returned) when you omit it. The
+handle itself lives only inside the sealed record — the network stores a
+pseudorandom bucket, so the most it can ever tell is that two rows share
+a handle. It has no order, and asking for one is refused rather than
+answered with hash order.</p>
+<pre><code class="from-quickstart">SELECT NEXT VALUE FOR invoice_no</code></pre>
+<pre><span class="g">{'value': 1}   ·   then {'value': 2} — from any writer, never a duplicate</span></pre>
+<p>Sequences are <b>network-atomic</b>: each value is a slot claimed by
+insert-if-absent, arbitrated by the replicas — the same mechanism that
+elects one compactor per epoch. Unique and monotonic across writers;
+gaps are possible (a crash after claiming spends the number), which is
+exactly how auditors expect invoice numbers to behave.</p>
+
+<h2 id="refused"><span class="n">8</span>What is refused, and why</h2>
 <p class="lead">This table is the honest half of the product. Nothing in it
 is a missing feature that is coming later — each row is an architectural
 boundary, and the refusal text in the REPL says the same thing.</p>
@@ -240,7 +264,7 @@ boundary, and the refusal text in the REPL says the same thing.</p>
     <td>idempotent writes; a crash costs a visible duplicate, not a hole</td></tr>
 </table>
 
-<h2 id="further"><span class="n">8</span>Going further</h2>
+<h2 id="further"><span class="n">9</span>Going further</h2>
 <p>The <a href="/build-python">Python guide</a> is the same system with the
 full API: streaming reads in bounded memory, histograms, multi-device
 invites, and sharding across master keys when one client's compaction

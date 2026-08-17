@@ -177,7 +177,11 @@ class Owner:
         key = hashlib.scrypt(self._pass.encode(), salt=salt, n=2 ** 14, r=8,
                              p=1, dklen=32)
         ct = AESGCM(key).encrypt(nonce, json.dumps(self._st).encode(), None)
-        tmp = self._path + ".tmp"
+        # Unique temp name: two Owner instances over one state file is a
+        # documented mistake, but the failure for making it should be
+        # last-write-wins, not FileNotFoundError from racing renames of a
+        # shared .tmp.
+        tmp = self._path + f".tmp{os.getpid()}.{os.urandom(3).hex()}"
         with open(tmp, "w") as f:
             json.dump({"salt": salt.hex(), "nonce": nonce.hex(),
                        "ct": ct.hex()}, f)
@@ -544,6 +548,70 @@ class Owner:
         if out.get("status") != 200:
             raise ConnectionError(f"relayed request failed: {out}")
         return json.loads(b64decode(out["body_b64"]))
+
+    # -------------------------------------------------- keys & sequences
+    KEY_BITS = 20                     # ~1M buckets; collisions post-filtered
+
+    def key_bucket(self, field, value):
+        """The index bucket for an opaque handle.
+
+        This is the first application's winning pattern — HMAC the value,
+        index only the bucket, ride the real value sealed inside the
+        record — built in, with the hash keyed under this database's own
+        master instead of a separate secret somebody has to generate,
+        deploy and not lose. What the network can tell: two rows share a
+        handle. What it cannot tell: anything else — buckets are
+        pseudorandom, unordered, and meaningless without the master.
+
+        Collisions are expected (~1M buckets) and harmless BY CONTRACT:
+        every caller must compare the plaintext value after decryption.
+        The SQL layer does; anyone using this directly must too.
+        """
+        h = hmac.new(self._master, f"keycol|{field}|{value}".encode(),
+                     hashlib.sha256).digest()
+        return int.from_bytes(h[:4], "big") & ((1 << self.KEY_BITS) - 1)
+
+    def next_value(self, name, timeout=30):
+        """A network-atomic counter: 1, 2, 3…, no duplicates, any writer.
+
+        Applications kept a side-database for exactly this ("invoice
+        numbers live in SQLite next to the sessions"), because nothing in
+        the engine could hand out unique numbers. But the primitive was
+        here all along: put_nx — insert-if-absent, arbitrated by the
+        replicas — is the same mechanism that elects one compactor per
+        epoch. A sequence is a chain of claimed slots; your number is the
+        slot you won.
+
+        Contention costs one round trip per collision and nothing is ever
+        reused: a lost race means someone else OWNS that number. Crash
+        after winning, before using the number? The number is spent —
+        sequences promise uniqueness and order, not density, which is
+        also how invoice auditors expect gaps to be explainable.
+        """
+        kind = b"seq:" + str(name).encode()
+        seqs = self._st.setdefault("seqs", {})
+        i = int(seqs.get(str(name), 0))
+        # A cold cache would re-contest every historical slot one round
+        # trip at a time. Gallop to the current end first — sequence slots
+        # are dense by construction (every claim wins exactly the next
+        # one), which is the property galloping needs.
+        i = max(i, self._discover_ends(
+            {"s": ((lambda j: self._sys_key(kind, j)), i)})["s"])
+        deadline = time.time() + timeout
+        me = self._st["writer"]
+        while time.time() < deadline:
+            i += 1
+            if self._put_nx(self._sys_key(kind, i),
+                            self._sys_encode(f"claimed:{me}")):
+                seqs[str(name)] = i
+                self._save()
+                return i
+            # Lost: the slot exists whatever the mirror thinks, so advance
+            # unconditionally — re-probing a slot we just lost would spin.
+            seqs[str(name)] = i
+        raise TimeoutError(f"could not claim a value for sequence {name!r} "
+                           f"within {timeout}s — extreme contention or an "
+                           f"unreachable network")
 
     # ------------------------------------------------------------ mirror
     def enable_mirror(self, sync_every=None):
