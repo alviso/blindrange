@@ -812,7 +812,26 @@ class Owner:
         return ends
 
     # ---------------------------------------------------- system chains
-    def _refresh_epoch(self):
+    # How long a system-chain answer stays fresh. Epoch and writer chains
+    # change on compaction and invite — events per hour, not per query —
+    # yet every read re-galloped both, and a gallop's final probe is an
+    # absence proof, which waits for the SLOWEST replica by design. On the
+    # public network that made the interactive floor ~5 relay rounds per
+    # query, 2-3 of them these refreshes: the first real application
+    # measured 10-23s reads, and this was most of it. Correctness net:
+    # query_multi already detects a system chain that grew mid-query and
+    # refreshes+retries; a stale TTL costs one retry, not a wrong answer.
+    SYS_REFRESH_S = float(os.environ.get("BR_SYS_REFRESH_S", "5"))
+
+    def _refresh_epoch(self, force=False):
+        now = time.monotonic()
+        if not force and now - getattr(self, "_epoch_checked", 0) \
+                < self.SYS_REFRESH_S:
+            return self._st["epoch"]
+        self._epoch_checked = now
+        return self._refresh_epoch_now()
+
+    def _refresh_epoch_now(self):
         """One probe (typically) against the on-network epoch chain, whose
         entries are markers: "open:N" (epoch N exists — write there) and
         "sealed:N" (epoch N is fully merged into N+1 — stop reading it).
@@ -856,7 +875,16 @@ class Owner:
             return [st["epoch"] - 1, st["epoch"]]
         return [st["epoch"]]
 
-    def _refresh_writers(self):
+    def _refresh_writers(self, force=False):
+        now = time.monotonic()
+        if not force and now - getattr(self, "_writers_checked", 0) \
+                < self.SYS_REFRESH_S:
+            return self._writers_cache
+        self._writers_checked = now
+        self._writers_cache = self._refresh_writers_now()
+        return self._writers_cache
+
+    def _refresh_writers_now(self):
         """Learn any new writers from the on-network registry chain."""
         end = self._discover_ends(
             {"r": (lambda i: self._sys_key(b"registry", i),
@@ -1108,29 +1136,88 @@ class Owner:
         return [(mlvl, idx) for idx in range(a // w, b // w + 1)]
 
     def _unit_entries(self, field, units, writers):
-        """Gallop and fetch one batch of units; returns record ids found."""
-        spec = self._st["schema"][field]
-        k_ws = {}
-        gallop = {}
+        """One batch of units, the warm way: speculate from the cache.
+
+        This used to seed every gallop with a cached length of ZERO, so
+        every query_stream batch re-discovered every chain end from
+        scratch — log2(length) sequential network rounds per batch, most
+        of them proving absence, which waits for the slowest replica by
+        design. The first real application (InvoiceFlow) found it: its
+        interactive reads sat in exactly this loop while query_multi,
+        which speculates from the cache in one round, was fast on the
+        same data. Field report, verbatim: "absence is the expensive
+        answer."
+
+        Now it does what query_multi does: fetch entries 1..cached AND
+        probe cached+1 in a single round, gallop only the chains that
+        actually grew, and pay the cache forward for the next caller.
+        Safe because chains are append-only within an epoch and the cache
+        is keyed by epoch — a compaction moves to a new epoch rather than
+        shrinking an old one.
+        """
+        st = self._st
+        me, top = st["writer"], st["epoch"]
+        remote = st["remote"]
+        k_ws, chains = {}, {}
         for lvl, idx in units:
             w = f"{field}|{lvl}|{idx}"
             k_ws[w] = self._k_w(w)
             for ep in self._epochs():
                 for u in writers:
-                    gallop[(ep, w, u)] = (
-                        (lambda i, e=ep, k=k_ws[w], u=u: self._ut(k, e, u, i)),
-                        0)
-        ends = self._discover_ends(gallop) if gallop else {}
-        ut_map = {}
-        for (ep, w, u), c in ends.items():
-            for i in range(1, c + 1):
-                ut_map[self._ut(k_ws[w], ep, u, i)] = (k_ws[w], ep, u, i)
-        rids = []
-        for ut, blob in (self._mget(list(ut_map)) if ut_map else {}).items():
-            k_w, ep, u, i = ut_map[ut]
+                    cached = (st["chains"].get(w, 0)
+                              if (u == me and ep == top)
+                              else remote.get(f"{ep}|{w}", {}).get(u, 0))
+                    chains[(w, ep, u)] = {
+                        "fn": (lambda i, e=ep, k=k_ws[w], u=u:
+                               self._ut(k, e, u, i)),
+                        "cached": cached}
+        if not chains:
+            return []
+
+        enum_map, probe_map = {}, {}
+        for cid, ch in chains.items():
+            for i in range(1, ch["cached"] + 1):
+                enum_map[ch["fn"](i)] = (cid, i)
+            probe_map[ch["fn"](ch["cached"] + 1)] = cid
+        got = self._mget(list(enum_map) + list(probe_map))
+
+        grown = {cid for k, cid in probe_map.items() if k in got}
+        ends = {cid: ch["cached"] for cid, ch in chains.items()}
+        if grown:
+            g_ends = self._discover_ends(
+                {cid: (chains[cid]["fn"], chains[cid]["cached"] + 1)
+                 for cid in grown})
+            delta = {}
+            for cid, end in g_ends.items():
+                ends[cid] = end
+                for i in range(chains[cid]["cached"] + 2, end + 1):
+                    delta[chains[cid]["fn"](i)] = (cid, i)
+            if delta:
+                got.update(self._mget(list(delta)))
+            for cid in grown:
+                enum_map[chains[cid]["fn"](chains[cid]["cached"] + 1)] = (
+                    cid, chains[cid]["cached"] + 1)
+            enum_map.update(delta)
+
+        rids, dirty = [], False
+        for key, (cid, i) in enum_map.items():
+            blob = got.get(key)
+            if blob is None:
+                continue
+            w, ep, u = cid
             rid = bytes(x ^ y for x, y in zip(b64decode(blob),
-                                              self._mask(k_w, ep, u, i)))
+                                              self._mask(k_ws[w], ep, u, i)))
             rids.append(rid.hex())
+        for (w, ep, u), end in ends.items():
+            if u == me and ep == top:
+                if end > st["chains"].get(w, 0):
+                    st["chains"][w] = end
+                    dirty = True
+            elif end != remote.setdefault(f"{ep}|{w}", {}).get(u, 0):
+                remote[f"{ep}|{w}"][u] = end
+                dirty = True
+        if dirty:
+            self._save()
         return rids
 
     def query_stream(self, predicates, limit=None, order=None, batch=24,
@@ -1315,8 +1402,10 @@ class Owner:
         if any(cid[0] == "sys" for cid in grown):
             if _retried:
                 raise RuntimeError("system chains unstable across retries")
-            self._refresh_epoch()
-            self._refresh_writers()
+            # force=True matters here: this is the correctness net that
+            # makes the TTL safe, and a cached answer would defeat it.
+            self._refresh_epoch(force=True)
+            self._refresh_writers(force=True)
             return self.query_multi(predicates, _retried=True)
 
         # gallop only the chains that grew; their entry at cached+1 is
@@ -1456,8 +1545,8 @@ class Owner:
         ever invisible. One compactor at a time: the open marker is an
         insert-if-absent slot, and losing that race aborts cleanly."""
         import time as _time
-        E = self._refresh_epoch()
-        writers = self._refresh_writers()
+        E = self._refresh_epoch(force=True)
+        writers = self._refresh_writers(force=True)
         me = self._st["writer"]
 
         # An unsealed previous epoch means a compaction opened and never
@@ -1847,7 +1936,7 @@ class Owner:
         # faithful, expensive nonsense. On a live database this flag is
         # data loss, which is why it is a word you must type and not a
         # fallback the guard quietly takes.
-        self._refresh_epoch()
+        self._refresh_epoch(force=True)
         if not everything and len(self._epochs()) > 1:
             raise RuntimeError(
                 "a compaction is in flight (or died mid-flight), so the "
