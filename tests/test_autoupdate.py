@@ -8,6 +8,7 @@ restarted mid-ingest, which cost a benchmark at 620k records.
 import os
 import threading
 import time
+import sys
 import unittest
 
 from pathlib import Path
@@ -267,3 +268,52 @@ class TestWindowsSupervisor(unittest.TestCase):
         self.assertIn("os._exit(RESTART_CODE)", src)
         self.assertNotIn("subprocess.Popen", src,
                          "spawning from the child is what orphaned it")
+
+
+class TestUpdateGate(unittest.TestCase):
+    """A broken commit must strand ZERO nodes.
+
+    1cb02ea shipped an IndentationError; every --auto-update node pulled
+    it, restarted into it, and died at import — seed crash-looping,
+    Windows supervisor relaunching into the wreck, three NAT'd tenants
+    down at once. The gate runs a throwaway interpreter against the new
+    tree before the process replaces itself, and rolls the checkout back
+    when the import fails.
+    """
+
+    def test_a_broken_tree_is_refused_and_rolled_back(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp(prefix="brgate_"))
+        repo = tmp / "repo"
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run(["git", "clone", "-q", "--depth", "2",
+                        str(root), str(repo)], check=True,
+                       capture_output=True)
+        good = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        # a syntactically broken "next release"
+        bad_file = repo / "blindrange" / "client.py"
+        bad_file.write_text(bad_file.read_text()
+                            + "\nif True:\nbroken_indent = 1\n")
+        subprocess.run(["git", "-C", str(repo), "-c",
+                        "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-aqm", "broken"], check=True,
+                       capture_output=True)
+
+        gate = subprocess.run(
+            [sys.executable, "-c", "import blindrange.node"],
+            capture_output=True, text=True, cwd=str(repo),
+            env={**os.environ, "PYTHONPATH": str(repo), "BR_NO_QUIC": "1"})
+        self.assertNotEqual(gate.returncode, 0,
+                            "the fixture is not actually broken")
+
+        # and the good tree passes the same gate
+        subprocess.run(["git", "-C", str(repo), "reset", "--hard", good],
+                       check=True, capture_output=True)
+        gate = subprocess.run(
+            [sys.executable, "-c", "import blindrange.node"],
+            capture_output=True, text=True, cwd=str(repo),
+            env={**os.environ, "PYTHONPATH": str(repo), "BR_NO_QUIC": "1"})
+        self.assertEqual(gate.returncode, 0, gate.stderr[-400:])

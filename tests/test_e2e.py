@@ -150,7 +150,30 @@ class TestE2E(unittest.TestCase):
         for port in (BASE + 2, BASE + 4):           # kill 2 of 6 (RF=3)
             self.procs[port].terminate()
             self.procs[port].wait()
+        # HITS survive two deaths immediately: any one copy answers.
         self.assert_query("amount", 100_000, 300_000)
+        # ABSENCE does not, and must not: with write_acks=2, a key could
+        # exist entirely on the two corpses, so the client refuses to
+        # conclude from the survivor — the exact refusal that would have
+        # prevented a production database from being silently truncated
+        # during a rolling outage. The class continues only after the
+        # membership has genuinely buried the dead, which is what real
+        # recovery looks like.
+        import blindrange.client as _c
+        dead = {f"127.0.0.1:{BASE + 2}", f"127.0.0.1:{BASE + 4}"}
+        old_live = _c.PEER_LIVE_S
+        _c.PEER_LIVE_S = 12          # fixture nodes purge at 15s anyway
+        try:
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                self.owner.refresh_membership()
+                if not dead & set(self.owner._addr_of.values()):
+                    break
+                time.sleep(1)
+            self.assertFalse(dead & set(self.owner._addr_of.values()),
+                             "the dead pair never left membership")
+        finally:
+            _c.PEER_LIVE_S = old_live
 
     def test_05_node_join_via_gossip(self):
         port = BASE + 9

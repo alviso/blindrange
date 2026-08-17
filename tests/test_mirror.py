@@ -251,3 +251,101 @@ class TestFreshnessRegimes(MirrorCase):
         self.assertTrue(st["single_writer"])
         self.assertGreaterEqual(st["last_pass_s"], 0.0)
         self.assertGreater(st["keys"], 0)
+
+
+class TestDegradedNetworkIntegrity(unittest.TestCase):
+    """The production incident, recreated: nodes die mid-life, and the
+    system must fail loudly instead of concluding.
+
+    What actually happened: a rolling outage degraded the network while
+    sync passes ran; gallops read silence as absence; passes stored
+    truncated chains and stamped themselves synced; fresh mirrors then
+    served 6 of 12 rows as the authoritative whole truth, and the app
+    wrote consequences of the lie into its other database.
+    """
+
+    def test_outage_makes_queries_fail_loudly_and_sync_refuse(self):
+        import subprocess
+        import tempfile
+        import urllib.request
+        tmp = tempfile.mkdtemp(prefix="blindrange_degraded_")
+        procs = []
+        try:
+            # Three nodes, TWO killed: the production shape (3 of 5
+            # down). With write_acks=2, ONE dead node leaves absence
+            # provable from survivors — the quorum rule — so a single
+            # death must not trip refusals; two deaths must.
+            for i, port in enumerate((7853, 7854, 7855)):
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-m", "blindrange.node", "--port",
+                     str(port), "--data", f"{tmp}/n{i}", "--secret", "dg"]
+                    + (["--seed", "127.0.0.1:7853"] if i else []),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=str(ROOT), env={**os.environ}))
+            for port in (7853, 7854, 7855):
+                for _ in range(80):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/stats", timeout=1)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+
+            o = Owner.create(f"{tmp}/o.brdb", "pw", SCHEMA,
+                             ["127.0.0.1:7853"], network_secret="dg")
+            # Deterministic join: killing a node the ring never admitted
+            # is not an outage, and the first version of this test flaked
+            # exactly that way — a 2s nap racing gossip.
+            for _ in range(100):
+                o.refresh_membership()
+                if len(o.ring.addrs) >= 3:
+                    break
+                time.sleep(0.3)
+            else:
+                self.fail("nodes never joined the ring; the fixture "
+                          "cannot exercise an outage")
+            o.insert_many([{"amount": i, "n": i} for i in range(40)])
+            o.drain()
+            o.enable_mirror(sync_every=3600)
+            o.sync()
+
+            # the outage: kill two of three — and only THEN take the
+            # baseline, because enable_mirror's background loop runs its
+            # own first pass and two legitimate pre-kill passes 0.2ms
+            # apart flaked the first version of this assertion.
+            procs[1].kill()
+            procs[2].kill()
+            time.sleep(1)
+            synced_before = o.mirror_status()["synced_at"]
+            o.SYS_REFRESH_S = 0               # no cached system answers
+
+            # 1) a fresh single-writer mirror keeps serving — locally,
+            #    correctly, through the outage
+            got = {r["n"] for r in o.query("amount", 0, 4095)}
+            self.assertEqual(got, set(range(40)))
+
+            # 2) a sync pass against the degraded network must REFUSE to
+            #    conclude: synced_at may not advance
+            try:
+                o.sync()
+            except Exception:
+                pass                          # loud failure is acceptable
+            self.assertEqual(o.mirror_status()["synced_at"], synced_before,
+                             "a pass marked itself synced against a "
+                             "degraded network — the exact mechanism that "
+                             "turned an outage into silent data loss")
+
+            # 3) with the mirror out of the way, concluding reads fail
+            #    LOUDLY rather than returning fewer rows
+            m, o._mirror = o._mirror, None
+            try:
+                with self.assertRaises((ConnectionError, OSError)):
+                    for _ in range(3):        # absence probes must trip it
+                        o.query("amount", 0, 4095)
+                        o.count("amount", 0, 4095)
+            finally:
+                o._mirror = m
+        finally:
+            for pr in procs:
+                pr.kill()
+            shutil.rmtree(tmp, ignore_errors=True)

@@ -77,7 +77,7 @@ from .ring import Ring, failure_group
 # considers live. Under write load a busy node's heartbeat can lag several
 # seconds; dropping it then shrinks the ring, which makes quorum wait on
 # whatever slow node remains — the opposite of what you want under load.
-PEER_LIVE_S = 40.0
+PEER_LIVE_S = float(os.environ.get("BR_PEER_LIVE_S", "40"))
 TOMB = "@tomb"                     # reserved label for tombstone chains
 
 
@@ -897,11 +897,13 @@ class Owner:
             missing = [k for k in keys if k not in local]
             if not missing:
                 self._mirror.hits += len(keys)
+                self.last_unresolved = set()   # answered wholly locally
                 return local
             if self._mirror.fresh(single_writer=self._single_writer()):
                 self._mirror.hits += len(local)
                 self._mirror.misses += len(missing)
-                return local
+                self.last_unresolved = set()   # absence answered by a
+                return local                   # complete fresh mirror
             got = self._mget_network(missing)
             if got:
                 self._mirror.put_many(list(got.items()))
@@ -961,6 +963,64 @@ class Owner:
         missing = fan(0, R, list(keys))
         if missing:
             fan(R, R + PROBE_EXTRA, missing)
+        # The distinction this system once failed to make, at real cost:
+        # a key nobody RETURNED is not the same as a key everyone DENIED.
+        # During a rolling node outage, gallop probes read silence as
+        # absence, a sync pass stored the shortened chains it "found",
+        # stamped itself complete, and a fresh mirror then answered that
+        # absence authoritatively — production served 6 of 12 companies
+        # while claiming correctness. Absence is CONFIRMED only when every
+        # primary replica replied; everything else is UNRESOLVED, exposed
+        # here for callers who conclude from absence (gallops, sync) to
+        # refuse on. Hits are unaffected: a returned value is a returned
+        # value, whoever else was down.
+        def unresolved():
+            # Quorum argument, not a heuristic: every key that exists has
+            # at least write_acks replicas (the durability floor), so if
+            # FEWER than write_acks of a key's replicas are silent, an
+            # existing key would have answered from a survivor — silence
+            # from the rest is genuinely absence. At write_acks silent, an
+            # existing key could be hiding entirely behind the silence,
+            # and concluding is exactly the mistake that truncated a
+            # production database. One dead node (the common case, and
+            # test_04's) stays fully answerable; a multi-node outage is
+            # refused.
+            tolerable = max(0, self.write_acks - 1)
+            return {k for k in keys
+                    if k not in out
+                    and sum(1 for a in route[k][:R]
+                            if a not in replied) > tolerable}
+
+        # Silence gets two escalating answers before it becomes a refusal.
+        # First: re-ask, because one busy replica missing one 2s window
+        # must not fail a query — the first full-suite run after the
+        # integrity fix failed fifteen tests on a healthy network over
+        # exactly that. Second: REFRESH MEMBERSHIP and re-route, because a
+        # silent node may simply be dead — and once the living have taken
+        # over its ring range, absence is provable against the living. A
+        # node that died cleanly stops blocking absence proofs within one
+        # membership refresh; a network that is genuinely degraded (nodes
+        # flapping, still gossiped) keeps failing the quorum test and is
+        # refused, which is the lesson the truncated production database
+        # taught. Routes must be REBUILT after the refresh — retrying the
+        # stale route asks the corpse again and learns nothing.
+        for attempt in range(3):
+            stuck = unresolved()
+            if not stuck:
+                break
+            if attempt == 0:
+                time.sleep(0.3)
+            else:
+                try:
+                    self.refresh_membership()
+                except OSError:
+                    pass
+                for k in stuck:
+                    route[k] = [self._addr(n) for n in
+                                self.ring.route(k, R + PROBE_EXTRA)
+                                if self._addr(n)]
+            fan(0, R + PROBE_EXTRA, list(stuck))
+        self.last_unresolved = unresolved()
         # Read-repair is a durability feature with one sharp edge, found
         # live: during a MASS DELETE, a replica that missed its
         # best-effort delete still holds the key, the primary honestly
@@ -1049,6 +1109,17 @@ class Owner:
                      for cid, st in state.items()}
             keys = {cid: state[cid]["fn"](p) for cid, p in batch.items()}
             got = self._mget(list(set(keys.values())))
+            bad = getattr(self, "last_unresolved", ()) or ()
+            poisoned = [cid for cid, key in keys.items() if key in bad]
+            if poisoned:
+                # Concluding a chain end from an unanswered probe is how a
+                # degraded network turned into a truncated database. Fail
+                # the operation loudly; the caller retries when replicas
+                # return. Slowness and errors — never silently fewer rows.
+                raise ConnectionError(
+                    f"cannot determine chain end: replicas unreachable for "
+                    f"{len(poisoned)} probe(s) — refusing to conclude "
+                    f"absence from silence")
             done = []
             for cid, p in batch.items():
                 st = state[cid]
@@ -1781,6 +1852,14 @@ class Owner:
                     for i in range(1, c + 1):
                         ut_map[self._ut(k_ws[w], E, u, i)] = (w, u, i)
                 got = self._mget(list(ut_map)) if ut_map else {}
+                bad = getattr(self, "last_unresolved", ()) or ()
+                lost = [k for k in ut_map if k not in got and k in bad]
+                if lost:
+                    raise ConnectionError(
+                        f"walk cannot proceed: {len(lost)} chain entrie(s) "
+                        f"unreachable, not absent — a pass concluded from "
+                        f"this exact situation once and served 6 of 12 rows "
+                        f"as the whole truth")
                 nonempty = set()
                 for ut, blob in got.items():
                     w, u, i = ut_map[ut]

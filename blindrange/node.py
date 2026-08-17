@@ -334,6 +334,36 @@ def _update_loop(secret):
             # that way now proves nothing and earns nothing, so silently
             # never restarting is expensive.
             if after and RUNNING_COMMIT and after != RUNNING_COMMIT:
+                # THE GATE. One syntactically broken commit reached main and
+                # every --auto-update node pulled it, restarted into it, and
+                # died at import — the seed crash-looped under systemd and
+                # the Windows supervisor relaunched into the same wreck and
+                # handed the operator their prompt back. A whole network,
+                # downed by an IndentationError. So before this process
+                # replaces itself with the new tree, a THROWAWAY interpreter
+                # must prove the new tree imports. If it does not, roll the
+                # checkout back to the running commit and publish the
+                # blockage — a node that keeps running old code and says so
+                # beats a fleet that dies simultaneously.
+                gate = subprocess.run(
+                    [sys.executable, "-c", "import blindrange.node"],
+                    capture_output=True, text=True, timeout=120, cwd=repo,
+                    env={**os.environ, "PYTHONPATH": repo,
+                         "BR_NO_QUIC": "1"})
+                if gate.returncode != 0:
+                    why = (gate.stderr or "").strip().splitlines()
+                    msg = (f"update to {after[:8]} fails import "
+                           f"({why[-1][:90] if why else 'unknown'}) — "
+                           f"rolled back, still on {RUNNING_COMMIT[:8]}")
+                    subprocess.run(["git", "-C", repo, "reset", "--hard",
+                                    RUNNING_COMMIT],
+                                   capture_output=True, timeout=60)
+                    UPDATE_BLOCKED_REASON[0] = msg
+                    if _UPDATE_BROKEN[0] != msg:
+                        _UPDATE_BROKEN[0] = msg
+                        print(f"auto-update REFUSED: {msg}",
+                              file=sys.stderr, flush=True)
+                    continue
                 print(f"auto-update: {RUNNING_COMMIT[:8]} -> {after[:8]}, "
                       f"restarting",
                       file=sys.stderr, flush=True)
