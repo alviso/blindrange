@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build on blindrange — Node.js</title>
+<meta name="description" content="npm install blindrange: SQL-shaped statements over storage that cannot read your data, from Node. Runs the reference client under the hood, so there is nothing to drift.">
+<meta property="og:title" content="Build on blindrange — Node.js">
+<meta property="og:description" content="One npm install, no Python setup, no daemon, no port. The package runs the reference client as a child it owns, so every feature and fix arrives the day it ships.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/build-node">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:20px; margin:44px 0 4px; }
+  h2 .n { color:var(--acc); margin-right:10px; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  pre { background:#12161d; border:1px solid var(--line); border-radius:9px;
+        padding:13px 15px; overflow-x:auto; font-size:13px; line-height:1.55;
+        margin:12px 0; }
+  pre .c { color:var(--dim); } pre .g { color:var(--ok); }
+  code { color:var(--warn); }
+  .lead { color:var(--dim); }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--acc); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim); margin:14px 0; }
+  .note b { color:var(--txt); font-weight:normal; }
+  .warn { border-left-color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; margin:12px 0; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; }
+  th { color:var(--acc); font-weight:normal; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Build on <span>blindrange</span> — Node.js</h1>
+<div class="tag">One <code>npm install</code>. No Python to set up, no daemon
+to run, no port to secure. The statements are the
+<a href="/build">SQL dialect</a> — <b>shaped like SQL, deliberately not
+SQL</b> — and every sample below is quoted from
+<a href="https://github.com/alviso/blindrange/blob/main/examples/node/quickstart.mjs">examples/node/quickstart.mjs</a>,
+which the test suite runs.</div>
+
+<h2><span class="n">1</span>Install and connect</h2>
+<pre>npm install blindrange</pre>
+<pre><code class="from-quickstart">import { connect, UnsupportedError } from "blindrange";</code></pre>
+<pre><code class="from-quickstart">const db = await connect({
+  path: process.env.BR_STATE || "/tmp/blindrange-node-quickstart",
+  passphrase: "quickstart passphrase",
+  bootstrap: [process.env.BR_BOOTSTRAP || "seed.blindrange.dev:7501"],
+  networkSecret: process.env.BR_SECRET || "blindrange-public",
+});</code></pre>
+
+<table>
+<tr><th>option</th><th>what it is</th><th>example</th></tr>
+<tr><td><code>path</code></td>
+    <td>directory holding your tables' master keys, encrypted at rest.
+        <b>Back it up</b> — the network only has ciphertext.</td>
+    <td><code>"./shop"</code></td></tr>
+<tr><td><code>passphrase</code></td>
+    <td>unlocks that directory. Sent to the child over stdin, never on
+        argv, never on any socket.</td>
+    <td><code>"correct horse battery staple"</code></td></tr>
+<tr><td><code>bootstrap</code></td>
+    <td>any one live peer; gossip finds the rest.</td>
+    <td><code>["seed.blindrange.dev:7501"]</code></td></tr>
+<tr><td><code>networkSecret</code></td>
+    <td>which network — anti-vandal, not access control.</td>
+    <td><code>"blindrange-public"</code></td></tr>
+</table>
+
+<h2><span class="n">2</span>Everything is a statement</h2>
+<pre><code class="from-quickstart">await db.execute(`CREATE TABLE orders (
+  amount   INT BITS 20 BLUR 64,
+  day      INT BITS 16 BLUR 16,
+  status   TEXT(6) BLUR 16,
+  customer STORED
+)`);</code></pre>
+<pre><code class="from-quickstart">await db.execute(`INSERT INTO orders (amount, day, status, customer) VALUES
+  (450, 201, 'paid', 'cust-001'),
+  (120, 205, 'refunded', 'cust-002'),
+  (720, 210, 'paid', 'cust-003')`);</code></pre>
+<pre><code class="from-quickstart">console.log(await db.execute(
+  `SELECT customer, amount FROM orders WHERE amount BETWEEN 300 AND 800
+   ORDER BY amount DESC`));</code></pre>
+<pre><span class="g">[ { customer: 'cust-003', amount: 720 },
+  { customer: 'cust-001', amount: 450 } ]</span></pre>
+
+<p>Counts and sums come from index metadata — nothing fetched, nothing
+decrypted, and the sum arrives <b>with its error bar</b>, which is exactly
+the resolution you traded for privacy:</p>
+<pre><code class="from-quickstart">console.log(await db.execute(`SELECT COUNT(*) FROM orders`));
+console.log(await db.execute(`SELECT APPROX SUM(amount) FROM orders`));</code></pre>
+<pre><span class="g">[ { count: 3, basis: 'exact-to-leaf' } ]
+[ { sum: 1310.5, plus_minus: 96, rows: 3 } ]</span></pre>
+
+<pre><code class="from-quickstart">await db.execute(`UPDATE orders SET status = 'shipped' WHERE amount = 450`);
+await db.execute(`DELETE FROM orders WHERE day > 208`);</code></pre>
+
+<h2><span class="n">3</span>Refusals arrive typed</h2>
+<p>Everything the engine genuinely cannot do — <code>JOIN</code>,
+<code>OR</code>, exact <code>SUM()</code>, leading-wildcard
+<code>LIKE</code> — rejects with <code>UnsupportedError</code>, whose
+message names why and what to use instead. A boundary is never dressed up
+as a bug:</p>
+<pre><code class="from-quickstart">try {
+  await db.execute(`SELECT SUM(amount) FROM orders`);
+} catch (e) {
+  if (e instanceof UnsupportedError) console.log("refused:", e.message);
+}</code></pre>
+<p>The full refusal table, with reasons, is in
+<a href="/build#refused">the SQL guide</a>.</p>
+
+<h2><span class="n">4</span>How this package works, honestly</h2>
+<div class="note"><b>It is not a JavaScript reimplementation.</b> The
+package spawns the reference Python client as a child it owns — a
+self-contained CPython ships as a platform-specific optional dependency,
+the same prebuilt interpreters <code>uv</code> installs. Stdio only:
+<b>no port exists</b>, so nothing else on the machine can reach your
+database, and the child dies with your process. Why: the client is where
+all cryptography lives, and a parallel implementation would have to match
+it byte-for-byte forever — every divergence would be silent corruption.
+Running the reference means every feature, fix and measurement lands here
+the day it ships, including QUIC direct paths.</div>
+<div class="note warn"><b>Costs, stated plainly:</b> roughly 40&nbsp;MB
+download for the bundled runtime (npm selects only your platform's), and
+about 100&nbsp;ms of child start per <code>connect()</code>. If no bundled
+runtime exists for your platform, the package falls back to
+<code>python3</code> on PATH with blindrange installed, or an explicit
+path in <code>BLINDRANGE_PYTHON</code>.</div>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/build">the SQL guide</a> ·
+<a href="/build-python">the Python guide</a> ·
+<a href="/demos">demos</a> ·
+<a href="https://status.blindrange.dev/">live network</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>

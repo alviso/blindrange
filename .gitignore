@@ -9,3 +9,5 @@ build/
 *.brdb
 *.brdb.tmp
 .DS_Store
+# assembled platform runtimes — rebuilt by npm/build_platform_packages.py
+npm/dist/

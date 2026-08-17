@@ -1,0 +1,26 @@
+{
+  "name": "blindrange",
+  "version": "0.1.0",
+  "description": "Range queries over storage that cannot read your data. SQL-shaped statements over the blindrange network; runs the reference client, so there is nothing to drift.",
+  "license": "MIT",
+  "repository": "github:alviso/blindrange",
+  "homepage": "https://blindrange.dev/build-node",
+  "main": "./index.cjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs"
+    }
+  },
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "@blindrange/python-darwin-arm64": "0.1.0",
+    "@blindrange/python-darwin-x64": "0.1.0",
+    "@blindrange/python-linux-x64": "0.1.0",
+    "@blindrange/python-linux-arm64": "0.1.0",
+    "@blindrange/python-win32-x64": "0.1.0"
+  },
+  "keywords": ["encrypted", "database", "range-query", "privacy", "sql"]
+}

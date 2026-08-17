@@ -80,7 +80,8 @@ class TestQuickstartRuns(unittest.TestCase):
         """
         import html as _html
         pairs = [("docs/build.html", "examples/sql_quickstart.py"),
-                 ("docs/build-python.html", "examples/quickstart.py")]
+                 ("docs/build-python.html", "examples/quickstart.py"),
+                 ("docs/build-node.html", "examples/node/quickstart.mjs")]
         for page_path, script_path in pairs:
             page = (ROOT / page_path).read_text()
             script = (ROOT / script_path).read_text()
