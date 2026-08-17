@@ -179,13 +179,13 @@ def assemble(tag, triple, assets, urls, wheel, version):
         "exports.env = {};\n")
     os_name, cpu = tag.split("-")
     (pkg / "package.json").write_text(json.dumps({
-        "name": f"@blindrange/python-{tag}",
+        "name": f"@alviso/blindrange-python-{tag}",
         "version": version,
         "description": f"Self-contained CPython + blindrange for {tag}. "
                        f"Installed automatically by the blindrange package;"
                        f" never depend on this directly.",
         "license": "MIT",
-        "repository": "github:alviso/blindrange",
+        "repository": {"type": "git", "url": "git+https://github.com/alviso/blindrange.git"},
         "main": "index.js",
         "os": [os_name],
         "cpu": [cpu],

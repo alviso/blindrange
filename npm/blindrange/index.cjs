@@ -14,7 +14,7 @@
  * Interpreter resolution, in order:
  *   1. opts.python                    — explicit path
  *   2. env BLINDRANGE_PYTHON          — CI / development
- *   3. @blindrange/python-<platform>  — the bundled self-contained CPython
+ *   3. @alviso/blindrange-python-<platform> — the bundled CPython
  *      installed automatically as a platform-specific optionalDependency
  *   4. python3 on PATH with the blindrange package importable
  */
@@ -36,7 +36,7 @@ function resolvePython(opts) {
   const tag = `${process.platform}-${process.arch}`;
   try {
     // eslint-disable-next-line global-require
-    const plat = require(`@blindrange/python-${tag}`);
+    const plat = require(`@alviso/blindrange-python-${tag}`);
     return { cmd: plat.python, env: plat.env || {} };
   } catch (e) {
     /* no bundled runtime for this platform — fall through */
