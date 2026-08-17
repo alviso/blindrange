@@ -105,6 +105,12 @@ con = connect(
 )
 rows = con.execute(<span class="k">"SELECT ..."</span>)          <span class="c"># every statement returns a list of dicts</span></pre>
 
+<div class="note"><b>Reads are local.</b> The connection keeps a complete
+encrypted mirror of each table beside your state directory: lookups,
+ranges, counts and "not found" all answer from local disk at local speed,
+while writes go to the network for durability. You configure nothing.
+Opening a large existing database does a one-time full sync first.</div>
+
 <div class="note warn"><b>Nobody can recover this for you.</b> Each table's
 master key lives under that directory, locked by the passphrase, and every
 key on the network is an HMAC under it. Lose both and the data is gone —
@@ -173,12 +179,9 @@ matching is <code>=</code> or a trailing-<code>%</code> LIKE — the index is
 a prefix index, and equality still checks the full value on the decrypted
 row, so <code>'paid'</code> never matches <code>'paidX'</code>.</p>
 
-<div class="note"><b>ORDER BY … DESC LIMIT n is the cheap direction</b> for
-"the most recent n": it walks the range from the top and stops. Ascending
-with a LIMIT answers a different question — the <i>oldest</i> matches —
-and pays for every bucket in the range on the way there. Measured on the
-demo network: five round trips against one, returning rows 479 hours old
-instead of 20 minutes.</div>
+<p class="lead"><code>ORDER BY … DESC LIMIT n</code> is how you ask for
+the newest n — ascending with a limit answers with the <i>oldest</i>
+matches, which is a different question.</p>
 
 <h2 id="aggregate"><span class="n">5</span>COUNT and APPROX SUM — nothing decrypted</h2>
 <pre><code class="from-quickstart">SELECT COUNT(*) FROM orders WHERE amount BETWEEN 0 AND 1000</code></pre>

@@ -141,6 +141,10 @@ all cryptography lives, and a parallel implementation would have to match
 it byte-for-byte forever — every divergence would be silent corruption.
 Running the reference means every feature, fix and measurement lands here
 the day it ships, including QUIC direct paths.</div>
+<div class="note"><b>Reads are local.</b> The bridge keeps a complete
+encrypted mirror of each table beside the state directory — lookups,
+ranges, counts and "not found" answer from local disk. Writes go to the
+network for durability. Nothing to configure.</div>
 <div class="note warn"><b>Costs, stated plainly:</b> roughly 40&nbsp;MB
 download for the bundled runtime (npm selects only your platform's), and
 about 100&nbsp;ms of child start per <code>connect()</code>. If no bundled

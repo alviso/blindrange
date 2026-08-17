@@ -334,9 +334,10 @@ case where there is no trade: append-only is what the index already is,
 tamper-evidence falls out of per-record AEAD, and the queries audit logs
 actually use are the three this index is fastest at. For most data "the
 vendor can read it" is tolerated; for an audit trail it is a liability.</p>
-<p><a href="/build"><b>Build on it →</b></a> CREATE TABLE, INSERT,
-SELECT, UPDATE, DELETE — familiar verbs over storage that cannot read any
-of it. Shaped like SQL, deliberately not SQL: everything the engine cannot
+<p><a href="/build"><b>Build on it →</b></a> your application talks to a
+local database at local speed; blindrange replicates it — encrypted,
+continuously — to machines that cannot read it. Familiar verbs over
+storage that cannot read any of it. Shaped like SQL, deliberately not SQL: everything the engine cannot
 do is refused with the reason, and every sample is quoted from a script
 the test suite runs. The <a href="/build-python">Python guide</a> is the
 same ground with the full API.</p>

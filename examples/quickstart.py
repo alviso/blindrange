@@ -85,6 +85,12 @@ def main():
         print(f"   created {state_path} · joined via {a.bootstrap}")
     print(f"   {len(db.network())} nodes visible")
 
+    # Local-first: keep a complete encrypted mirror beside the state file.
+    # Reads — including proving something ABSENT — answer from local disk;
+    # only writes touch the network. The SQL layer and the npm package do
+    # this by default; the raw API asks you to say it once.
+    db.enable_mirror()
+
     # ---------------------------------------------------------------- 3
     step(3, "CREATE — write records")
     rows = [{"amount": 100 + (i * 37) % 900, "day": 200 + i % 30,
