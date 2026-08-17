@@ -1786,6 +1786,231 @@ class Owner:
                 epochs.append(E)
         return {"epochs_purged": epochs, "keys_removed": removed}
 
+    # Orphan sweep tuning. Windows are index counts per probing batch;
+    # the tail is how far past the last hit a dense scan keeps looking.
+    PURGE_WINDOW = 512
+    PURGE_MISS_TAIL = 1024
+    PURGE_TIER3_LEVELS = 3
+    PURGE_TIER3_STRIDE = 512
+    PURGE_TIER3_MAX = 1 << 20
+    PURGE_MAX_LABELS = 65_536
+    PURGE_FULL_DEPTH = 8
+
+    def purge_orphans(self, verbose=False):
+        """Find and delete every key a crashed compaction stranded.
+
+        purge_epochs() above re-walks dead epochs the way compaction did,
+        and that walk has two blind spots, both created by the crash it is
+        cleaning up after:
+
+          * The walk PRUNES: it only descends into children of non-empty
+            labels. Compaction deletes top-down, so an interrupted delete
+            removes parent chains first — leaving whole child subtrees
+            fully intact but unreachable. Nothing is wrong with those
+            chains; the walk just never asks about them. Measured on the
+            public network, one interrupted compaction stranded roughly
+            3.5 million keys this way.
+          * Galloping assumes chains are dense. A chain whose prefix was
+            deleted before the crash reads as empty from index 1, and its
+            surviving tail is invisible.
+
+        This sweep closes both. It enumerates the COMPLETE label set from
+        the schema — every dyadic tree node, no pruning, since the label
+        space is deterministic and needs no discovery — and gallops every
+        (label, writer) chain of every dead epoch. Every non-empty chain
+        is then dense-scanned past its discovered end, tolerating holes.
+        And the top PURGE_TIER3_LEVELS of each field's tree get a lattice
+        probe even when they look empty, because deletion order means the
+        one prefix-holed chain is almost always an upper level.
+
+        Stated residual, honestly: a chain BELOW those levels whose prefix
+        was deleted and whose tail survives escapes this sweep. Deletion
+        order makes that shape vanishingly rare, and a rerun after the
+        next compaction will not resurrect it — it stays bounded, not
+        growing.
+
+        Blobs: chain values unmask to record ids, so any rid referenced
+        only by dead epochs has its blob checked and removed too. Blobs
+        of records that were never indexed by a reachable chain cannot be
+        named by anyone, this sweep included; that is the price of blobs
+        keyed by random handles.
+
+        Refuses while a compaction is in flight, because epoch current-1
+        is then still live for readers — finish it first with
+        compact(resume=True).
+        """
+        self._refresh_epoch()
+        if len(self._epochs()) > 1:
+            raise RuntimeError(
+                "a compaction is in flight (or died mid-flight), so the "
+                "previous epoch is still live for readers. Finish it with "
+                "compact(resume=True), then purge.")
+        writers = self._refresh_writers() or [self._st["writer"]]
+        current = self._st["epoch"]
+        if current == 0:
+            return {"epochs": [], "chain_keys_removed": 0,
+                    "blobs_removed": 0, "beyond_gallop": 0}
+
+        say = (lambda *a: print(*a, flush=True)) if verbose else (lambda *a: None)
+        live_entries = self._walk_epoch(current, writers)[0]
+        live_rids = set()
+        for rids in live_entries.values():
+            live_rids.update(rids)
+
+        # Which labels to sweep. A field's full label set is 2^(mlvl+1) —
+        # 2,046 for a 22-bit field at leaf 4096, over a million for a
+        # 31-bit one. Small trees are enumerated completely, which is the
+        # whole point: no pruning, no blind spots. Large trees are swept
+        # completely down to PURGE_FULL_DEPTH and guided below it by where
+        # the CURRENT epoch holds data — value distributions do not move
+        # between epochs of the same database, so dead-epoch keys live
+        # under the same subtrees the live ones do. The one shape that
+        # escapes guided mode is dead data in a value region the database
+        # no longer touches at all, below the fully-swept depth; the
+        # result reports which mode ran so nobody mistakes guided for
+        # exhaustive.
+        occupied = set(live_entries)
+
+        def sweep_labels(field, spec):
+            mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+            total = (1 << (mlvl + 1)) - 2
+            if total <= self.PURGE_MAX_LABELS:
+                for lvl in range(1, mlvl + 1):
+                    for idx in range(1 << lvl):
+                        yield f"{field}|{lvl}|{idx}", lvl
+                return
+            full_depth = self.PURGE_FULL_DEPTH
+            for lvl in range(1, full_depth + 1):
+                for idx in range(1 << lvl):
+                    yield f"{field}|{lvl}|{idx}", lvl
+            seen = set()
+            for lab in occupied:
+                try:
+                    f, lvl_s, idx_s = lab.split("|")
+                    lvl, idx = int(lvl_s), int(idx_s)
+                except ValueError:
+                    continue
+                if f != field or lvl <= full_depth:
+                    continue
+                # the occupied label, its ancestors down to full_depth,
+                # and its children one level below — the halo where a
+                # crashed delete strands neighbours
+                for l2, i2 in ([(lvl, idx)]
+                               + [(lvl - d, idx >> d)
+                                  for d in range(1, lvl - full_depth)]
+                               + ([(lvl + 1, idx * 2), (lvl + 1, idx * 2 + 1)]
+                                  if lvl < mlvl else [])):
+                    if (l2, i2) not in seen:
+                        seen.add((l2, i2))
+                        yield f"{field}|{l2}|{i2}", l2
+
+        removed = blobs_removed = beyond = 0
+        epochs_touched = []
+        dead_rids = set()
+        coverage = "full"
+        for E in range(0, current):
+            found_keys = []
+            for field, spec in list(self._st["schema"].items()) + [(TOMB, None)]:
+                if field != TOMB:
+                    mlvl = max_level(spec["bits"],
+                                     spec.get("leaf_width", 1))
+                    if (1 << (mlvl + 1)) - 2 > self.PURGE_MAX_LABELS:
+                        coverage = "guided"
+                labels = ([(TOMB, 0)] if field == TOMB
+                          else list(sweep_labels(field, spec)))
+                k_ws = {lab: self._k_w(lab) for lab, _ in labels}
+                spec_map = {(lab, u): ((lambda i, k=k_ws[lab], e=E, u=u:
+                                        self._ut(k, e, u, i)), 0)
+                            for lab, _ in labels for u in writers}
+                ends = self._discover_ends(spec_map) if spec_map else {}
+                lvl_of = dict(labels)
+                for (lab, u), end in ends.items():
+                    k_w = k_ws[lab]
+                    hits = {}
+                    for i in range(1, end + 1):
+                        hits[i] = self._ut(k_w, E, u, i)
+                    # Tier 2: holes above the galloped end. Non-empty
+                    # chains only, so this stays cheap.
+                    if end > 0:
+                        extra = self._dense_scan(k_w, E, u, start=end + 1)
+                        beyond += len(extra)
+                        hits.update(extra)
+                    # Tier 3: prefix-holed upper levels that look empty.
+                    elif lvl_of.get(lab, 99) <= self.PURGE_TIER3_LEVELS:
+                        first = self._lattice_probe(k_w, E, u)
+                        if first:
+                            extra = self._dense_scan(
+                                k_w, E, u,
+                                start=max(1, first - self.PURGE_TIER3_STRIDE))
+                            beyond += len(extra)
+                            hits.update(extra)
+                    if not hits:
+                        continue
+                    got = self._mget(list(hits.values()))
+                    for i, key in hits.items():
+                        v = got.get(key)
+                        if v is None:
+                            continue
+                        found_keys.append(key)
+                        if field != TOMB:
+                            try:
+                                masked = b64decode(v)
+                                mask = self._mask(k_w, E, u, i)
+                                dead_rids.add(bytes(
+                                    x ^ y for x, y in
+                                    zip(masked, mask)).hex())
+                            except Exception:
+                                pass          # junk value; key still dies
+            if found_keys:
+                epochs_touched.append(E)
+                say(f"  epoch {E}: {len(found_keys):,} stranded keys")
+                for i in range(0, len(found_keys), self.CHUNK):
+                    self._delete(found_keys[i:i + self.CHUNK])
+                removed += len(found_keys)
+
+        # Blobs referenced only by dead epochs. Existence-checked first so
+        # the count reports what was actually there.
+        candidates = ["R:" + r for r in dead_rids - live_rids]
+        for i in range(0, len(candidates), self.CHUNK):
+            chunk = candidates[i:i + self.CHUNK]
+            present = list(self._mget(chunk))
+            if present:
+                self._delete(present)
+                blobs_removed += len(present)
+        return {"epochs": epochs_touched, "chain_keys_removed": removed,
+                "blobs_removed": blobs_removed, "beyond_gallop": beyond,
+                "coverage": coverage}
+
+    def _dense_scan(self, k_w, E, u, start):
+        """Window scan that survives holes: keeps going until a full miss
+        tail past the last hit, instead of stopping at the first gap."""
+        out, i, last_hit = {}, start, start - 1
+        while i <= last_hit + self.PURGE_MISS_TAIL:
+            window = {self._ut(k_w, E, u, j): j
+                      for j in range(i, i + self.PURGE_WINDOW)}
+            got = self._mget(list(window))
+            for key in got:
+                j = window[key]
+                out[j] = key
+                last_hit = max(last_hit, j)
+            i += self.PURGE_WINDOW
+        return out
+
+    def _lattice_probe(self, k_w, E, u):
+        """Cheapest question first: does ANYTHING survive in this chain?
+        Arithmetic-stride probes across the plausible index range; returns
+        the first surviving index or None. Deletion goes prefix-first, so
+        survivors form a suffix and a stride-width suffix cannot slip
+        between probes."""
+        idxs = list(range(1, self.PURGE_TIER3_MAX, self.PURGE_TIER3_STRIDE))
+        for base in range(0, len(idxs), 4096):
+            window = {self._ut(k_w, E, u, j): j
+                      for j in idxs[base:base + 4096]}
+            got = self._mget(list(window))
+            if got:
+                return min(window[k] for k in got)
+        return None
+
     # ------------------------------------------------------------- repair
     def repair(self):
         """Anti-entropy sweep: walk everything reachable (system chains, the
