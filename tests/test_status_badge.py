@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import unittest
+import unittest.mock
 
 from blindrange import node
 from blindrange.node import audit_badge, status_html
@@ -260,3 +261,85 @@ class TestRosterLinger(unittest.TestCase):
         live = [r for r in rows
                 if r.get("mode") != "down" and not r.get("down")]
         self.assertEqual([r["id"] for r in live], ["aa"])
+
+
+class TestPeerStatsRefusesImpostors(unittest.TestCase):
+    """A /stats answer is only believed if the answerer IS the asked node.
+
+    For one night the public seed attributed its own statistics to four
+    peers: every roster row showed the seed's key count and "directly
+    reachable", until a restart. /stats always carried node_id; nothing
+    checked it. Now an answer from the wrong node is discarded and logged
+    with the addr and the actual speaker — the two facts that will name
+    the transport bug when it recurs.
+    """
+
+    def _stats_for(self, answerer_id, asked_id):
+        import io
+        import json as _json
+        import sys as _sys
+
+        fake = {"node_id": answerer_id, "keys": 123, "version": "v"}
+
+        class FakePool:
+            @staticmethod
+            def request(addr, method, path, timeout=None):
+                return 200, _json.dumps(fake).encode()
+
+        err = io.StringIO()
+        with unittest.mock.patch.object(node, "POOL", FakePool), \
+             unittest.mock.patch.object(_sys, "stderr", err):
+            node._IMPOSTOR_LOGGED.clear()
+            out = node._peer_stats(asked_id, {"addr": "1.2.3.4:1"},
+                                   "s", None, "me" * 8)
+        return out, err.getvalue()
+
+    def test_the_right_answerer_is_believed(self):
+        out, _ = self._stats_for("aa" * 8, "aa" * 8)
+        self.assertEqual(out["keys"], 123)
+
+    def test_the_wrong_answerer_is_discarded_and_named(self):
+        out, logged = self._stats_for("bb" * 8, "aa" * 8)
+        self.assertIsNone(out, "an impostor's stats were believed")
+        self.assertIn("bbbbbbbb", logged)
+        self.assertIn("1.2.3.4:1", logged)
+
+    def test_answering_with_my_own_stats_is_called_out(self):
+        out, logged = self._stats_for("me" * 8, "aa" * 8)
+        self.assertIsNone(out)
+        self.assertIn("(me)", logged,
+                      "self-attribution is the observed failure and the log "
+                      "should say so explicitly")
+
+
+class TestFutureTimestampsCannotPoisonTheRoster(unittest.TestCase):
+    """An entry stamped in the future wins every newer-ts comparison and
+    never crosses the TTL — an immortal lie until restart. Rejected at
+    ingest instead."""
+
+    def test_future_entry_is_refused_and_sane_one_accepted(self):
+        import tempfile
+        import time as _time
+        d1 = tempfile.mkdtemp()
+        d2 = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d1, True)
+        self.addCleanup(__import__("shutil").rmtree, d2, True)
+        peers = node.Peers(node.Identity(d1), "127.0.0.1:7501")
+        other = node.Identity(d2)
+        now_ms = int(_time.time() * 1000)
+
+        good = other.heartbeat("9.9.9.9:7501")
+        peers.merge({other.node_id: good})
+        self.assertIn(other.node_id, peers.table, "a sane entry was refused")
+
+        # Same identity, timestamp an hour in the future: must not land,
+        # and must not displace the sane entry.
+        evil = dict(good)
+        evil["ts"] = now_ms + 3_600_000
+        evil["sig"] = other.priv.sign(
+            f"{evil['addr']}|{evil.get('udp', '')}|{evil['ts']}".encode()
+        ).hex()
+        peers.merge({other.node_id: evil})
+        self.assertLess(peers.table[other.node_id]["ts"],
+                        now_ms + node.CLOCK_SKEW_MAX * 1000,
+                        "a future-stamped entry took an immortal seat")

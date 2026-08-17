@@ -74,6 +74,7 @@ from . import token as tok_mod
 from . import __version__ as VERSION
 
 GOSSIP_EVERY = 2.0        # seconds between gossip rounds
+CLOCK_SKEW_MAX = float(os.environ.get("BR_CLOCK_SKEW_MAX", "120"))
 PEER_TTL = 15.0           # drop peers silent for this long
 REPAIR_EVERY = float(os.environ.get("BR_REPAIR_EVERY", "5"))
 REPAIR_BATCH = int(os.environ.get("BR_REPAIR_BATCH", "0"))   # 0 = adaptive
@@ -877,6 +878,13 @@ class Peers:
                 if nid == self.ident.node_id:
                     continue
                 cur = self.table.get(nid)
+                # A timestamp from the future is poison, not news: it wins
+                # every "newer ts" comparison forever, never crosses the
+                # TTL (the age computes negative), and the only cure was a
+                # restart. One skewed clock — or one replayed entry — must
+                # not get an immortal seat in everyone's roster.
+                if e.get("ts", 0) > (now + CLOCK_SKEW_MAX) * 1000:
+                    continue
                 if (not cur or e["ts"] > cur["ts"]) and verify_entry(nid, e):
                     if not cur:
                         self.changed_at = now
@@ -1121,9 +1129,22 @@ def _service_post(store, peers, hub, secret, path, data, quic=None):
 STATUS_CACHE = {"at": 0.0, "rows": [], "total": 0}
 
 
+_IMPOSTOR_LOGGED = {}
+
+
 def _peer_stats(nid, e, secret, hub, self_id):
     """Best-effort /stats for one peer (key count and version). Tenants are
-    reached over the relay connection they already hold with us."""
+    reached over the relay connection they already hold with us.
+
+    The answer is only believed if the answerer says it IS the node we
+    asked about. /stats has always carried node_id, and for one night the
+    public seed attributed its own statistics to four other nodes — every
+    peer row showed the seed's key count and "directly reachable", for
+    hours, until a restart. Whatever mislaid the transport (a poisoned
+    gossip addr, a pooled-connection desync — the log line below is
+    designed to say which, next time), the lie was only possible because
+    nobody checked the one field that names the speaker.
+    """
     try:
         if is_via(e["addr"]):
             _relay, tenant = parse_via(e["addr"])
@@ -1131,9 +1152,26 @@ def _peer_stats(nid, e, secret, hub, self_id):
                                     "path": "/stats", "body_b64": ""})
             if not out or out.get("status") != 200:
                 return None
-            return json.loads(b64decode(out["body_b64"]))
-        status, raw = POOL.request(e["addr"], "GET", "/stats", timeout=2)
-        return json.loads(raw) if status == 200 else None
+            stats = json.loads(b64decode(out["body_b64"]))
+        else:
+            status, raw = POOL.request(e["addr"], "GET", "/stats", timeout=2)
+            if status != 200:
+                return None
+            stats = json.loads(raw)
+        answerer = stats.get("node_id")
+        if answerer is not None and answerer != nid:
+            # Somebody answered — the wrong somebody. Refuse the data and
+            # keep the evidence: the addr and who actually spoke are the
+            # two facts that identify the transport bug when it recurs.
+            now = time.time()
+            if now - _IMPOSTOR_LOGGED.get(nid, 0) > 300:
+                _IMPOSTOR_LOGGED[nid] = now
+                print(f"stats: asked {nid[:8]} at {e['addr']} but "
+                      f"{answerer[:8]}{' (me)' if answerer == self_id else ''}"
+                      f" answered — discarding, showing unknown instead",
+                      file=sys.stderr, flush=True)
+            return None
+        return stats
     except (OSError, ValueError, KeyError):
         return None
 
