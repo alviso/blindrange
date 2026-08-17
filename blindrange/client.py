@@ -393,6 +393,7 @@ class Owner:
                         if n in getattr(self, "_addr_of", {})] + contacts
         found = {}
         udp = {}
+        src = {}
         answers = 0
         for addr in contacts:
             try:
@@ -400,6 +401,8 @@ class Owner:
                 for nid, e in peers.items():
                     if e.get("age", 1e9) <= PEER_LIVE_S and e.get("addr"):
                         found[nid] = e["addr"]
+                        src.setdefault(
+                            e["addr"], (addr, e.get("age"), time.time()))
                         # .get everywhere: a roster ghost (a lingering
                         # not-answering node) carries whatever fields it
                         # was remembered with, and one absent field
@@ -416,6 +419,7 @@ class Owner:
                                   f"(tried {contacts})")
         self._addr_of = found
         self._udp_of = udp
+        self._memb_src = src
         new_ring = Ring(sorted(found), replicas=3,
                         groups={nid: failure_group(a, udp.get(nid, ""))
                                 for nid, a in found.items()})
@@ -1235,10 +1239,24 @@ class Owner:
                 silent = getattr(self, "last_silent", {})
                 who = sorted({a for cid in poisoned
                               for a in silent.get(keys[cid], [])})
+                # Provenance turns a refusal into a case file: WHO told
+                # this client the silent node was alive, how old that
+                # claim was at admission, and how long ago that was. A
+                # roster ghost is only explicable at admission time.
+                srcs = getattr(self, "_memb_src", {})
+                now = time.time()
+                trail = {}
+                for a in who:
+                    rec = srcs.get(a)
+                    if rec:
+                        trail[a] = (f"served by {rec[0]} at age {rec[1]}s, "
+                                    f"{now - rec[2]:.0f}s ago")
+                    else:
+                        trail[a] = "no admission record"
                 raise ConnectionError(
                     f"cannot determine chain end: {len(poisoned)} probe(s) "
                     f"unresolved; silent replicas: {who} — refusing to "
-                    f"conclude absence from silence")
+                    f"conclude absence from silence; provenance: {trail}")
             done = []
             for cid, p in batch.items():
                 st = state[cid]

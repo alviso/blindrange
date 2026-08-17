@@ -202,15 +202,24 @@ class TestE2E(unittest.TestCase):
         wait_http(f"127.0.0.1:{port}")
         wait_peers(f"127.0.0.1:{port}", 5, self.secret)  # learns the network
         # membership is eventually consistent: poll until the owner's view
-        # includes the new node and has dropped the dead pair
-        deadline = time.time() + 20
+        # includes the new node AND has dropped the dead pair. The comment
+        # above always promised both; the code only checked the first —
+        # and a refresh landing inside the ~16s window where nodes still
+        # serve a corpse (purge runs on merge, /peers serves the raw
+        # snapshot) re-admitted the dead here and carried them into every
+        # later test. The CI refusals named exactly this pair.
+        dead = {f"127.0.0.1:{BASE + 2}", f"127.0.0.1:{BASE + 4}"}
+        deadline = time.time() + 30
         while time.time() < deadline:
             self.owner.refresh_membership()
-            if f"127.0.0.1:{port}" in self.owner._addr_of.values():
+            got = set(self.owner._addr_of.values())
+            if f"127.0.0.1:{port}" in got and not dead & got:
                 break
             time.sleep(0.5)
         self.assertIn(f"127.0.0.1:{port}",
                       self.owner._addr_of.values())
+        self.assertFalse(dead & set(self.owner._addr_of.values()),
+                         "the dead pair re-entered the view in test_05")
         self.assert_query("amount", 100_000, 300_000)   # failover + read-repair
 
     def test_06_owner_reopen_and_insert(self):
