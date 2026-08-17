@@ -174,6 +174,22 @@ class TestE2E(unittest.TestCase):
                              "the dead pair never left membership")
         finally:
             _c.PEER_LIVE_S = old_live
+        # That burial used a 12 s threshold; every client CREATED later
+        # (reopen, invite, cache-loss) uses the default. A corpse aged
+        # 12-40 s re-enters those fresh views, gets routed, stays silent,
+        # and the integrity rule rightly refuses absence — CI machines
+        # land in exactly that window (the named refusal listed the two
+        # corpses verbatim). Wait until the dead are dead under the
+        # DEFAULT threshold too, so no later client can ever route to
+        # them. This is the fixture keeping its promise, not a timeout.
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            self.owner.refresh_membership()
+            if not dead & set(self.owner._addr_of.values()):
+                break
+            time.sleep(1)
+        self.assertFalse(dead & set(self.owner._addr_of.values()),
+                         "the dead pair re-entered the default-threshold view")
 
     def test_05_node_join_via_gossip(self):
         port = BASE + 9
