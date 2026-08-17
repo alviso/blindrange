@@ -210,6 +210,9 @@ background once enough pile up (<code>PRAGMA AUTOCOMPACT OFF</code> if you
 want manual control, <code>COMPACT orders</code> to force one). Automating
 this is recent and deliberate: compaction now survives its own crash and
 resumes, so a process dying mid-compaction no longer wedges anything.</p>
+<p>One rule from the field: after any integrity incident, converge by
+wiping <b>with integrity enforced</b> — a wipe under a compromised view
+deletes only what that view could see, and leaves the rest as orphans.</p>
 
 <h2 id="docs-ctr"><span class="n">7</span>Documents and counters</h2>
 <p>Two things applications always need, built in so nobody reinvents
