@@ -1036,6 +1036,12 @@ class Owner:
                                 if self._addr(n)]
             fan(0, R + PROBE_EXTRA, list(stuck))
         self.last_unresolved = unresolved()
+        # Name the silent, always: a refusal that says "1 probe(s)" sent a
+        # production team four repro attempts and two hypotheses; the same
+        # refusal naming two addresses is its own diagnosis.
+        self.last_silent = {
+            k: [a for a in route[k][:R] if a not in replied]
+            for k in self.last_unresolved}
         # Read-repair is a durability feature with one sharp edge, found
         # live: during a MASS DELETE, a replica that missed its
         # best-effort delete still holds the key, the primary honestly
@@ -1129,12 +1135,16 @@ class Owner:
             if poisoned:
                 # Concluding a chain end from an unanswered probe is how a
                 # degraded network turned into a truncated database. Fail
-                # the operation loudly; the caller retries when replicas
-                # return. Slowness and errors — never silently fewer rows.
+                # the operation loudly — and NAME the silent replicas,
+                # because "1 probe(s)" cost a production team four repro
+                # attempts while the addresses would have been the answer.
+                silent = getattr(self, "last_silent", {})
+                who = sorted({a for cid in poisoned
+                              for a in silent.get(keys[cid], [])})
                 raise ConnectionError(
-                    f"cannot determine chain end: replicas unreachable for "
-                    f"{len(poisoned)} probe(s) — refusing to conclude "
-                    f"absence from silence")
+                    f"cannot determine chain end: {len(poisoned)} probe(s) "
+                    f"unresolved; silent replicas: {who} — refusing to "
+                    f"conclude absence from silence")
             done = []
             for cid, p in batch.items():
                 st = state[cid]
