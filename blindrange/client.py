@@ -654,6 +654,29 @@ class Owner:
             self._mirror.close()
             self._mirror = None
 
+    def _single_writer(self):
+        """Is this process the only writer this database has ever had?
+
+        From the cached registry, deliberately: the moment invite() runs,
+        the registry grows on its next refresh and freshness reverts to
+        the windowed regime automatically. Until then, write-through means
+        the mirror is complete by construction and never expires.
+        """
+        writers = (getattr(self, "_writers_cache", None)
+                   or self._st.get("writers") or [])
+        return len(writers) <= 1
+
+    def mirror_status(self):
+        """Everything an operator wants to know about the local mirror:
+        completeness, when it last synced, how long a pass takes (which
+        is what freshness windows are measured against), and hit rates.
+        The first deployment built a watcher out of log lines for lack of
+        exactly this."""
+        if self._mirror is None:
+            return None
+        return {**self._mirror.status(),
+                "single_writer": self._single_writer()}
+
     def sync(self):
         """One reconcile pass: walk everything reachable in the current
         epoch(s) with warm caches and land it in the mirror. Uses the same
@@ -675,6 +698,7 @@ class Owner:
         m = self._mirror
         if m is None:
             return
+        t_pass = time.time()
         writers = self._refresh_writers(force=True)
         self._refresh_epoch(force=True)
         for E in self._epochs():
@@ -691,12 +715,19 @@ class Owner:
                     got = self._mget(missing)
                     m.put_many(list(got.items()))
         self._refresh_tombs(writers)
-        m.mark_synced()
+        m.mark_synced(duration_s=time.time() - t_pass)
 
     def _sync_loop(self, every):
         while not self._sync_stop.is_set():
             try:
                 self.sync()
+                # A loop that fires every 20s while a pass takes 10 minutes
+                # is a treadmill: permanent background churn that never
+                # yields a fresh mirror. Pace by what a pass actually
+                # costs on this topology.
+                if self._mirror is not None:
+                    every = max(every,
+                                2.0 * self._mirror.status()["last_pass_s"])
             except RuntimeError as e:
                 if "after shutdown" in str(e):
                     return          # interpreter exit race; nothing to say
@@ -862,7 +893,7 @@ class Owner:
             if not missing:
                 self._mirror.hits += len(keys)
                 return local
-            if self._mirror.fresh():
+            if self._mirror.fresh(single_writer=self._single_writer()):
                 self._mirror.hits += len(local)
                 self._mirror.misses += len(missing)
                 return local

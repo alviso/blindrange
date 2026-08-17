@@ -147,8 +147,9 @@ class TestFreshnessContract(MirrorCase):
 
         # Stale: the same query must fall through and find everything.
         with unittest.mock.patch.object(mirror_mod, "MIRROR_STALE_S", 0.0), \
-             unittest.mock.patch.object(type(o._mirror), "fresh",
-                                        lambda self, stale_s=0: False):
+             unittest.mock.patch.object(
+                 type(o._mirror), "fresh",
+                 lambda self, stale_s=0, single_writer=False: False):
             got = {r["n"] for r in o.query("amount", 0, 4095)}
         self.assertEqual(got, {1, 2},
                          "a stale mirror answered absence it could not know")
@@ -191,3 +192,62 @@ class TestRebuild(MirrorCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFreshnessRegimes(MirrorCase):
+    """The production findings, pinned: single-writer never expires;
+    multi-writer windows scale with measured pass duration."""
+
+    def test_single_writer_mirror_never_expires(self):
+        """A 30s window against 10-minute passes meant the mirror never
+        once counted as fresh and reads measured WORSE than no mirror.
+        For a single writer the age gate was wrong in principle:
+        write-through makes the mirror complete by construction."""
+        from blindrange import mirror as mirror_mod
+        o = self.owner("regime1")
+        o.insert_many([{"amount": 3, "n": 1}])
+        o.drain()
+        o.sync()
+        self.assertTrue(o._single_writer())
+        with unittest.mock.patch.object(mirror_mod, "MIRROR_STALE_S", 0.0):
+            rounds = self.count_rounds(o)
+            got = {r["n"] for r in o.query("amount", 0, 4095)}
+            self.assertEqual(got, {1})
+            self.assertEqual(rounds[0], 0,
+                             "a single-writer mirror expired by age — the "
+                             "exact regression the field report measured "
+                             "at 6.2s per read")
+
+    def test_multi_writer_window_scales_with_pass_duration(self):
+        o = self.owner("regime2")
+        o.insert_many([{"amount": 3, "n": 1}])
+        o.drain()
+        o.sync()
+        m = o._mirror
+        # Pretend the registry has two writers and the pass took an hour:
+        # a 30s static window must not defeat a 3600s pass.
+        m.mark_synced(duration_s=3600.0)
+        with unittest.mock.patch.object(o, "_single_writer",
+                                        lambda: False):
+            self.assertTrue(m.fresh(stale_s=30.0, single_writer=False),
+                            "the window did not scale with the pass")
+        # …but an ANCIENT sync still expires: backdate it past 3x.
+        import time as _time
+        with m.lock:
+            m.db.execute("INSERT OR REPLACE INTO meta VALUES "
+                         "('synced_at', ?)", (str(_time.time() - 12000),))
+            m.db.commit()
+        self.assertFalse(m.fresh(stale_s=30.0, single_writer=False))
+
+    def test_status_answers_the_operator_questions(self):
+        o = self.owner("status")
+        o.insert_many([{"amount": 1, "n": 1}])
+        o.drain()
+        # the background loop may already have completed a pass — that
+        # is the feature working, not a fixture problem
+        o.sync()
+        st = o.mirror_status()
+        self.assertTrue(st["complete_once"])
+        self.assertTrue(st["single_writer"])
+        self.assertGreaterEqual(st["last_pass_s"], 0.0)
+        self.assertGreater(st["keys"], 0)

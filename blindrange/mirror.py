@@ -89,19 +89,59 @@ class Mirror:
 
     # -- freshness -----------------------------------------------------
 
-    def mark_synced(self):
+    def mark_synced(self, duration_s=0.0):
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO meta VALUES "
                             "('synced_at', ?)", (str(time.time()),))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES "
+                            "('last_pass_s', ?)", (str(duration_s),))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES "
+                            "('complete_once', '1')")
             self.db.commit()
 
-    def fresh(self, stale_s=MIRROR_STALE_S):
-        """True while a sync pass completed recently enough that a local
-        miss may honestly be reported as absence."""
+    def _meta(self, k):
         with self.lock:
             row = self.db.execute(
-                "SELECT v FROM meta WHERE k='synced_at'").fetchone()
-        return bool(row) and time.time() - float(row[0]) < stale_s
+                "SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        return row[0] if row else None
+
+    def status(self):
+        synced = self._meta("synced_at")
+        return {"synced_at": float(synced) if synced else None,
+                "last_pass_s": float(self._meta("last_pass_s") or 0),
+                "complete_once": self._meta("complete_once") == "1",
+                "keys": self.count(), "hits": self.hits,
+                "misses": self.misses}
+
+    def fresh(self, stale_s=None, single_writer=False):
+        """May a local miss honestly be reported as absence?
+
+        Two regimes, learned in production the expensive way:
+
+        * SINGLE WRITER: yes, forever, once ONE pass has ever completed.
+          Write-through means every later key came from this process, so
+          the mirror is complete by construction and its AGE is
+          irrelevant. The first deployment ran with an age gate anyway —
+          and because a pass took ten minutes on that topology while the
+          window was thirty seconds, the mirror never once counted as
+          fresh, every absence walked the network, and reads measured
+          WORSE than having no mirror at all.
+        * MULTI WRITER: yes, within a window that a real pass can
+          actually satisfy — the configured floor or three times the
+          measured pass duration, whichever is larger. A static window
+          shorter than a pass is not a safety margin, it is a rule that
+          disables the feature while looking like caution.
+        """
+        if self._meta("complete_once") != "1":
+            return False
+        if single_writer:
+            return True
+        synced = self._meta("synced_at")
+        if not synced:
+            return False
+        window = max(stale_s if stale_s is not None else MIRROR_STALE_S,
+                     3.0 * float(self._meta("last_pass_s") or 0))
+        return time.time() - float(synced) < window
 
     def close(self):
         with self.lock:
