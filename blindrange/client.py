@@ -104,6 +104,7 @@ class Owner:
         self._direct = {}                  # node_id -> DirectPath
         self._no_direct_until = {}         # node_id -> retry-after ts
         self.direct_requests = 0           # served over punched QUIC paths
+        self.path_map = {}                 # node_id -> ("quic"|"relay", ts)
         self.refresh_membership()
 
     @classmethod
@@ -519,12 +520,14 @@ class Owner:
                     json.dumps(frame).encode(), timeout=10))
                 if out.get("s") == 200:
                     self.direct_requests += 1
+                    self.path_map[nid] = ("quic", time.time())
                     return json.loads(b64decode(out["b"]))
                 raise ConnectionError(f"direct request failed: {out.get('s')}")
             except ConnectionError:
                 raise
             except Exception:
                 self._drop_direct(nid)     # path died; fall back to relay
+        self.path_map[nid] = ("relay", time.time())
         env = {"to": nid, "id": os.urandom(8).hex(), "method": method,
                "path": path, "body_b64": b64encode(body).decode()}
         raw = json.dumps(env).encode()
@@ -1643,6 +1646,27 @@ class Owner:
 
 
     # ------------------------------------------------------------- audit
+    def paths(self):
+        """Which transport each NAT'd peer is actually getting, right now.
+
+        Exists because the first application spent a night stack-sampling
+        to learn that requests were sitting in _relay, and a later
+        diagnosis wrongly concluded QUIC could not punch from a container
+        — when the truth was per-tenant: most peers punch, one does not,
+        and absence latency is set by the slowest replica, so a single
+        relay-bound peer prices every absence proof. One glance at this
+        map answers "who is slow and why" without a profiler.
+        """
+        import time as _time
+        now = _time.time()
+        out = {}
+        for nid, (kind, ts) in sorted(self.path_map.items()):
+            blocked = self._no_direct_until.get(nid, 0) - now
+            out[nid[:8]] = {"path": kind, "age_s": round(now - ts, 1),
+                            **({"retry_in_s": round(blocked, 1)}
+                               if kind == "relay" and blocked > 0 else {})}
+        return out
+
     def audit(self, sample=200, timeout=8):
         """Verify what each node ACTUALLY holds, without asking it.
 
