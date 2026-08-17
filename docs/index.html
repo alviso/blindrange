@@ -355,12 +355,15 @@ of it, plus the attack harness we run against our own design, is on the
 
 <h2 id="built">Built with blindrange</h2>
 <p><a href="https://invoiceflow.tech"><b>InvoiceFlow →</b></a> a production
-invoicing app (FastAPI&nbsp;+&nbsp;React) migrating off MongoDB onto this
-public network. It runs in <b>dual mode</b> today — every record is written
-to both stores, reads flip as the verification drills pass — because that
-is what an honest cutover looks like, and we would rather show you one than
-claim it finished early. The app keeps its keys; invoices cross the wire
-sealed; the nodes store records they cannot read.</p>
+invoicing app (FastAPI&nbsp;+&nbsp;React) and the <b>first application to
+run on this network with no other database behind it</b>. The cutover was
+earned, not announced: dual mode first, every record written to MongoDB
+and blindrange side by side, count verification at each step, and
+a final drill that killed the network for 40 seconds in production — reads
+kept answering from the local mirror, and the one write caught in the
+outage landed when the network returned. Then Mongo was retired. The app
+keeps its keys; invoices cross the wire sealed; the nodes store records
+they cannot read.</p>
 <p>It is also the application that shaped the engine. The local-first
 mirror, <code>KEY</code> columns, network-atomic sequences and the
 refusing-absence-from-silence rule each exist because this migration hit
