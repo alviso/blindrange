@@ -658,7 +658,7 @@ class Owner:
         """One reconcile pass: walk everything reachable in the current
         epoch(s) with warm caches and land it in the mirror. Uses the same
         machinery queries use, so it cannot disagree with them."""
-        if self._mirror is None:
+        if self._mirror is None or self._sync_stop.is_set():
             return
         # The pass must SEE the network, not its own cache: discovery reads
         # through a fresh mirror report new chain entries as absent, and
@@ -672,23 +672,26 @@ class Owner:
             self._tls.bypass_mirror = False
 
     def _sync_inner(self):
+        m = self._mirror
+        if m is None:
+            return
         writers = self._refresh_writers(force=True)
         self._refresh_epoch(force=True)
         for E in self._epochs():
             entries, keys = self._walk_epoch(E, writers)
             if keys:
                 got = self._mget(keys)
-                self._mirror.put_many(list(got.items()))
+                m.put_many(list(got.items()))
             rids = {r for lst in entries.values() for r in lst}
             blob_keys = ["R:" + r for r in rids]
             if blob_keys:
-                have = self._mirror.get_many(blob_keys)
+                have = m.get_many(blob_keys)
                 missing = [k for k in blob_keys if k not in have]
                 if missing:
                     got = self._mget(missing)
-                    self._mirror.put_many(list(got.items()))
+                    m.put_many(list(got.items()))
         self._refresh_tombs(writers)
-        self._mirror.mark_synced()
+        m.mark_synced()
 
     def _sync_loop(self, every):
         while not self._sync_stop.is_set():
@@ -700,6 +703,8 @@ class Owner:
                 print(f"mirror sync failed (RuntimeError: "
                       f"{str(e)[:100]}) — will retry", flush=True)
             except Exception as e:      # background: loud, never fatal
+                if self._sync_stop.is_set() or self._mirror is None:
+                    return      # close() raced a pass in flight; not news
                 print(f"mirror sync failed ({type(e).__name__}: "
                       f"{str(e)[:100]}) — will retry", flush=True)
             self._sync_stop.wait(every)

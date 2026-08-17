@@ -582,8 +582,19 @@ class TestReportCost(unittest.TestCase):
         self.assertIn("proof of work", str(e.exception))
 
     def test_proof_of_work_does_not_transfer_to_another_report(self):
+        from blindrange import receipt
         rep = self.report()
         rep["nodes"] = {"deadbeefdeadbeef": {"sampled": 1, "verified": 1}}
+        # A transferred pow is invalid with probability 1 - 2^-bits — which
+        # at the lowered TEST difficulty means the forgery occasionally
+        # passes by sheer luck and this test flaked in CI. That is not a
+        # hole (at production bits the luck is 2^-22, i.e. the definition
+        # of proof of work); it is a probabilistic fixture. Perturb until
+        # the forgery is genuinely invalid, then assert it is rejected.
+        n = 1
+        while receipt.check(rep, self.agg.POW_BITS):
+            n += 1
+            rep["nodes"]["deadbeefdeadbeef"]["sampled"] = n
         with self.assertRaises(ValueError) as e:
             self.agg.record_report(rep)
         self.assertIn("proof of work", str(e.exception))
