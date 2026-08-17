@@ -72,14 +72,21 @@ def latest_release_assets():
 
 
 def pick_asset(assets, triple):
-    """The install_only build: unpack-and-run, no build system, smallest."""
-    want = [n for n in assets
-            if triple in n and n.endswith("install_only.tar.gz")
-            and f"cpython-{PY_VERSION}." in n]
+    """Prefer install_only_stripped: same runtime, no debug symbols.
+
+    The plain install_only linux build unpacked to 791 MB — debug info,
+    a 100+ MB static libpython nobody links, and the stdlib test suite.
+    Stripped exists for exactly this use and cuts it by hundreds of MB.
+    """
+    def match(suffix):
+        return sorted(n for n in assets
+                      if triple in n and n.endswith(suffix)
+                      and f"cpython-{PY_VERSION}." in n)
+    want = match("install_only_stripped.tar.gz") or match("install_only.tar.gz")
     if not want:
         raise SystemExit(f"no install_only cpython-{PY_VERSION} asset for "
                          f"{triple} — check PY_VERSION against the release")
-    return sorted(want)[-1]
+    return want[-1]
 
 
 def build_wheel():
@@ -143,6 +150,26 @@ def assemble(tag, triple, assets, urls, wheel, version):
         for whl in list(Path(dl).glob("*.whl")) + [wheel]:
             with zipfile.ZipFile(whl) as z:
                 z.extractall(sp)
+
+    # Dead weight a database client will never execute: the stdlib test
+    # suite, tkinter/IDLE, ensurepip wheels, and any static library that
+    # survived stripping. Deleting them is safe precisely because the
+    # bridge imports a known, closed set of modules — and the smoke test
+    # below this script in the workflow runs the REAL bridge against the
+    # trimmed runtime, so an over-eager trim fails loudly before publish.
+    lib = (pkg / "python" / "Lib" if tag.startswith("win32")
+           else pkg / "python" / "lib")
+    for victim in ([lib / f"python{PY_VERSION}" / "test",
+                    lib / f"python{PY_VERSION}" / "idlelib",
+                    lib / f"python{PY_VERSION}" / "tkinter",
+                    lib / f"python{PY_VERSION}" / "ensurepip",
+                    lib / "test", lib / "idlelib", lib / "tkinter",
+                    lib / "ensurepip"]
+                   + list(lib.glob("libpython*.a"))
+                   + list((pkg / "python").glob("**/*.a"))):
+        if victim.exists():
+            (shutil.rmtree(victim, ignore_errors=True)
+             if victim.is_dir() else victim.unlink())
 
     exe = ("python/python.exe" if tag.startswith("win32")
            else "python/bin/python3")
