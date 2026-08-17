@@ -1567,6 +1567,11 @@ class Owner:
         # written after winning the slot and cleared after sealing, so a
         # compaction another writer is running is still refused.
         mine = self._st.get("compacting")
+        if mine is not None and len(self._epochs()) == 1:
+            # Intent written, claim never made (killed in between): the
+            # network did not advance, so there is nothing to resume.
+            self._st.pop("compacting", None)
+            mine = None
         resuming = len(self._epochs()) > 1 and (mine == E or resume)
         if len(self._epochs()) > 1 and not resuming:
             raise RuntimeError(
@@ -1582,14 +1587,28 @@ class Owner:
         else:
             new_E = E + 1
             slot = self._st["epoch_len"] + 1
+            # Intent BEFORE claim. The old order — claim the epoch slot on
+            # the network, THEN save the local marker — left a window where
+            # a kill produced an open epoch nobody remembered owning: the
+            # network said "open:8", the state file said nothing, and every
+            # later compact() refused with "in flight" while the caller's
+            # retry loop kept inserting. One 900s stop-timeout SIGKILL in
+            # that window put 27 million junk keys on the public network.
+            # Written this way round, a kill before the claim leaves only a
+            # stale intent that the next run clears (the network never
+            # advanced, so there is nothing to resume), and a kill after it
+            # leaves a marker that matches — the auto-resume case.
+            self._st["compacting"] = new_E
+            self._save()
             if not self._put_nx(self._sys_key(b"epoch", slot),
                                 self._sys_encode(f"open:{new_E}")):
-                self._refresh_epoch()
+                self._st.pop("compacting", None)
+                self._save()
+                self._refresh_epoch(force=True)
                 raise RuntimeError("another compaction won the epoch slot")
             self._st["epoch_len"] = slot
             self._st["epoch"] = new_E
             self._st["chains"] = {}
-            self._st["compacting"] = new_E
             self._save()
 
         # drain epoch E: re-walk until a pass sees nothing new

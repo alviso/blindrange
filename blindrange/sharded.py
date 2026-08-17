@@ -358,13 +358,15 @@ class ShardedOwner:
 
     # ------------------------------------------------------------ housekeeping
 
-    def compact(self):
+    def compact(self, resume=False):
         """One shard at a time, deliberately.
 
         Compaction rewrites an epoch in memory, and doing every shard at
         once would rebuild exactly the peak this design exists to avoid.
+        `resume` passes through: on a shard with nothing to resume it is
+        a no-op flag and an ordinary compaction runs.
         """
-        return [o.compact() for o in self.shards]
+        return [o.compact(resume=resume) for o in self.shards]
 
     def configure_tokens(self, issuer, account):
         for o in self.shards:

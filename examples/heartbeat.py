@@ -58,7 +58,8 @@ def _stop(*_):
     print("  finishing the current cycle, then stopping", flush=True)
 
 
-def cycle(owner, n, field="ts", compact=False):
+def cycle(owner, n, field="ts", compact=False, insert=True,
+          drain_limit=None):
     """Insert, read, delete, and — periodically — compact.
 
     Compaction is deliberately NOT every cycle. Measured on the live
@@ -70,13 +71,14 @@ def cycle(owner, n, field="ts", compact=False):
     """
     rng = random.Random()
     t = {}
-    rows = [{"ts": rng.randrange(2_592_000), "m": f"hb {rng.randrange(1 << 30)}"}
-            for _ in range(n)]
-
-    t0 = time.time()
-    owner.insert_many(rows)
-    owner.drain()
-    t["insert"] = time.time() - t0
+    t["insert"] = 0.0
+    if insert:
+        rows = [{"ts": rng.randrange(2_592_000),
+                 "m": f"hb {rng.randrange(1 << 30)}"} for _ in range(n)]
+        t0 = time.time()
+        owner.insert_many(rows)
+        owner.drain()
+        t["insert"] = time.time() - t0
 
     # Full range, so the number logged is meaningful every time. A random
     # window looked fine and quietly reported "0 matched", which reads as a
@@ -87,7 +89,8 @@ def cycle(owner, n, field="ts", compact=False):
 
     t0 = time.time()
     rids = [r["_rid"] for r in owner.query_stream(
-        [{"field": field, "lo": 0, "hi": (1 << 22) - 1}], limit=n)]
+        [{"field": field, "lo": 0, "hi": (1 << 22) - 1}],
+        limit=drain_limit or n)]
     for i in range(0, len(rids), 2000):
         owner.delete_many(rids[i:i + 2000])
     t["delete"] = time.time() - t0
@@ -151,6 +154,14 @@ def main():
           f"SYNTHETIC traffic, label it as such wherever it is shown",
           flush=True)
     cycles = 0
+    # Rows inserted but not yet confirmed deleted. The one invariant a
+    # load generator must never break: a failure mode must not become an
+    # insert treadmill. A wedged compaction once turned "retry the cycle"
+    # into +5,000 records every six minutes for nine hours — 27 million
+    # junk keys on volunteers' disks — because the insert ran uncondition-
+    # ally at the top of every retry. Past three cycles of backlog, this
+    # stops adding and only drains.
+    backlog = 0
     while not STOP:
         try:
             due = a.compact_every and (cycles + 1) % a.compact_every == 0
@@ -158,9 +169,16 @@ def main():
             # completion made a slow compaction indistinguishable from a
             # hang — the process sat at 0% CPU with no output and looked
             # dead when it was working.
+            draining = backlog >= a.records * 3
             print(f"  cycle {cycles + 1} starting"
-                  f"{' (compaction due)' if due else ''}…", flush=True)
-            t = cycle(owner, a.records, compact=due)
+                  f"{' (compaction due)' if due else ''}"
+                  f"{f' (DRAINING backlog {backlog:,}, no insert)' if draining else ''}"
+                  f"…", flush=True)
+            if not draining:
+                backlog += a.records
+            t = cycle(owner, a.records, compact=due, insert=not draining,
+                      drain_limit=a.records * 5 if draining else None)
+            backlog = 0
             cycles += 1
             print(f"  cycle {cycles}: insert {t['insert']:.0f}s "
                   f"({a.records / max(t['insert'], 1e-9):,.0f}/s) · "
@@ -174,6 +192,17 @@ def main():
             # heartbeat. Say what happened, wait longer, carry on.
             print(f"  cycle failed: {type(e).__name__}: {str(e)[:160]}",
                   file=sys.stderr, flush=True)
+            if "compaction is already in flight" in str(e):
+                # This trail has exactly one writer — us — so an unsealed
+                # epoch is always our own corpse, and resuming it is the
+                # fix, not a risk. Left unresumed, every retry fails the
+                # same way forever.
+                try:
+                    print("  resuming the abandoned compaction…", flush=True)
+                    owner.compact(resume=True)
+                except Exception as e2:
+                    print(f"  resume failed too: {type(e2).__name__}: "
+                          f"{str(e2)[:120]}", file=sys.stderr, flush=True)
             time.sleep(min(a.pause * 4, 300))
             continue
         if a.once:
