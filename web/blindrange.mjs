@@ -653,6 +653,22 @@ export class Owner {
     if (this.mirror) for (const k of keys) this.mirror.kv.delete(k);
   }
 
+  _refuseUnresolved(keys, what) {
+    // A query result must never silently shrink: entries the cached
+    // counters prove exist, or candidate records, that stayed
+    // unresolved mean a silent replica set — where a smaller answer is
+    // a wrong answer. First seen live: a public-network query returned
+    // 2 rows out of 3 during one degraded moment, with nothing raised.
+    const stuck = keys.filter((k) => this.lastUnresolved.has(k));
+    if (!stuck.length) return;
+    const who = [...new Set(stuck.flatMap((k) => this.lastSilent[k] || []))]
+      .sort();
+    throw new Error(
+      `query cannot be answered completely: ${stuck.length} ${what} ` +
+      `unresolved; silent replicas: [${who}] — refusing to return ` +
+      `silently fewer rows`);
+  }
+
   // ----------------------------------------------------- chain discovery
   async _discoverEnds(spec) {
     // spec: {id: {fn: async i -> key, cached}} -> {id: end}
@@ -899,6 +915,7 @@ export class Owner {
     }
     let got = await this._mget([...Object.keys(enumMap),
                                 ...Object.keys(probeMap)]);
+    this._refuseUnresolved(Object.keys(enumMap), "index entries");
 
     const grown = new Set(Object.entries(probeMap)
       .filter(([k]) => k in got).map(([, cid]) => cid));
@@ -923,8 +940,10 @@ export class Owner {
         for (let i = chains[cid].cached + 2; i <= end; i++)
           deltaKeys[await chains[cid].fn(i)] = [cid, i];
       }
-      if (Object.keys(deltaKeys).length)
+      if (Object.keys(deltaKeys).length) {
         Object.assign(got, await this._mget(Object.keys(deltaKeys)));
+        this._refuseUnresolved(Object.keys(deltaKeys), "index entries");
+      }
       for (const cid of grown)
         enumMap[await chains[cid].fn(chains[cid].cached + 1)] =
           [cid, chains[cid].cached + 1];
@@ -971,6 +990,7 @@ export class Owner {
     const live = [...(rids || [])].filter((r) => !dead.has(r));
 
     const recs = await this._mget(live.map((r) => "R:" + r));
+    this._refuseUnresolved(live.map((r) => "R:" + r), "candidate records");
     const out = [];
     for (const r of live) {
       const blob = recs["R:" + r];

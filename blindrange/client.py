@@ -1211,6 +1211,23 @@ class Owner:
             path.close()
         self._no_direct_until[nid] = _time.time() + 60
 
+    def _refuse_unresolved(self, keymap, what):
+        """A query result must never silently shrink. An index entry the
+        cached counters PROVE exists, or a candidate record, that stayed
+        unresolved after the retry ladder means some replica set is
+        silent — the exact condition where a smaller answer would be a
+        wrong answer. Same contract as chain-end discovery: slowness and
+        errors, never silently fewer rows."""
+        stuck = set(keymap) & set(getattr(self, "last_unresolved", ()) or ())
+        if not stuck:
+            return
+        silent = getattr(self, "last_silent", {})
+        who = sorted({a for k in stuck for a in silent.get(k, [])})
+        raise ConnectionError(
+            f"query cannot be answered completely: {len(stuck)} {what} "
+            f"unresolved; silent replicas: {who} — refusing to return "
+            f"silently fewer rows")
+
     # -------------------------------------------- chain-length discovery
     def _discover_ends(self, chains_spec):
         """Batched galloping search for the true end of append-only chains.
@@ -1870,6 +1887,7 @@ class Owner:
             probe_map[ch["fn"](ch["cached"] + 1)] = cid
         got = self._mget(list(enum_map) + list(probe_map))
         rounds = 1
+        self._refuse_unresolved(enum_map, "index entries")
 
         grown = {cid for k, cid in probe_map.items() if k in got}
         if any(cid[0] == "sys" for cid in grown):
@@ -1898,6 +1916,7 @@ class Owner:
             if delta_keys:
                 got.update(self._mget(list(delta_keys)))
                 rounds += 1
+                self._refuse_unresolved(delta_keys, "index entries")
             for cid in grown:
                 enum_map[chains[cid]["fn"](chains[cid]["cached"] + 1)] = (
                     cid, chains[cid]["cached"] + 1)
@@ -1950,6 +1969,9 @@ class Owner:
         results = []
         blobs = self._mget(["R:" + r for r in candidates]) if candidates else {}
         rounds += 1 if candidates else 0
+        if candidates:
+            self._refuse_unresolved({"R:" + r: r for r in candidates},
+                                    "candidate records")
         for key, ct in blobs.items():
             raw = b64decode(ct)
             rec = json.loads(self._aes.decrypt(raw[:12], raw[12:], None))
