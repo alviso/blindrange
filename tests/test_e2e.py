@@ -89,6 +89,14 @@ class TestE2E(unittest.TestCase):
                      "name": rng.choice(names) + str(i), "row": i}
                     for i in range(400)]
         cls.owner.insert_many(cls.rows)
+        # Every kill-nodes test downstream assumes THREE copies of every
+        # key. write_acks=2 returns with the third copy still in flight,
+        # and for months the unscoped reconcile bug papered over any
+        # hedge that never landed by replicating everything everywhere.
+        # Route-scoped repair ended the accidental protection — CI lost
+        # a row to kill-2 within one run. Wait for the hedges we paid
+        # for, don't inherit them from a bug.
+        cls.owner.drain()
 
     @classmethod
     def tearDownClass(cls):
@@ -138,6 +146,7 @@ class TestE2E(unittest.TestCase):
         hot = [{"amount": 999_999, "day": 999, "name": "hot" + str(i),
                 "row": 40_000 + i} for i in range(100)]
         self.owner.insert_many(hot)
+        self.owner.drain()             # test_04 kills nodes; see setUpClass
         self.rows.extend(hot)
         after = keycounts()
         gained = sum(1 for a in after if after[a] > before.get(a, 0))
