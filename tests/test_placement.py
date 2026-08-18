@@ -21,6 +21,14 @@ NODES = [f"n{i}" for i in range(9)]
 BY_THREES = {f"n{i}": f"op{i // 3}" for i in range(9)}
 
 
+class AllRing:
+    """Routes everything to everyone: scoping is tested
+    elsewhere; these tests exercise transfer mechanics."""
+    def route(self, k, n=None):
+        return ["peer"]
+
+
+
 class TestFailureGroup(unittest.TestCase):
     def test_ipv4_collapses_to_a_24(self):
         self.assertEqual(failure_group("46.4.48.244:7501"), "46.4.48.0/24")
@@ -588,7 +596,8 @@ class TestRepairStatShape(unittest.TestCase):
 
         stat = node._new_repair_stat()
         with unittest.mock.patch.object(node, "post_any", fake_post):
-            sent, _ = node._reconcile("1.2.3.4:1", FakeStore(), Peers(),
+            sent, _ = node._reconcile("1.2.3.4:1", "peer", AllRing(),
+                                      FakeStore(), Peers(),
                                       "s", stat)
         self.assertEqual(sent, len(keys))
         self.assertEqual(stat["reconciled"], len(keys))

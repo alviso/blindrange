@@ -1602,8 +1602,9 @@ def _new_repair_stat():
             "reconciled": 0, "since": time.time()}
 
 
-def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
-    """Send a peer only what it is missing, by comparing key ranges.
+def _reconcile(addr, nid, ring, store, peers, secret, stat,
+               budget=RECONCILE_BUCKETS):
+    """Send a peer only what it is missing AND OWNS, by comparing ranges.
 
     Repair used to push the contents of a range whether or not the far side
     already had them. Measured on the public network, doubling how fast we
@@ -1612,7 +1613,12 @@ def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
 
     Buckets are key prefixes, so both sides can count and list a range
     straight off the primary-key index. Compare counts, and only where they
-    disagree ask for that bucket's key list and send the difference.
+    disagree ask for that bucket's key list and send the difference —
+    FILTERED to keys whose route includes the recipient. Unscoped, this
+    mechanism turned every join into full replication: a new node is
+    "behind" in every bucket, so every peer sent it everything it held,
+    and the network converged toward N copies of everything. Repair's
+    job is the replication factor, not maximal redundancy.
 
     Returns (keys_sent, buckets_examined), or (None, 0) if the peer is too
     old to answer — the caller falls back to the blind sweep, which matters
@@ -1655,8 +1661,9 @@ def _reconcile(addr, store, peers, secret, stat, budget=RECONCILE_BUCKETS):
                 return None, 0        # peer answers the one-prefix shape only
             missing = []
             for prefix in group:
-                missing += store.bucket_entries_except(prefix,
-                                                       got.get(prefix, []))
+                missing += [e for e in store.bucket_entries_except(
+                                prefix, got.get(prefix, []))
+                            if nid in ring.route(e[0])]
             for j in range(0, len(missing), REPAIR_POST_MAX):
                 chunk = missing[j:j + REPAIR_POST_MAX]
                 post_any(addr, "/kv",
@@ -1751,6 +1758,7 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                         groups={nid: failure_group(e["addr"], e.get("udp", ""))
                                 for nid, e in live.items()})
             addr_of = {nid: e["addr"] for nid, e in live.items()}
+            nid_of = {e["addr"]: nid for nid, e in live.items()}
             mine = store.count()
             # Is anyone visibly behind? Checked on a slow poll, because it costs
             # a /stats round trip per peer and the answer changes slowly.
@@ -1807,8 +1815,11 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
             for addr in sorted(behind_addrs):
                 if addr in no_digest:
                     continue
+                if addr not in nid_of:
+                    continue
                 try:
-                    got, _ = _reconcile(addr, store, peers, secret, stat)
+                    got, _ = _reconcile(addr, nid_of[addr], ring,
+                                        store, peers, secret, stat)
                 except OSError:
                     continue
                 if got is None:
@@ -1921,6 +1932,7 @@ def _reachability_loop(store, peers, hub, secret, direct_addr,
     ident = peers.ident
     time.sleep(DIALBACK_FIRST)
     relay_nid = None
+    tenant_thread = None
     port = direct_addr.rsplit(":", 1)[-1]
     while True:
         candidates = peers.live_direct()
@@ -1974,6 +1986,24 @@ def _reachability_loop(store, peers, hub, secret, direct_addr,
                     relay_nid = random.choice(list(pool))
                 if relay_nid:
                     via = f"via:{pool[relay_nid]['addr']}/{ident.node_id}"
+                    lifeline_dead = (is_via(peers.addr)
+                                     and peers.addr == via
+                                     and tenant_thread is not None
+                                     and not tenant_thread.is_alive())
+                    if lifeline_dead:
+                        # Supervision, not hope: the poll thread is
+                        # hardened against bad envelopes, but if it ever
+                        # dies anyway the node must not stay half-dead.
+                        print("[reachability] tenant lifeline thread "
+                              "died — respawning (without this the node "
+                              "stays in gossip but answers nothing)",
+                              flush=True)
+                        tenant_thread = threading.Thread(
+                            target=_tenant_loop,
+                            args=(store, peers, hub, secret,
+                                  lambda: peers.addr),
+                            daemon=True)
+                        tenant_thread.start()
                     if peers.addr != via:
                         peers.addr = via
                         # The decision was always honest; now it is also
@@ -1996,11 +2026,12 @@ def _reachability_loop(store, peers, hub, secret, direct_addr,
                             f"firewall-cmd --reload; ufw: ufw allow "
                             f"{port}) and this node will return to "
                             f"direct mode on its own.", flush=True)
-                        threading.Thread(
+                        tenant_thread = threading.Thread(
                             target=_tenant_loop,
                             args=(store, peers, hub, secret,
                                   lambda: peers.addr),
-                            daemon=True).start()
+                            daemon=True)
+                        tenant_thread.start()
         time.sleep(DIALBACK_EVERY)
 
 
@@ -2037,21 +2068,42 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
             got = _post_direct(relay, "/relay/poll", body, secret,
                                timeout=POLL_WAIT + 10)
             for env in got.get("envelopes", []):
-                if env["method"] == "GET":
-                    path, _, query = env["path"].partition("?")
-                    code, obj = service_get(store, peers, path, query,
-                                            quic=_tenant_loop.quic)
-                else:
-                    data = json.loads(b64decode(env["body_b64"]) or b"{}")
-                    code, obj = service_post(store, peers, hub, secret,
-                                             env["path"], data,
-                                             quic=_tenant_loop.quic)
+                # One malformed envelope used to kill this thread — and
+                # this thread IS the node, as far as anyone trying to
+                # reach it can tell. The node kept gossiping (separate
+                # thread), so it stayed in every roster while answering
+                # nothing: the "half-dead node" first hypothesized from
+                # a production incident, later reported by an operator
+                # as "tenants stop reporting until a manual restart".
+                # An envelope may fail; the lifeline may not.
+                try:
+                    if env.get("method") == "GET":
+                        path, _, query = env.get("path",
+                                                 "").partition("?")
+                        code, obj = service_get(store, peers, path, query,
+                                                quic=_tenant_loop.quic)
+                    else:
+                        data = json.loads(
+                            b64decode(env.get("body_b64", "")) or b"{}")
+                        code, obj = service_post(store, peers, hub, secret,
+                                                 env.get("path", ""), data,
+                                                 quic=_tenant_loop.quic)
+                except Exception as e:
+                    code, obj = 500, {"error": f"{type(e).__name__}: "
+                                               f"{str(e)[:120]}"}
+                if env.get("id") is None:
+                    continue          # unanswerable; nothing waits forever
                 reply = {"id": env["id"], "status": code,
                          "body_b64": b64encode(json.dumps(obj).encode()).decode()}
                 _post_direct(relay, "/relay/reply",
                              json.dumps(reply).encode(), secret)
         except OSError:
             time.sleep(2)                              # relay hiccup; retry
+        except Exception as e:
+            # Never silently: a dead lifeline is invisible from outside.
+            print(f"[tenant] poll cycle failed ({type(e).__name__}: "
+                  f"{str(e)[:120]}) — retrying", flush=True)
+            time.sleep(2)
 
 
 _tenant_loop.quic = None

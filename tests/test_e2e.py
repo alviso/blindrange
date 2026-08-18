@@ -946,6 +946,100 @@ class TestNATRelay(unittest.TestCase):
                 p.wait()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_a_poison_envelope_does_not_kill_the_lifeline(self):
+        """One malformed relay envelope used to kill the tenant's poll
+        thread with a ValueError the `except OSError` never caught. The
+        node kept gossiping, so it stayed in every roster while
+        answering nothing — the half-dead node: reported in production
+        as a 1-probe integrity refusal, and by an operator as "tenants
+        stop reporting until a manual restart". The lifeline must
+        answer 500 to garbage and keep polling."""
+        import hashlib
+        import hmac as _hmac
+        import json
+        import os
+        tmp = tempfile.mkdtemp(prefix="blindrange_poison_")
+        secret = "poisonnet"
+        env = {**os.environ, "BR_DIALBACK_FIRST": "1",
+               "BR_DIALBACK_EVERY": "2"}
+        root = str(Path(__file__).resolve().parents[1])
+        procs = []
+
+        def start(port, seeds, advertise=None):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{tmp}/n{port}",
+                    "--secret", secret]
+            if advertise:
+                args += ["--advertise", advertise]
+            for sd in seeds:
+                args += ["--seed", sd]
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=root,
+                                    env=env)
+
+        def relay_send(payload):
+            body = json.dumps(payload).encode()
+            sig = _hmac.new(secret.encode(), body,
+                            hashlib.sha256).hexdigest()
+            req = urllib.request.Request(
+                "http://127.0.0.1:7991/relay/send", data=body,
+                headers={"X-BR-Auth": sig})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read())
+
+        try:
+            procs.append(start(7991, []))
+            wait_http("127.0.0.1:7991")
+            # tenant: advertises a dead port, self-demotes to via:relay
+            procs.append(start(7992, ["127.0.0.1:7991"],
+                               advertise="127.0.0.1:7899"))
+            wait_http("127.0.0.1:7992")
+            sig = _hmac.new(secret.encode(), b"/peers",
+                            hashlib.sha256).hexdigest()
+            tenant_nid = None
+            deadline = time.time() + 30
+            while time.time() < deadline and tenant_nid is None:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:7991/peers",
+                    headers={"X-BR-Auth": sig})
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    peers = json.loads(r.read())["peers"]
+                for nid, e in peers.items():
+                    if e["addr"].startswith("via:"):
+                        tenant_nid = nid
+                time.sleep(0.5)
+            self.assertIsNotNone(tenant_nid, "no tenant appeared")
+
+            # poison: body_b64 that is not base64, path that is not a
+            # route, and a missing method — each historically lethal
+            for poison in (
+                    {"to": tenant_nid, "id": "p1", "method": "POST",
+                     "path": "/kv", "body_b64": "%%%not-base64%%%"},
+                    {"to": tenant_nid, "id": "p2", "method": "POST",
+                     "path": "/kv", "body_b64": "bm90LWpzb24="},
+                    {"to": tenant_nid, "id": "p3", "path": "/stats",
+                     "body_b64": ""}):
+                got = relay_send(poison)
+                self.assertIn("status", got,
+                              f"poison {poison['id']} got no reply at all")
+
+            # the lifeline must still be alive: a legitimate request
+            # through the relay answers with the tenant's node_id
+            got = relay_send({"to": tenant_nid, "id": "ok1",
+                              "method": "GET", "path": "/stats",
+                              "body_b64": ""})
+            self.assertEqual(got.get("status"), 200,
+                             "lifeline dead after poison — half-dead node")
+            import base64 as _b64
+            stats = json.loads(_b64.b64decode(got["body_b64"]))
+            self.assertEqual(stats["node_id"], tenant_nid)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestQuicDirect(unittest.TestCase):
     """Punched direct paths: a client reaching a relay tenant should
@@ -1121,9 +1215,73 @@ class TestReconcileOverTheWire(unittest.TestCase):
                     return {}
 
         with unittest.mock.patch.object(nd, "post_any", missing):
-            sent, looked = nd._reconcile("1.2.3.4:1", DummyStore(), Peers(),
+            sent, looked = nd._reconcile("1.2.3.4:1", "peer", AllRing(),
+                                         DummyStore(), Peers(),
                                          "s", {"sent": {}, "reconciled": 0})
         self.assertIsNone(sent, "a 404 must mean 'fall back', not 'done'")
+
+
+class AllRing:
+    """Routes everything to everyone: scoping is tested
+    elsewhere; these tests exercise transfer mechanics."""
+    def route(self, k, n=None):
+        return ["peer"]
+
+
+class TestReconcileScope(unittest.TestCase):
+    """Reconciliation sends a peer only what it lacks AND OWNS. Unscoped,
+    every join became full replication: the new node was behind in every
+    bucket, so every peer sent everything — measured on the public
+    network as a brand-new node holding a 100% copy within two hours."""
+
+    def test_only_routed_keys_are_sent(self):
+        import json as _json
+        from blindrange import node as nd
+        keys = [f"I:{i:04x}" for i in range(40)]
+        owned = {k for i, k in enumerate(keys) if i % 4 == 0}
+
+        class ShardRing:
+            def route(self, k, n=None):
+                return ["peer"] if k in owned else ["someone-else"]
+
+        sent_entries = []
+
+        def fake_post(addr, path, body, secret, **kw):
+            data = _json.loads(body)
+            if path == "/digest":
+                return {"chars": 4, "buckets": {}}
+            if path == "/bucketkeys":
+                return {"buckets": {pref: [] for pref in data["prefixes"]}}
+            if path == "/kv":
+                sent_entries.extend(data["entries"])
+                return {}
+            raise AssertionError(path)
+
+        class FakeStore:
+            def bucket_chars(self):
+                return 4
+
+            def bucket_counts(self, chars):
+                return {"I:": len(keys)}
+
+            def bucket_entries_except(self, prefix, have, limit=None):
+                return [[k, "v"] for k in keys if k not in set(have)]
+
+        class Peers:
+            class ident:
+                @staticmethod
+                def poll_token():
+                    return {}
+
+        stat = nd._new_repair_stat()
+        with unittest.mock.patch.object(nd, "post_any", fake_post):
+            sent, _ = nd._reconcile("1.2.3.4:1", "peer", ShardRing(),
+                                    FakeStore(), Peers(), "s", stat)
+        got = {k for k, _v in sent_entries}
+        self.assertEqual(got, owned,
+                         "reconcile must ship exactly the recipient's "
+                         "share — nothing it does not own")
+        self.assertEqual(sent, len(owned))
 
 
 class DummyStore:
