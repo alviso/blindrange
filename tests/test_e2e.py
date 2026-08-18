@@ -946,6 +946,77 @@ class TestNATRelay(unittest.TestCase):
                 p.wait()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_tenant_stats_reach_across_relays(self):
+        """A tenant is only connected to ONE relay's hub — but every
+        node (and the status page) asks for tenant stats through its
+        OWN hub. With a single direct node that was the same hub by
+        accident; the night two more direct nodes joined, every tenant
+        parked elsewhere went "not reporting" network-wide. _peer_stats
+        must fall back to forwarding through the relay named in the
+        via: address."""
+        import hashlib
+        import hmac as _hmac
+        import json
+        import os
+        from blindrange import node as nd
+        tmp = tempfile.mkdtemp(prefix="blindrange_xrelay_")
+        secret = "xrelaynet"
+        env = {**os.environ, "BR_DIALBACK_FIRST": "1",
+               "BR_DIALBACK_EVERY": "2"}
+        root = str(Path(__file__).resolve().parents[1])
+        procs = []
+
+        def start(port, seeds, advertise=None):
+            args = [sys.executable, "-m", "blindrange.node", "--port",
+                    str(port), "--data", f"{tmp}/n{port}",
+                    "--secret", secret]
+            if advertise:
+                args += ["--advertise", advertise]
+            for sd in seeds:
+                args += ["--seed", sd]
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=root,
+                                    env=env)
+
+        try:
+            procs.append(start(7981, []))
+            wait_http("127.0.0.1:7981")
+            procs.append(start(7982, ["127.0.0.1:7981"]))
+            wait_http("127.0.0.1:7982")
+            procs.append(start(7983, ["127.0.0.1:7981"],
+                               advertise="127.0.0.1:7899"))
+            wait_http("127.0.0.1:7983")
+            sig = _hmac.new(secret.encode(), b"/peers",
+                            hashlib.sha256).hexdigest()
+            tenant = None
+            deadline = time.time() + 30
+            while time.time() < deadline and tenant is None:
+                req = urllib.request.Request(
+                    "http://127.0.0.1:7981/peers",
+                    headers={"X-BR-Auth": sig})
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    peers = json.loads(r.read())["peers"]
+                for nid, e in peers.items():
+                    if e["addr"].startswith("via:"):
+                        tenant = (nid, e)
+                time.sleep(0.5)
+            self.assertIsNotNone(tenant, "no tenant appeared")
+            nid, e = tenant
+            # Ask WITHOUT a local hub connection to the tenant — the
+            # shape of every node that is not the tenant's own relay.
+            stats = nd._peer_stats(nid, e, secret, hub=None,
+                                   self_id="not-the-tenant")
+            self.assertIsNotNone(
+                stats, "tenant unreachable across relays — this is the "
+                       "'all tenants not reporting' outage")
+            self.assertEqual(stats.get("node_id"), nid)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.terminate()
+                p.wait()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_a_poison_envelope_does_not_kill_the_lifeline(self):
         """One malformed relay envelope used to kill the tenant's poll
         thread with a ValueError the `except OSError` never caught. The

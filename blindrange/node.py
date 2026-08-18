@@ -1216,9 +1216,24 @@ def _peer_stats(nid, e, secret, hub, self_id):
     """
     try:
         if is_via(e["addr"]):
-            _relay, tenant = parse_via(e["addr"])
-            out = hub.send(tenant, {"id": os.urandom(8).hex(), "method": "GET",
-                                    "path": "/stats", "body_b64": ""})
+            relay, tenant = parse_via(e["addr"])
+            env = {"id": os.urandom(8).hex(), "method": "GET",
+                   "path": "/stats", "body_b64": ""}
+            out = hub.send(tenant, env) if hub is not None else None
+            if not out:
+                # Not OUR tenant. For one night the seed was the only
+                # direct node, so every tenant's relay was the asker's
+                # own hub and this fallback was unreachable dead code
+                # that did not exist. The moment two more direct nodes
+                # joined, tenants parked on their hubs went dark on the
+                # status page network-wide. The via: address names the
+                # relay that CAN reach them — ask it to forward.
+                try:
+                    out = post_any(relay, "/relay/send",
+                                   json.dumps({"to": tenant, **env}).encode(),
+                                   secret)
+                except OSError:
+                    return None
             if not out or out.get("status") != 200:
                 return None
             stats = json.loads(b64decode(out["body_b64"]))
