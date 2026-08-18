@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build on blindrange — web apps, no backend</title>
+<meta name="description" content="Ship a multi-device web app as one static HTML file: keys, crypto and queries in the page, durability from a network that cannot read the data. The starter is a complete app; the security section is not optional.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="canonical" href="https://blindrange.dev/build-web">
+<meta property="og:title" content="Build on blindrange — web apps, no backend">
+<meta property="og:description" content="One static file is the whole application. Auth is key distribution, uniqueness is network-arbitrated, and the nodes cannot read any of it.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/build-web">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:20px; margin:44px 0 4px; }
+  h2 .n { color:var(--acc); margin-right:10px; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  pre { background:#12161d; border:1px solid var(--line); border-radius:9px;
+        padding:13px 15px; overflow-x:auto; font-size:13px; line-height:1.55;
+        margin:12px 0; }
+  pre .c { color:var(--dim); }
+  code { color:var(--warn); }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--acc); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim); margin:14px 0; }
+  .note b { color:var(--txt); font-weight:normal; }
+  .warn { border-left-color:var(--warn); }
+  table { border-collapse:collapse; width:100%; font-size:13.5px; margin:12px 0; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left;
+           vertical-align:top; }
+  th { color:var(--acc); font-weight:normal; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Build on <span>blindrange</span> — web apps, no backend</h1>
+<div class="tag"><b>One static file is the whole application.</b> Keys are
+derived in the page, records sealed in the page, queries planned in the
+page; the network supplies durability, sync between devices, and
+uniqueness arbitration — while being unable to read a byte of it. Host
+the file anywhere that serves HTML, or nowhere in particular.</div>
+
+<h2><span class="n">1</span>Start from a complete app</h2>
+<p><a href="/starter">Splitlist</a> is a working multi-device shared
+checklist in ~130 lines, most of them comments —
+<a href="https://github.com/alviso/blindrange/blob/main/examples/web/starter.html">read
+the file</a>, save it, open it. It shows the whole model: open-or-create,
+one indexed field, sealed payload fields, network-arbitrated ordering,
+invites as the only auth. Copy it and change the schema.</p>
+<pre><span class="c"># the entire deployment procedure:</span>
+cp starter.html anywhere-a-browser-can-reach/</pre>
+
+<h2><span class="n">2</span>The API on one screen</h2>
+<pre>import { Owner, idbAdapter } from "https://blindrange.dev/blindrange.js?v=2";
+
+const db = await Owner.create(idbAdapter("myapp"), passphrase, SCHEMA,
+    ["seed.blindrange.dev:7501"],
+    { networkSecret: "blindrange-public",
+      gateway: ["https://blindrange.dev/api"] });   <span class="c">// list = failover</span>
+
+await db.insert({ amount: 42, note: "sealed fields travel free" });
+await db.query("amount", 0, 100);        <span class="c">// range → [{...rec, _rid}]</span>
+await db.queryPrefix("name", "sa");      <span class="c">// str fields: prefix search</span>
+await db.delete(rid);                    <span class="c">// tombstone by _rid</span>
+await db.nextValue("invoice");           <span class="c">// unique across ALL writers</span>
+await db.nextValues("invoice", 10);      <span class="c">// block, one round trip</span>
+db.invite();                             <span class="c">// onboarding string = master key</span>
+await Owner.accept(adapter, pass, invite);  <span class="c">// join from an invite</span>
+await Owner.open(adapter, pass);         <span class="c">// reopen this device's state</span>
+await db.enableMirror("myapp-mirror");   <span class="c">// local-first reads, persistent</span>
+await db.drain();                        <span class="c">// await hedged background copies</span></pre>
+<p>Schema fields are what you can <b>range-query</b>; every other key in a
+record is carried sealed and costs nothing. <code>BLUR</code>
+(<code>leaf_width</code>) is the resolution the network may ever
+distinguish — <a href="/build#create">the SQL guide explains the privacy
+budget</a>; the same rules apply here.</p>
+
+<h2><span class="n">3</span>Auth is key distribution</h2>
+<p>There are no accounts. Whoever holds the state (this device, unlocked
+by the passphrase) or an invite (any device, any language — Python's
+<code>Owner.accept</code> takes the same string) is a writer. This is the
+honest scope of v1: <b>apps for a person or an invited group</b> — which
+is most small software. Scoped capabilities (read-only, one table) are a
+design item, not a feature; nothing on this page pretends otherwise.</p>
+
+<h2><span class="n">4</span>Security you own — not optional</h2>
+<div class="note warn"><b>Any script in your page can read the master
+key.</b> The rules are short and absolute: vendor
+<code>blindrange.js</code> next to your page (best) or pin the import
+with an <code>integrity</code> hash; send a strict
+<code>Content-Security-Policy</code>; and never add a third-party script,
+analytics tag or CDN widget to a page that holds keys. XSS here is not a
+cookie theft — it is the database.</div>
+<div class="note warn"><b>The passphrase is the recovery story.</b>
+PBKDF2-sealed state in this browser, invites as the only other copy of
+the master. Lose both and the data is unrecoverable by design — the same
+property that locks the storage provider out, pointed at your user. Say
+so in your UI.</div>
+
+<h2><span class="n">5</span>What to expect, measured</h2>
+<table>
+<tr><th>operation</th><th>public demo network, via gateway</th></tr>
+<tr><td>create / first open</td><td>~3–5s (writer registration)</td></tr>
+<tr><td>insert (quorum-acked)</td><td>~0.5–2s — returns at 2 acks, third
+copy lands in the background (<code>drain()</code> awaits it)</td></tr>
+<tr><td>query, first</td><td>~2–4s (network round trips)</td></tr>
+<tr><td>query, repeat</td><td>local — persistent in-browser mirror</td></tr>
+</table>
+<p>The gateway adds one hop: browsers refuse plain-HTTP from HTTPS pages,
+so requests travel through a fronted node's <code>/fwd</code>. The
+gateway sees which nodes you talk to — nodes always could; it reads
+nothing — nodes never could. Pass several gateways; any direct node
+behind any TLS proxy is one.</p>
+
+<h2><span class="n">6</span>Honesty section</h2>
+<p>The demo network has a published secret and <b>no durability
+promise</b> — run your own nodes (and gateway: any node + Caddy) for
+anything real. Not in the browser client, deliberately: SQL dialect,
+compaction (run it from any Python writer of the same database), QUIC
+direct paths. The client is <a
+href="https://github.com/alviso/blindrange/blob/main/web/blindrange.mjs">one
+dependency-free file</a> whose every key derivation is pinned
+byte-identical to the reference by a cross-language test suite — if they
+ever disagree, the build fails, not your data.</p>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/try">try it live</a> ·
+<a href="/build">the SQL guide</a> ·
+<a href="/build-python">the Python guide</a> ·
+<a href="/build-node">the Node.js guide</a> ·
+<a href="/apps">built on it</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>

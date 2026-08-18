@@ -147,7 +147,7 @@ to it by a cross-language test suite.</div>
 
 </div>
 <script type="module">
-import { Owner, idbAdapter, memoryAdapter } from "/blindrange.js?v=1";
+import { Owner, idbAdapter, memoryAdapter } from "/blindrange.js?v=2";
 
 const SCHEMA = {
   amount: { type: "int", bits: 20, leaf_width: 64 },
@@ -198,7 +198,7 @@ $("openBtn").onclick = async () => {
             { networkSecret: SECRET, gateway: GATEWAY }));
       } else throw e;
     }
-    owner.enableMirror();
+    await owner.enableMirror("try-mirror");   // survives reloads
     $("dbStatus").innerHTML = `Open. Writer <b>${owner._st.writer}</b>, ` +
       `${owner.network().length} nodes in view, ` +
       `${owner._st.writers.length} writer(s) registered.`;
@@ -258,7 +258,7 @@ $("importBtn").onclick = async () => {
   try {
     owner = await timed("accept invite (join as a new writer)",
       () => Owner.accept(memoryAdapter(), pass, inv, { gateway: GATEWAY }));
-    owner.enableMirror();
+    await owner.enableMirror();
     $("dbStatus").innerHTML = `Imported (this session only). Writer ` +
       `<b>${owner._st.writer}</b>, ${owner._st.writers.length} writer(s).`;
     ready();

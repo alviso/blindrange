@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<!-- ============================================================
+     blindrange starter: a shared checklist with NO BACKEND.
+
+     This one file is the entire application. Copy it anywhere a
+     browser can load it - GitHub Pages, a USB stick, an intranet
+     share - and it works identically, because there is nothing
+     else: keys are derived in the page, records are sealed in the
+     page, and the public blindrange network stores ciphertext it
+     cannot read.
+
+     Auth is key distribution: press "Invite" on one device, paste
+     on another (or into Python's Owner.accept) and both write to
+     the same list. No accounts exist. Whoever holds an invite IS
+     a writer - treat invites like the keys they are.
+
+     SECURITY YOU OWN: any script that runs in this page can read
+     the master key. Vendor blindrange.js next to this file (best),
+     or pin the import with an integrity hash. Never add third-
+     party scripts to a page that holds keys.
+     ============================================================ -->
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Splitlist — a checklist with no backend</title>
+<style>
+  body { background:#0f1115; color:#d7dce4; max-width:560px;
+         margin:40px auto; padding:0 20px;
+         font:16px/1.6 ui-monospace, Menlo, monospace; }
+  h1 { font-size:26px; } h1 span { color:#5cc8ff; }
+  input, button { font:inherit; background:#171a21; color:#d7dce4;
+                  border:1px solid #262b36; border-radius:8px;
+                  padding:8px 12px; }
+  button { color:#5cc8ff; cursor:pointer; border-color:#5cc8ff; }
+  li { list-style:none; padding:6px 0; border-bottom:1px solid #262b36;
+       cursor:pointer; }
+  li.done { color:#8b93a1; text-decoration:line-through; }
+  #status { color:#8b93a1; font-size:13px; margin:12px 0; }
+  textarea { width:100%; background:#171a21; color:#d7dce4;
+             border:1px solid #262b36; font-size:11px; }
+</style>
+</head>
+<body>
+<h1>Split<span>list</span></h1>
+<div id="status">unlocking…</div>
+<div>
+  <input id="text" placeholder="add an item" size="28">
+  <button id="add">Add</button>
+  <button id="invite">Invite</button>
+</div>
+<ul id="list"></ul>
+<textarea id="inviteBox" rows="3"
+  placeholder="paste an invite here and reload to join someone's list"></textarea>
+
+<script type="module">
+// Vendor this file next to your page for production; the hosted copy
+// is convenient for trying things.
+import { Owner, idbAdapter }
+  from "https://blindrange.dev/blindrange.js?v=2";
+
+const NET = {
+  bootstrap: ["seed.blindrange.dev:7501"],   // public DEMO network:
+  networkSecret: "blindrange-public",        // no durability promise -
+  gateway: ["https://blindrange.dev/api"],   // run your own for real use
+};
+// One indexed field is enough for a list: a per-item sequence number
+// gives ordering AND a range to query everything by. `text` and `done`
+// travel inside the sealed record - the network never sees them.
+const SCHEMA = { pos: { type: "int", bits: 20, leaf_width: 64 } };
+
+const $ = (id) => document.getElementById(id);
+const store = idbAdapter("splitlist");
+const pass = localStorage.splitlistPass ||
+  (localStorage.splitlistPass = crypto.randomUUID());
+
+let db;
+const pasted = $("inviteBox").value.trim() || localStorage.splitlistInvite;
+try {
+  db = await Owner.open(store, pass, { gateway: NET.gateway });
+} catch {
+  db = pasted
+    ? await Owner.accept(store, pass, pasted, { gateway: NET.gateway })
+    : await Owner.create(store, pass, SCHEMA, NET.bootstrap,
+        { networkSecret: NET.networkSecret, gateway: NET.gateway });
+}
+await db.enableMirror("splitlist-mirror");
+
+async function render() {
+  const rows = await db.query("pos", 0, 2 ** 20 - 1);
+  rows.sort((a, b) => a.pos - b.pos);
+  $("list").innerHTML = rows.map((r) =>
+    `<li class="${r.done ? "done" : ""}" data-rid="${r._rid}"
+         data-pos="${r.pos}" data-text="${r.text}"
+         data-done="${r.done ? 1 : 0}">${r.text}</li>`).join("");
+  $("status").textContent =
+    `${rows.length} item(s) · ${db._st.writers.length} writer(s) · ` +
+    `sealed on ${db.network().length} public nodes`;
+}
+
+$("add").onclick = async () => {
+  const text = $("text").value.trim();
+  if (!text) return;
+  $("text").value = "";
+  // next_value is arbitrated by the network: two devices adding at
+  // the same moment still get distinct positions, with no server.
+  const pos = await db.nextValue("pos");
+  await db.insert({ pos, text, done: false });
+  render();
+};
+
+$("list").onclick = async (e) => {
+  const li = e.target.closest("li");
+  if (!li) return;
+  // toggling = delete + reinsert (records are immutable ciphertext);
+  // a crash between the two leaves a visible duplicate, never a hole
+  await db.delete(li.dataset.rid);
+  await db.insert({ pos: +li.dataset.pos, text: li.dataset.text,
+                    done: li.dataset.done !== "1" });
+  render();
+};
+
+$("invite").onclick = () => {
+  $("inviteBox").value = db.invite();
+  $("inviteBox").select();
+  // the invite CONTAINS the master key - send it like a house key
+};
+$("inviteBox").onchange = () => {
+  localStorage.splitlistInvite = $("inviteBox").value.trim();
+  $("status").textContent = "invite saved — clear site data, reload to join";
+};
+
+await render();
+setInterval(render, 15000);      // pick up other writers' items
+</script>
+</body>
+</html>

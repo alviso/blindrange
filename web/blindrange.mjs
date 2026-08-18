@@ -381,17 +381,33 @@ export class Owner {
     // returns {status, body_b64}. The gateway sees who talks to whom —
     // nodes always did; that is inside the disclosed leakage.
     if (this.gateway) {
+      // Gateways are a network role, not a landlord: pass several and
+      // a dead one costs a retry, not the application.
+      const gws = Array.isArray(this.gateway) ? this.gateway
+        : [this.gateway];
       const env = { addr, method, path,
         body_b64: bodyBytes ? b64(bodyBytes) : "" };
       const raw = utf8(JSON.stringify(env));
-      const r = await fetch(`${this.gateway}/fwd`, { method: "POST",
-        headers: { "Content-Type": "application/json",
-                   ...(await this._sign(raw)) },
-        body: raw });
-      if (!r.ok) throw new Error(`gateway HTTP ${r.status}`);
-      const out = await r.json();
-      if (out.status >= 400) throw new Error(`HTTP ${out.status} from ${addr}${path}`);
-      return JSON.parse(td.decode(unb64(out.body_b64 || "")));
+      let lastErr = null;
+      for (let n = 0; n < gws.length; n++) {
+        const gw = gws[(this._gwIdx || 0 + n) % gws.length];
+        try {
+          const r = await fetch(`${gw}/fwd`, { method: "POST",
+            headers: { "Content-Type": "application/json",
+                       ...(await this._sign(raw)) },
+            body: raw });
+          if (!r.ok) throw new Error(`gateway HTTP ${r.status}`);
+          const out = await r.json();
+          if (out.status >= 400)
+            throw new Error(`HTTP ${out.status} from ${addr}${path}`);
+          this._gwIdx = gws.indexOf(gw);
+          return JSON.parse(td.decode(unb64(out.body_b64 || "")));
+        } catch (e) {
+          lastErr = e;
+          if (String(e).includes(`from ${addr}`)) throw e; // real answer
+        }
+      }
+      throw lastErr;
     }
     const headers = method === "POST"
       ? { "Content-Type": "application/json", ...(await this._sign(bodyBytes)) }
@@ -523,10 +539,14 @@ export class Owner {
       if (!missing.length) { this.lastUnresolved = new Set(); return out; }
       const got = await this._mgetNetwork(missing);
       for (const [k, v] of Object.entries(got)) { m.kv.set(k, v); out[k] = v; }
+      if (m.persistPut) m.persistPut(Object.entries(got));
       return out;
     }
     const got = await this._mgetNetwork(keys);
-    if (m) for (const [k, v] of Object.entries(got)) m.kv.set(k, v);
+    if (m) {
+      for (const [k, v] of Object.entries(got)) m.kv.set(k, v);
+      if (m.persistPut) m.persistPut(Object.entries(got));
+    }
     return got;
   }
 
@@ -588,6 +608,11 @@ export class Owner {
   }
 
   async _put(kvPairs) {
+    // Hedged, like the reference: every replica is asked at once, but
+    // the caller returns the moment each key has write_acks answers —
+    // the remaining copies land in the background (drain() awaits
+    // them). v1 awaited every replica and each write paid the slowest
+    // node on the ring; that alone was most of "a bit slow".
     const want = Math.max(1, Math.min(this.writeAcks, this.ring.replicas));
     const byNode = {};
     for (const [k, v] of kvPairs)
@@ -596,12 +621,21 @@ export class Owner {
         if (a) (byNode[a] = byNode[a] || []).push([k, v]);
       }
     const acks = Object.fromEntries(kvPairs.map(([k]) => [k, 0]));
-    await Promise.all(Object.entries(byNode).map(async ([a, entries]) => {
-      try {
-        await this._post(a, "/kv", { entries });
+    let settled = 0;
+    const entriesCount = Object.keys(byNode).length;
+    let resolveGate;
+    const gate = new Promise((res) => { resolveGate = res; });
+    const quorum = () => Object.values(acks).every((n) => n >= want);
+    const jobs = Object.entries(byNode).map(([a, entries]) =>
+      this._post(a, "/kv", { entries }).then(() => {
         for (const [k] of entries) acks[k] += 1;
-      } catch { /* replica down; successor retry below */ }
-    }));
+        if (quorum()) resolveGate();
+      }).catch(() => {}).finally(() => {
+        settled += 1;
+        if (settled === entriesCount) resolveGate();
+      }));
+    this._track(jobs);
+    if (entriesCount) await gate;
     const vals = Object.fromEntries(kvPairs);
     for (const k of Object.keys(acks).filter((k) => acks[k] < 1)) {
       for (const nid of await this.ring.route(k, this.ring.replicas + 3)) {
@@ -616,9 +650,24 @@ export class Owner {
     }
     if (Object.values(acks).some((n) => n === 0))
       throw new Error("write not durable: some keys got zero ACKs");
-    void want;               // v1 awaits all replicas; zero-ack raises
-    if (this.mirror)
+    if (this.mirror) {
       for (const [k, v] of kvPairs) this.mirror.kv.set(k, v);
+      if (this.mirror.persistPut) this.mirror.persistPut(kvPairs);
+    }
+  }
+
+  _track(jobs) {
+    this._inflight = this._inflight || new Set();
+    for (const j of jobs) {
+      this._inflight.add(j);
+      j.finally(() => this._inflight.delete(j));
+    }
+  }
+
+  async drain() {
+    // Wait for every hedged background write. Call before you close
+    // the tab if the last copy matters to you right now.
+    await Promise.allSettled([...(this._inflight || [])]);
   }
 
   async _putNx(key, value) {
@@ -635,8 +684,13 @@ export class Owner {
       } catch { continue; }
     }
     if (this.mirror) {
-      if (won) this.mirror.kv.set(key, value);
-      else this.mirror.kv.delete(key);
+      if (won) {
+        this.mirror.kv.set(key, value);
+        if (this.mirror.persistPut) this.mirror.persistPut([[key, value]]);
+      } else {
+        this.mirror.kv.delete(key);
+        if (this.mirror.persistDel) this.mirror.persistDel([key]);
+      }
     }
     return won;
   }
@@ -650,7 +704,10 @@ export class Owner {
       }
     await Promise.all(Object.entries(byNode).map(([a, ks]) =>
       this._post(a, "/delete", { keys: ks }).catch(() => {})));
-    if (this.mirror) for (const k of keys) this.mirror.kv.delete(k);
+    if (this.mirror) {
+      for (const k of keys) this.mirror.kv.delete(k);
+      if (this.mirror.persistDel) this.mirror.persistDel(keys);
+    }
   }
 
   _refuseUnresolved(keys, what) {
@@ -1075,22 +1132,74 @@ export class Owner {
   }
 
   // --------------------------------------------------------------- mirror
-  enableMirror() {
-    if (!this.mirror)
-      this.mirror = { kv: new Map(), completeOnce: false, syncedAt: 0,
-        lastPassS: 0,
-        freshFor: (o) => {
-          const m = o.mirror;
-          if (!m.completeOnce) return false;
-          if (o._st.writers.length <= 1) return true;
-          const win = Math.max(30, 3 * m.lastPassS);
-          return Date.now() / 1000 - m.syncedAt < win;
-        } };
-    return this.mirror;
+  async enableMirror(persistName = null) {
+    if (this.mirror) return this.mirror;
+    const m = { kv: new Map(), completeOnce: false, syncedAt: 0,
+      lastPassS: 0,
+      freshFor: (o) => {
+        if (!m.completeOnce) return false;
+        if (o._st.writers.length <= 1) return true;
+        const win = Math.max(30, 3 * m.lastPassS);
+        return Date.now() / 1000 - m.syncedAt < win;
+      } };
+    if (persistName && typeof indexedDB !== "undefined") {
+      // Persistent mirror: a returning visitor reads locally from the
+      // first click instead of re-walking the network. Same freshness
+      // contract; the disk copy is just the Map surviving a reload.
+      const db = await new Promise((res, rej) => {
+        const q = indexedDB.open("blindrange-mirror", 1);
+        q.onupgradeneeded = () => q.result.createObjectStore("kv");
+        q.onsuccess = () => res(q.result);
+        q.onerror = () => rej(q.error);
+      });
+      const pfx = persistName + "\u0000";
+      await new Promise((res, rej) => {
+        const st = db.transaction("kv").objectStore("kv");
+        const rq = st.openCursor(IDBKeyRange.bound(pfx, pfx + "\uffff"));
+        rq.onsuccess = () => {
+          const c = rq.result;
+          if (!c) { res(); return; }
+          const k = String(c.key).slice(pfx.length);
+          if (k === "@meta") {
+            const meta = c.value || {};
+            m.completeOnce = !!meta.completeOnce;
+            m.syncedAt = meta.syncedAt || 0;
+            m.lastPassS = meta.lastPassS || 0;
+          } else m.kv.set(k, c.value);
+          c.continue();
+        };
+        rq.onerror = () => rej(rq.error);
+      });
+      let queue = [];
+      let timer = null;
+      const flush = () => {
+        const batch = queue;
+        queue = [];
+        timer = null;
+        const t = db.transaction("kv", "readwrite");
+        const st = t.objectStore("kv");
+        for (const [op, k, v] of batch)
+          op === "p" ? st.put(v, pfx + k) : st.delete(pfx + k);
+        st.put({ completeOnce: m.completeOnce, syncedAt: m.syncedAt,
+                 lastPassS: m.lastPassS }, pfx + "@meta");
+      };
+      const later = () => { if (!timer) timer = setTimeout(flush, 80); };
+      m.persistPut = (pairs) => {
+        for (const [k, v] of pairs) queue.push(["p", k, v]);
+        later();
+      };
+      m.persistDel = (keys) => {
+        for (const k of keys) queue.push(["d", k]);
+        later();
+      };
+      m.persistMeta = later;
+    }
+    this.mirror = m;
+    return m;
   }
 
   async sync() {
-    const m = this.enableMirror();
+    const m = await this.enableMirror();
     const t0 = Date.now();
     m.bypass = true;      // read the NETWORK, but store what arrives
     try {
@@ -1110,6 +1219,7 @@ export class Owner {
     m.completeOnce = true;
     m.syncedAt = Date.now() / 1000;
     m.lastPassS = (Date.now() - t0) / 1000;
+    if (m.persistMeta) m.persistMeta();
     return m.lastPassS;
   }
 
