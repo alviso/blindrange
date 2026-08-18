@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Try blindrange in your browser</title>
+<meta name="description" content="A live encrypted database in this page: keys derived here, queries planned here, records sealed here — stored on public nodes that cannot read any of it. View source; there is no backend.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="canonical" href="https://blindrange.dev/try">
+<meta property="og:title" content="Try blindrange in your browser">
+<meta property="og:description" content="The browser is the backend: a static page with keys, crypto and query planning, over blind storage. No server-side application exists.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/try">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:26px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  h2 { font-size:20px; margin:38px 0 10px; }
+  h2 .n { color:var(--acc); margin-right:10px; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code { color:var(--warn); }
+  .box { background:var(--panel); border:1px solid var(--line);
+         border-radius:12px; padding:18px 20px; margin:14px 0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+         margin-bottom:10px; }
+  input[type=password], input[type=text], input[type=number], textarea {
+      background:#10131a; color:var(--txt); border:1px solid var(--line);
+      border-radius:7px; padding:8px 11px;
+      font:14px ui-monospace, Menlo, monospace; }
+  input[type=number] { width:130px; }
+  input[type=password], input[type=text] { min-width:240px; }
+  textarea { width:100%; min-height:64px; font-size:12px; }
+  input:focus, textarea:focus { outline:none; border-color:var(--acc); }
+  button { background:var(--panel); color:var(--acc);
+           border:1px solid var(--acc); border-radius:8px; padding:8px 16px;
+           font:14px ui-monospace, Menlo, monospace; cursor:pointer; }
+  button:disabled { color:var(--dim); border-color:var(--line);
+                    cursor:default; }
+  button.secondary { color:var(--txt); border-color:var(--line); }
+  .status { font-size:13.5px; color:var(--dim); }
+  .status b { color:var(--ok); font-weight:normal; }
+  table { border-collapse:collapse; width:100%; font-size:13px;
+          margin:10px 0 0; }
+  th, td { border:1px solid var(--line); padding:6px 10px; text-align:left; }
+  th { color:var(--acc); font-weight:normal; }
+  #log { background:#0c0e12; border:1px solid var(--line); border-radius:9px;
+         padding:12px 14px; font-size:12.5px; line-height:1.6;
+         max-height:260px; overflow-y:auto; color:var(--dim);
+         white-space:pre-wrap; }
+  #log .t { color:var(--ok); }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--warn); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim); margin:16px 0; }
+  .note b { color:var(--txt); font-weight:normal; }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Try <span>blindrange</span> in your browser</h1>
+<div class="tag"><b>The browser is the backend.</b> This static page derives
+the keys, plans the queries, seals the records, and talks to the public
+network directly — the nodes store ciphertext they cannot read, and no
+server-side application exists anywhere. <b>View source.</b></div>
+
+<h2><span class="n">1</span>Your database</h2>
+<div class="box">
+  <div class="row">
+    <input type="password" id="pass" placeholder="a passphrase (stays in this browser)">
+    <button id="openBtn">Create / open</button>
+  </div>
+  <div class="status" id="dbStatus">No database open. State lives in this
+  browser's IndexedDB, sealed with your passphrase (PBKDF2 + AES-GCM);
+  the network only ever sees ciphertext under pseudorandom keys.</div>
+</div>
+
+<h2><span class="n">2</span>Write sealed records</h2>
+<div class="box">
+  <div class="row">
+    <input type="number" id="nRows" value="20" min="1" max="200">
+    <button id="insertBtn" disabled>Insert demo orders</button>
+    <span class="status" id="insertStatus"></span>
+  </div>
+</div>
+
+<h2><span class="n">3</span>Range-query the ciphertext</h2>
+<div class="box">
+  <div class="row">
+    amount <input type="number" id="lo" value="100000">
+    to <input type="number" id="hi" value="600000">
+    <button id="queryBtn" disabled>Query</button>
+    <span class="status" id="queryStatus"></span>
+  </div>
+  <div id="results"></div>
+</div>
+
+<h2><span class="n">4</span>Invite another device — or Python</h2>
+<div class="box">
+  <div class="row">
+    <button id="exportBtn" disabled class="secondary">Export invite</button>
+    <button id="importBtn" class="secondary">Import invite</button>
+    <span class="status">an invite IS the master key — treat it like one</span>
+  </div>
+  <textarea id="inviteBox" placeholder="Paste an invite from Python (owner.invite()) or another browser, then press Import. Or press Export to take this database elsewhere."></textarea>
+</div>
+
+<h2><span class="n">5</span>What actually happened</h2>
+<div id="log">Waiting…</div>
+
+<div class="note"><b>Honesty first:</b> this talks to the public demo
+network — a published membership secret and <b>no durability promise</b>;
+run your own nodes for anything real. Requests reach the nodes through
+this site's HTTPS gateway (one node's <code>/fwd</code>), because browsers
+refuse plain-HTTP from an HTTPS page — the gateway sees who talks to whom,
+which nodes always could; it reads nothing, which nodes never could.
+Reads after the first are answered from an in-page mirror. The client is
+<a href="https://github.com/alviso/blindrange/blob/main/web/blindrange.mjs">
+one dependency-free file</a>, byte-compatible with the reference and pinned
+to it by a cross-language test suite.</div>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/build">the SQL guide</a> ·
+<a href="/build-python">the Python guide</a> ·
+<a href="/build-node">the Node.js guide</a> ·
+<a href="/apps">built on it</a> ·
+<a href="/demos">demos</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+<script type="module">
+import { Owner, idbAdapter, memoryAdapter } from "/blindrange.js?v=1";
+
+const SCHEMA = {
+  amount: { type: "int", bits: 20, leaf_width: 64 },
+  day:    { type: "int", bits: 11, leaf_width: 1 },
+  name:   { type: "str", bits: 20, leaf_width: 16, chars: 4 },
+};
+const GATEWAY = "/api";
+const BOOTSTRAP = ["seed.blindrange.dev:7501"];
+const SECRET = "blindrange-public";
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+let owner = null;
+
+function log(msg, ms) {
+  const line = ms !== undefined
+    ? `${msg} <span class="t">${ms}ms</span>` : msg;
+  logEl.innerHTML = (logEl.innerHTML === "Waiting…" ? "" :
+    logEl.innerHTML + "\n") + line;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+async function timed(label, fn) {
+  const t0 = performance.now();
+  const out = await fn();
+  log(label, Math.round(performance.now() - t0));
+  return out;
+}
+
+function ready() {
+  $("insertBtn").disabled = false;
+  $("queryBtn").disabled = false;
+  $("exportBtn").disabled = false;
+}
+
+$("openBtn").onclick = async () => {
+  const pass = $("pass").value;
+  if (!pass) { alert("pick a passphrase"); return; }
+  $("openBtn").disabled = true;
+  try {
+    const adapter = idbAdapter("try-db");
+    try {
+      owner = await timed("open existing database (PBKDF2 unlock + membership)",
+        () => Owner.open(adapter, pass, { gateway: GATEWAY }));
+    } catch (e) {
+      if (String(e).includes("no state stored")) {
+        owner = await timed("create database (register writer on network)",
+          () => Owner.create(adapter, pass, SCHEMA, BOOTSTRAP,
+            { networkSecret: SECRET, gateway: GATEWAY }));
+      } else throw e;
+    }
+    owner.enableMirror();
+    $("dbStatus").innerHTML = `Open. Writer <b>${owner._st.writer}</b>, ` +
+      `${owner.network().length} nodes in view, ` +
+      `${owner._st.writers.length} writer(s) registered.`;
+    ready();
+  } catch (e) {
+    log("FAILED: " + e.message);
+    $("dbStatus").textContent = "Failed: " + e.message;
+  } finally { $("openBtn").disabled = false; }
+};
+
+$("insertBtn").onclick = async () => {
+  const n = Math.min(200, Math.max(1, +$("nRows").value || 20));
+  $("insertBtn").disabled = true;
+  try {
+    const names = ["acme", "apex", "sable", "salt", "iris", "gale"];
+    const rows = Array.from({ length: n }, (_, i) => ({
+      amount: 500 + Math.floor(Math.random() * 900000),
+      day: Math.floor(Math.random() * 700),
+      name: names[Math.floor(Math.random() * names.length)] + i,
+      note: "sealed client-side; the network never sees this field",
+    }));
+    await timed(`insert ${n} records (sealed here, quorum-acked there)`,
+      () => owner.insertMany(rows));
+    $("insertStatus").textContent = `${n} records written`;
+  } catch (e) { log("FAILED: " + e.message); }
+  finally { $("insertBtn").disabled = false; }
+};
+
+$("queryBtn").onclick = async () => {
+  $("queryBtn").disabled = true;
+  try {
+    const lo = +$("lo").value, hi = +$("hi").value;
+    const rows = await timed(`range query amount ∈ [${lo}, ${hi}]`,
+      () => owner.query("amount", lo, hi));
+    rows.sort((a, b) => a.amount - b.amount);
+    const cells = rows.slice(0, 50).map((r) =>
+      `<tr><td>${r.amount}</td><td>${r.day}</td><td>${r.name}</td></tr>`)
+      .join("");
+    $("results").innerHTML = rows.length
+      ? `<table><tr><th>amount</th><th>day</th><th>name</th></tr>${cells}</table>`
+      : "";
+    $("queryStatus").textContent =
+      `${rows.length} row(s)` + (rows.length > 50 ? " (showing 50)" : "");
+  } catch (e) { log("FAILED: " + e.message); }
+  finally { $("queryBtn").disabled = false; }
+};
+
+$("exportBtn").onclick = () => {
+  $("inviteBox").value = owner.invite();
+  log("invite exported — it contains the master key; treat it like one");
+};
+
+$("importBtn").onclick = async () => {
+  const inv = $("inviteBox").value.trim();
+  if (!inv) { alert("paste an invite first"); return; }
+  const pass = $("pass").value || prompt("passphrase for the imported db");
+  try {
+    owner = await timed("accept invite (join as a new writer)",
+      () => Owner.accept(memoryAdapter(), pass, inv, { gateway: GATEWAY }));
+    owner.enableMirror();
+    $("dbStatus").innerHTML = `Imported (this session only). Writer ` +
+      `<b>${owner._st.writer}</b>, ${owner._st.writers.length} writer(s).`;
+    ready();
+  } catch (e) { log("FAILED: " + e.message); }
+};
+
+log("page loaded — no backend was contacted to serve you this application");
+</script>
+</body>
+</html>

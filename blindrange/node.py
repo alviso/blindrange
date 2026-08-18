@@ -1175,6 +1175,44 @@ def _service_post(store, peers, hub, secret, path, data, quic=None,
             quic.punch(target)
         return 200, {"punching": bool(quic and target),
                      "udp": quic.observed if quic else ""}
+    if path == "/fwd":
+        # A browser page served over HTTPS cannot fetch plain-HTTP nodes
+        # (mixed content), so it sends every request here and this node
+        # forwards it. Scope: the target must be an address this node
+        # currently believes is a live peer (or itself) — this is a door
+        # to the NETWORK, not a generic proxy to the internet. Forwarded
+        # requests are plain requests; /fwd to /fwd is refused so nobody
+        # builds chains.
+        target = data.get("addr", "")
+        fpath = data.get("path", "")
+        method = data.get("method", "POST")
+        if fpath.startswith("/fwd"):
+            return 400, {"error": "forwarding does not chain"}
+        live_addrs = {e["addr"] for e in peers.live().values()}
+        live_addrs.add(peers.addr)
+        if target not in live_addrs:
+            return 404, {"error": "target is not a live peer of this node"}
+        body = b64decode(data.get("body_b64", "")) if data.get("body_b64") \
+            else b""
+        if len(body) > 8 * 1024 * 1024:
+            return 413, {"error": "forwarded body too large"}
+        try:
+            if method == "GET":
+                gh = ({"X-BR-Auth": _sign(secret,
+                                          fpath.split("?")[0].encode())}
+                      if secret else {})
+                fstatus, raw = POOL.request(target, "GET", fpath, None,
+                                            gh, timeout=10)
+            else:
+                fstatus, raw = POOL.request(
+                    target, "POST", fpath, body,
+                    {"Content-Type": "application/json",
+                     "X-BR-Auth": _sign(secret, body) if secret else ""},
+                    timeout=10)
+        except OSError as e:
+            return 502, {"error": f"forward failed: {str(e)[:120]}"}
+        return 200, {"status": fstatus,
+                     "body_b64": b64encode(raw or b"").decode()}
     if path == "/relay/poll":
         tok = data.get("token", {})
         if not verify_poll_token(tok):
@@ -2173,8 +2211,23 @@ def make_handler(store: Store, peers: Peers, hub: RelayHub, secret: str = "",
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            # CORS preflight: the browser client sends X-BR-Auth, which
+            # makes every POST "non-simple". Allow-all is correct here —
+            # membership is enforced by the HMAC secret on the actual
+            # request, and an Origin check would only be theater.
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods",
+                             "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, X-BR-Auth")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
 
         def _authed(self, payload: bytes) -> bool:
             """Network-membership check: HMAC(secret, payload). Anti-vandalism

@@ -78,6 +78,15 @@ class TestE2E(unittest.TestCase):
             "name":   {"type": "str", "bits": 20, "leaf_width": 16, "chars": 4},
         }
         cls.state = f"{cls.tmp}/owner.brdb"
+        # This class kills 2 of 6 nodes and asserts every row survives —
+        # a claim about THREE copies existing, not about write_acks=2
+        # returning. acks=2 leaves the third copy hedged; a hedge that
+        # fails under suite load is done, not retried (drain() waits, it
+        # does not resend), and twice now CI killed exactly the two
+        # holders of a two-copy row. Pay for the invariant the tests
+        # assert: every write in this class waits for all three.
+        cls._old_acks = os.environ.get("BR_WRITE_ACKS")
+        os.environ["BR_WRITE_ACKS"] = "3"
         cls.owner = Owner.create(cls.state, "correct horse", cls.schema,
                                  bootstrap=[f"127.0.0.1:{BASE}"],
                                  network_secret=cls.secret)
@@ -100,6 +109,10 @@ class TestE2E(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if cls._old_acks is None:
+            os.environ.pop("BR_WRITE_ACKS", None)
+        else:
+            os.environ["BR_WRITE_ACKS"] = cls._old_acks
         for p in cls.procs.values():
             if p.poll() is None:
                 p.terminate()
