@@ -1126,13 +1126,19 @@ class Owner:
         # refused, which is the lesson the truncated production database
         # taught. Routes must be REBUILT after the refresh — retrying the
         # stale route asks the corpse again and learns nothing.
-        for attempt in range(3):
+        # Backoffs sized for real recoveries (a re-execing node rebinds
+        # in ~1-3s, a relay tenant re-homes in ~5-20s), because the
+        # any-silence rule keeps more keys in the ladder and a loaded
+        # replica missing two 2s windows must become an answer, not a
+        # refusal — CI failed the kill-two test on exactly that margin.
+        waits = (0.3, 1.5, 4.0)
+        for attempt in range(len(waits) + 1):
             stuck = unresolved()
             if not stuck:
                 break
-            if attempt == 0:
-                time.sleep(0.3)
-            else:
+            if attempt < len(waits):
+                time.sleep(waits[attempt])
+            if attempt >= 1:
                 try:
                     self.refresh_membership()
                 except OSError:
