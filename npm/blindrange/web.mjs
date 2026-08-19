@@ -977,6 +977,18 @@ export class Owner {
   }
 
   async queryMulti(predicates, _retried = false) {
+    // foreground marker: the background walk yields while any page
+    // query runs — a browser gives one origin ~6 connections, and the
+    // walk was starving every page switch behind its own fetches
+    if (!(this.mirror && this.mirror.bypass)) {
+      this._uiBusy = (this._uiBusy || 0) + 1;
+      try { return await this._queryMultiInner(predicates, _retried); }
+      finally { this._uiBusy -= 1; }
+    }
+    return this._queryMultiInner(predicates, _retried);
+  }
+
+  async _queryMultiInner(predicates, _retried = false) {
     const st = this._st;
     const me = st.writer;
     const top = st.epoch;
@@ -1308,7 +1320,12 @@ export class Owner {
       const eps = this._epochs();
       const rids = new Set();
 
+      const uiYield = async () => {
+        while ((this._uiBusy || 0) > 0)
+          await new Promise((r) => setTimeout(r, 150));
+      };
       const walkLabels = async (labels, unmaskRids, boundFor) => {
+        await uiYield();
         // One batch for a whole tree level. Level 1 gallops (two
         // labels, cheap). Every deeper level fetches SPECULATIVELY:
         // a child chain can never be longer than its parent (one
@@ -1462,8 +1479,10 @@ export class Owner {
       }
       // every record the entries name
       const rkeys = [...rids].map((r) => "R:" + r);
-      for (let i = 0; i < rkeys.length; i += 64)
+      for (let i = 0; i < rkeys.length; i += 64) {
+        await uiYield();
         await this._mget(rkeys.slice(i, i + 64));
+      }
       await this._save();               // counters are the query's map
     } finally {
       m.bypass = false;
