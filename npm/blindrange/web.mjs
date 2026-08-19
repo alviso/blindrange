@@ -266,16 +266,27 @@ export function idbAdapter(name) {
 }
 
 const PBKDF2_ITERS = 600_000;
+const _sealCache = new Map();     // passphrase -> {saltHex, key}
 async function sealState(passphrase, stateObj) {
-  const salt = randomBytes(16), nonce = randomBytes(12);
-  const base = await subtle.importKey("raw", utf8(passphrase), "PBKDF2",
-    false, ["deriveBits"]);
-  const key = await aesKey(new Uint8Array(await subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITERS },
-    base, 256)));
-  const ct = await aesSeal(key, nonce, utf8(JSON.stringify(stateObj)));
+  // PBKDF2 at 600k iterations costs ~250ms — fine once at unlock,
+  // ruinous on every cache save (measured: it WAS the page latency
+  // once reads went local). Derive once per passphrase per session;
+  // a stable salt with fresh AES-GCM nonces is standard practice.
+  let ck = _sealCache.get(passphrase);
+  if (!ck) {
+    const salt = randomBytes(16);
+    const base = await subtle.importKey("raw", utf8(passphrase), "PBKDF2",
+      false, ["deriveBits"]);
+    ck = { saltHex: hex(salt),
+      key: await aesKey(new Uint8Array(await subtle.deriveBits(
+        { name: "PBKDF2", hash: "SHA-256", salt,
+          iterations: PBKDF2_ITERS }, base, 256))) };
+    _sealCache.set(passphrase, ck);
+  }
+  const nonce = randomBytes(12);
+  const ct = await aesSeal(ck.key, nonce, utf8(JSON.stringify(stateObj)));
   return JSON.stringify({ v: 1, kdf: "pbkdf2-sha256", iters: PBKDF2_ITERS,
-    salt: hex(salt), nonce: hex(nonce), ct: hex(ct) });
+    salt: ck.saltHex, nonce: hex(nonce), ct: hex(ct) });
 }
 async function openState(passphrase, blob) {
   const d = JSON.parse(blob);
@@ -530,16 +541,15 @@ export class Owner {
     if (!keys.length) { this.lastUnresolved = new Set(); return {}; }
     const m = this.mirror;
     if (m && !m.bypass && m.freshFor(this)) {
+      // The reference contract, now ported completely: a FRESH mirror
+      // answers absence locally. Most of what a query does is prove
+      // that chains did NOT grow — forwarding those misses to the
+      // network made every page walk the WAN while a complete local
+      // copy sat in IndexedDB. Hits local, absence local; the network
+      // is for writes and for staleness, not for every render.
       const out = {};
-      const missing = [];
-      for (const k of keys) {
-        if (m.kv.has(k)) out[k] = m.kv.get(k);
-        else missing.push(k);
-      }
-      if (!missing.length) { this.lastUnresolved = new Set(); return out; }
-      const got = await this._mgetNetwork(missing);
-      for (const [k, v] of Object.entries(got)) { m.kv.set(k, v); out[k] = v; }
-      if (m.persistPut) m.persistPut(Object.entries(got));
+      for (const k of keys) if (m.kv.has(k)) out[k] = m.kv.get(k);
+      this.lastUnresolved = new Set();
       return out;
     }
     const got = await this._mgetNetwork(keys);
@@ -1008,6 +1018,7 @@ export class Owner {
     }
 
     const ridSets = {};
+    let dirty = grown.size > 0;
     for (const [field] of bounds) ridSets[field] = new Set();
     for (const [key, [cid, i]] of Object.entries(enumMap)) {
       const blob = got[key];
@@ -1019,7 +1030,10 @@ export class Owner {
         ridSets[ch.field].add(hex(rid));
       } else if (ch.kind === "tomb") {
         const rid = xor8(unb64(blob), await this._mask(kT, ch.ep, ch.u, i));
-        if (!st.tombs.rids.includes(hex(rid))) st.tombs.rids.push(hex(rid));
+        if (!st.tombs.rids.includes(hex(rid))) {
+          st.tombs.rids.push(hex(rid));
+          dirty = true;
+        }
       }
     }
     // update caches: own chains for top epoch, remote for the rest
@@ -1027,17 +1041,26 @@ export class Owner {
       const ch = chains[cid];
       if (ch.kind === "lab") {
         if (ch.u === me && ch.ep === top) {
-          if ((st.chains[ch.w] || 0) < end) st.chains[ch.w] = end;
+          if ((st.chains[ch.w] || 0) < end) {
+            st.chains[ch.w] = end;
+            dirty = true;
+          }
         } else {
           const rk = `${ch.ep}|${ch.w}`;
           st.remote[rk] = st.remote[rk] || {};
-          st.remote[rk][ch.u] = end;
+          if (st.remote[rk][ch.u] !== end) {
+            st.remote[rk][ch.u] = end;
+            dirty = true;
+          }
         }
       } else if (ch.kind === "tomb") {
-        st.tombs.counts[`${ch.ep}|${ch.u}`] = end;
+        if (st.tombs.counts[`${ch.ep}|${ch.u}`] !== end) {
+          st.tombs.counts[`${ch.ep}|${ch.u}`] = end;
+          dirty = true;
+        }
       }
     }
-    await this._save();
+    if (dirty) await this._save();   // cache only; losable, re-probable
 
     let rids = null;
     for (const [field] of bounds)
