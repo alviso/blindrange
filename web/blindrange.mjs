@@ -1314,29 +1314,6 @@ export class Owner {
           while (end < ks.length && ks[end] in specGot) end += 1;
           ends[cid] = end;
         }
-        // strict boundary check: the quick pass may under-read if a
-        // holder missed one round — probe each end+1 with the FULL
-        // integrity rules and extend when something answers
-        for (let guard = 0; guard < 20; guard++) {
-          const probes = {};
-          for (const [cid, ks] of Object.entries(specKeys)) {
-            const nxt = ends[cid];
-            if (nxt < ks.length) probes[ks[nxt]] = cid;
-          }
-          const above = {};
-          for (const cid of Object.values(probes)) {
-            const { ep, u, kw } = info[cid];
-            void ep; void u; void kw;
-          }
-          if (!Object.keys(probes).length) break;
-          const got2 = await this._mget(Object.keys(probes));
-          Object.assign(specGot, got2);
-          let grew = false;
-          for (const [key, cid] of Object.entries(probes))
-            if (key in got2) { ends[cid] += 1; grew = true; }
-          void above;
-          if (!grew) break;
-        }
         const entryKeys = {};
         for (const [cid, end] of Object.entries(ends)) {
           if (specKeys[cid]) {
@@ -1354,8 +1331,10 @@ export class Owner {
         Object.assign(got, specGot);
         const totals = {};
         const chainEnds = {};
+        const chainList = [];
         for (const [cid, end] of Object.entries(ends)) {
-          const { w, ep, u } = info[cid];
+          const { w, ep, u, kw } = info[cid];
+          chainList.push({ w, ep, u, kw, end });
           totals[w] = (totals[w] || 0) + end;
           chainEnds[`${w}\u0000${ep}\u0000${u}`] = end;
           if (u === me && ep === top) {
@@ -1373,7 +1352,7 @@ export class Owner {
             const { ep, u, kw } = info[cid];
             rids.add(hex(xor8(unb64(blob), await this._mask(kw, ep, u, i))));
           }
-        return { totals, chainEnds };
+        return { totals, chainEnds, chainList };
       };
 
       // all fields walk concurrently: the walk is round-trip bound
@@ -1381,25 +1360,49 @@ export class Owner {
       await Promise.all(Object.entries(st.schema).map(
         async ([field, specF]) => {
           const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
-          let frontier = [[1, 0n], [1, 1n]];
-          let parentEnds = null;   // chainEnds of the previous level
-          while (frontier.length) {
-            const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
-            const boundFor = parentEnds === null ? null
-              : (w, ep, u) => {
-                  const parts = w.split("|");
-                  const parent = `${parts[0]}|${+parts[1] - 1}|` +
-                    (BigInt(parts[2]) / 2n);
-                  return parentEnds[`${parent}\u0000${ep}\u0000${u}`] || 0;
-                };
-            const { totals, chainEnds } =
-              await walkLabels(labels, true, boundFor);
-            const next = [];
-            for (const [l, i] of frontier)
-              if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
-                next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
-            frontier = next;
-            parentEnds = chainEnds;
+          for (let round = 0; round < 4; round++) {
+            const fieldChains = [];
+            let frontier = [[1, 0n], [1, 1n]];
+            let parentEnds = null;
+            while (frontier.length) {
+              const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
+              const boundFor = parentEnds === null ? null
+                : (w, ep, u) => {
+                    const parts = w.split("|");
+                    const parent = `${parts[0]}|${+parts[1] - 1}|` +
+                      (BigInt(parts[2]) / 2n);
+                    return parentEnds[`${parent}\u0000${ep}\u0000${u}`]
+                      || 0;
+                  };
+              const { totals, chainEnds, chainList } =
+                await walkLabels(labels, true, boundFor);
+              fieldChains.push(...chainList);
+              const next = [];
+              for (const [l, i] of frontier)
+                if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
+                  next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
+              frontier = next;
+              parentEnds = chainEnds;
+            }
+            // ONE strict pass for the whole field: probe every chain's
+            // end+1 with full integrity rules — a shared ladder at
+            // worst, instead of one per level
+            const probes = {};
+            for (const ch of fieldChains)
+              probes[await this._ut(ch.kw, ch.ep, ch.u, ch.end + 1)] = ch;
+            const got = Object.keys(probes).length
+              ? await this._mget(Object.keys(probes)) : {};
+            let extended = false;
+            for (const [key, ch] of Object.entries(got.constructor === Object
+                ? Object.fromEntries(Object.entries(probes)
+                    .filter(([k]) => k in got)) : {})) {
+              // the quick pass under-read this chain: record the entry
+              // and re-walk the field so deeper levels catch up
+              rids.add(hex(xor8(unb64(got[key]),
+                await this._mask(ch.kw, ch.ep, ch.u, ch.end + 1))));
+              extended = true;
+            }
+            if (!extended) break;
           }
         }));
       // tombstones: single label, all epochs and writers
