@@ -1258,31 +1258,63 @@ export class Owner {
       const eps = this._epochs();
       const rids = new Set();
 
-      const walkLabels = async (labels, unmaskRids) => {
-        // gallop every (label, epoch, writer) chain in one batch,
-        // fetch all entries, cache counters; returns per-label totals
+      const walkLabels = async (labels, unmaskRids, boundFor) => {
+        // One batch for a whole tree level. Level 1 gallops (two
+        // labels, cheap). Every deeper level fetches SPECULATIVELY:
+        // a child chain can never be longer than its parent (one
+        // writer's entries partition downward), so keys 1..parentEnd
+        // are fetched in a single round and the end is the contiguous
+        // prefix found — no galloping. Measured before this: a
+        // four-minute warmup, all of it round trips.
         const spec = {};
         const info = {};
+        const specKeys = {};
         for (const w of labels) {
           const kw = await this._kW(w);
           for (const ep of eps)
             for (const u of writers) {
               const cid = `${w}\u0000${ep}\u0000${u}`;
-              spec[cid] = { fn: (i) => this._ut(kw, ep, u, i), cached: 0 };
               info[cid] = { w, ep, u, kw };
+              const bound = boundFor ? boundFor(w, ep, u) : null;
+              if (bound === null)
+                spec[cid] = { fn: (i) => this._ut(kw, ep, u, i), cached: 0 };
+              else if (bound > 0) {
+                specKeys[cid] = [];
+                for (let i = 1; i <= bound; i++)
+                  specKeys[cid].push(await this._ut(kw, ep, u, i));
+              }
             }
         }
-        const ends = await this._discoverEnds(spec);
+        const ends = Object.keys(spec).length
+          ? await this._discoverEnds(spec) : {};
+        const allSpec = Object.values(specKeys).flat();
+        const specGot = allSpec.length ? await this._mget(allSpec) : {};
+        for (const [cid, ks] of Object.entries(specKeys)) {
+          let end = 0;
+          while (end < ks.length && ks[end] in specGot) end += 1;
+          ends[cid] = end;
+        }
         const entryKeys = {};
-        for (const [cid, end] of Object.entries(ends))
-          for (let i = 1; i <= end; i++)
-            entryKeys[await spec[cid].fn(i)] = [cid, i];
-        const got = Object.keys(entryKeys).length
-          ? await this._mget(Object.keys(entryKeys)) : {};
+        for (const [cid, end] of Object.entries(ends)) {
+          if (specKeys[cid]) {
+            for (let i = 1; i <= end; i++)
+              entryKeys[specKeys[cid][i - 1]] = [cid, i];
+          } else {
+            const { ep, u, kw } = info[cid];
+            for (let i = 1; i <= end; i++)
+              entryKeys[await this._ut(kw, ep, u, i)] = [cid, i];
+          }
+        }
+        const missing = Object.keys(entryKeys)
+          .filter((k) => !(k in specGot));
+        const got = missing.length ? await this._mget(missing) : {};
+        Object.assign(got, specGot);
         const totals = {};
+        const chainEnds = {};
         for (const [cid, end] of Object.entries(ends)) {
           const { w, ep, u } = info[cid];
           totals[w] = (totals[w] || 0) + end;
+          chainEnds[`${w}\u0000${ep}\u0000${u}`] = end;
           if (u === me && ep === top) {
             if ((st.chains[w] || 0) < end) st.chains[w] = end;
           } else {
@@ -1298,7 +1330,7 @@ export class Owner {
             const { ep, u, kw } = info[cid];
             rids.add(hex(xor8(unb64(blob), await this._mask(kw, ep, u, i))));
           }
-        return totals;
+        return { totals, chainEnds };
       };
 
       // all fields walk concurrently: the walk is round-trip bound
@@ -1307,14 +1339,24 @@ export class Owner {
         async ([field, specF]) => {
           const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
           let frontier = [[1, 0n], [1, 1n]];
+          let parentEnds = null;   // chainEnds of the previous level
           while (frontier.length) {
             const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
-            const totals = await walkLabels(labels, true);
+            const boundFor = parentEnds === null ? null
+              : (w, ep, u) => {
+                  const parts = w.split("|");
+                  const parent = `${parts[0]}|${+parts[1] - 1}|` +
+                    (BigInt(parts[2]) / 2n);
+                  return parentEnds[`${parent}\u0000${ep}\u0000${u}`] || 0;
+                };
+            const { totals, chainEnds } =
+              await walkLabels(labels, true, boundFor);
             const next = [];
             for (const [l, i] of frontier)
               if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
                 next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
             frontier = next;
+            parentEnds = chainEnds;
           }
         }));
       // tombstones: single label, all epochs and writers
