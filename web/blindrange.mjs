@@ -1301,19 +1301,22 @@ export class Owner {
         return totals;
       };
 
-      for (const [field, specF] of Object.entries(st.schema)) {
-        const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
-        let frontier = [[1, 0n], [1, 1n]];
-        while (frontier.length) {
-          const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
-          const totals = await walkLabels(labels, true);
-          const next = [];
-          for (const [l, i] of frontier)
-            if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
-              next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
-          frontier = next;
-        }
-      }
+      // all fields walk concurrently: the walk is round-trip bound
+      // (measured: sequential fields cost minutes through a gateway)
+      await Promise.all(Object.entries(st.schema).map(
+        async ([field, specF]) => {
+          const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
+          let frontier = [[1, 0n], [1, 1n]];
+          while (frontier.length) {
+            const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
+            const totals = await walkLabels(labels, true);
+            const next = [];
+            for (const [l, i] of frontier)
+              if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
+                next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
+            frontier = next;
+          }
+        }));
       // tombstones: single label, all epochs and writers
       const kT = await this._kW(TOMB);
       const tSpec = {};
