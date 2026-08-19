@@ -536,6 +536,18 @@ export class Owner {
   }
 
   // ------------------------------------------------------------ kv plane
+  async _mgetQuick(keys) {
+    keys = [...new Set(keys)];
+    if (!keys.length) return {};
+    const got = await this._mgetNetwork(keys, true);
+    const m = this.mirror;
+    if (m) {
+      for (const [k, v] of Object.entries(got)) m.kv.set(k, v);
+      if (m.persistPut) m.persistPut(Object.entries(got));
+    }
+    return got;
+  }
+
   async _mget(keys) {
     keys = [...new Set(keys)];
     if (!keys.length) { this.lastUnresolved = new Set(); return {}; }
@@ -560,7 +572,7 @@ export class Owner {
     return got;
   }
 
-  async _mgetNetwork(keys) {
+  async _mgetNetwork(keys, quick = false) {
     // The integrity rule, ported verbatim: a key is ABSENT only when
     // fewer than write_acks of its replicas stayed silent. Silence is
     // never evidence. Slow yes; wrong no.
@@ -592,6 +604,14 @@ export class Owner {
     await fan(0, R, keys);
     const missing1 = keys.filter((k) => !(k in out));
     if (missing1.length) await fan(R, R + PROBE_EXTRA, missing1);
+    if (quick) {
+      // sync's bulk speculation: absent-heavy by construction, and its
+      // chain ends are strictly re-verified at the boundary — running
+      // every overfetched key through the patience ladder cost minutes
+      this.lastUnresolved = new Set();
+      this.lastSilent = {};
+      return out;
+    }
 
     const unresolved = () => {
       // A missing key is unprovable if too many top-R replicas are
@@ -1288,11 +1308,34 @@ export class Owner {
         const ends = Object.keys(spec).length
           ? await this._discoverEnds(spec) : {};
         const allSpec = Object.values(specKeys).flat();
-        const specGot = allSpec.length ? await this._mget(allSpec) : {};
+        const specGot = allSpec.length ? await this._mgetQuick(allSpec) : {};
         for (const [cid, ks] of Object.entries(specKeys)) {
           let end = 0;
           while (end < ks.length && ks[end] in specGot) end += 1;
           ends[cid] = end;
+        }
+        // strict boundary check: the quick pass may under-read if a
+        // holder missed one round — probe each end+1 with the FULL
+        // integrity rules and extend when something answers
+        for (let guard = 0; guard < 20; guard++) {
+          const probes = {};
+          for (const [cid, ks] of Object.entries(specKeys)) {
+            const nxt = ends[cid];
+            if (nxt < ks.length) probes[ks[nxt]] = cid;
+          }
+          const above = {};
+          for (const cid of Object.values(probes)) {
+            const { ep, u, kw } = info[cid];
+            void ep; void u; void kw;
+          }
+          if (!Object.keys(probes).length) break;
+          const got2 = await this._mget(Object.keys(probes));
+          Object.assign(specGot, got2);
+          let grew = false;
+          for (const [key, cid] of Object.entries(probes))
+            if (key in got2) { ends[cid] += 1; grew = true; }
+          void above;
+          if (!grew) break;
         }
         const entryKeys = {};
         for (const [cid, end] of Object.entries(ends)) {
