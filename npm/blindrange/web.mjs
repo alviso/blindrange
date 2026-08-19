@@ -552,6 +552,25 @@ export class Owner {
     keys = [...new Set(keys)];
     if (!keys.length) { this.lastUnresolved = new Set(); return {}; }
     const m = this.mirror;
+    if (m && !m.bypass && !m.freshFor(this)) {
+      // Not fresh enough to prove ABSENCE locally — but a cached HIT
+      // is still a hit: records and index entries are immutable, and
+      // other writers' deletes surface through tombstone chains, not
+      // by mutating these keys. Without this, every page refetched
+      // keys the previous page fetched seconds earlier: measured 3-10s
+      // per page switch in session views.
+      const out = {};
+      const missing = [];
+      for (const k of keys) {
+        if (m.kv.has(k)) out[k] = m.kv.get(k);
+        else missing.push(k);
+      }
+      if (!missing.length) { this.lastUnresolved = new Set(); return out; }
+      const got = await this._mgetNetwork(missing);
+      for (const [k, v] of Object.entries(got)) { m.kv.set(k, v); out[k] = v; }
+      if (m.persistPut) m.persistPut(Object.entries(got));
+      return out;
+    }
     if (m && !m.bypass && m.freshFor(this)) {
       // The reference contract, now ported completely: a FRESH mirror
       // answers absence locally. Most of what a query does is prove
@@ -1007,16 +1026,27 @@ export class Owner {
 
     const enumMap = {};
     const probeMap = {};
+    this._probed = this._probed || new Map();
+    const probeTtlMs = (this.probeTtlS ?? 5) * 1000;
+    const nowMs = Date.now();
     for (const [cid, ch] of Object.entries(chains)) {
       if (ch.kind === "lab")
         for (let i = 1; i <= ch.cached; i++)
           enumMap[await ch.fn(i)] = [cid, i];
-      probeMap[await ch.fn(ch.cached + 1)] = cid;
+      // a chain probed within the TTL is trusted not to have grown —
+      // the same bargain SYS_REFRESH_S makes for system chains: a
+      // stale window costs seeing another writer's newest rows a few
+      // seconds late, never a wrong answer about existing rows
+      if (ch.kind === "sys" ||
+          nowMs - (this._probed.get(cid) || 0) >= probeTtlMs)
+        probeMap[await ch.fn(ch.cached + 1)] = cid;
     }
     let got = await this._mget([...Object.keys(enumMap),
                                 ...Object.keys(probeMap)]);
     this._refuseUnresolved(Object.keys(enumMap), "index entries");
 
+    for (const cid of Object.values(probeMap))
+      if (chains[cid].kind !== "sys") this._probed.set(cid, nowMs);
     const grown = new Set(Object.entries(probeMap)
       .filter(([k]) => k in got).map(([, cid]) => cid));
     if ([...grown].some((cid) => chains[cid].kind === "sys")) {
