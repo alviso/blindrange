@@ -1235,20 +1235,115 @@ export class Owner {
   }
 
   async sync() {
+    // A COMPLETE walk of the label tree, like the reference client's.
+    // The first version ran one full-domain query per field — which
+    // covers the domain with LEVEL-1 labels only, while real range
+    // queries cover with deeper labels whose chains were never
+    // fetched. Result, measured live: a mirror holding all 70 keys of
+    // a ledger whose every query through it returned zero rows,
+    // because "fresh" absence answered locally for chains the sync
+    // never visited. Complete means EVERY level: descend only into
+    // nonempty parents (every value writes all its levels, so a
+    // child's entries partition its parent's) — cost tracks what
+    // exists, not the domain size.
     const m = await this.enableMirror();
     const t0 = Date.now();
     m.bypass = true;      // read the NETWORK, but store what arrives
     try {
+      const st = this._st;
+      const me = st.writer;
+      const top = st.epoch;
       const writers = await this._refreshWriters(true);
       await this._refreshEpoch(true);
-      // one full query per field over the whole domain pulls every
-      // label entry and record through _mget; v1 sync = warm everything
-      for (const [field, spec] of Object.entries(this._st.schema)) {
-        const hiVal = spec.type === "str" ? "" : (2 ** spec.bits - 1);
-        if (spec.type === "str") await this.queryPrefix(field, "");
-        else await this.queryMulti([{ field, lo: 0, hi: hiVal }]);
+      const eps = this._epochs();
+      const rids = new Set();
+
+      const walkLabels = async (labels, unmaskRids) => {
+        // gallop every (label, epoch, writer) chain in one batch,
+        // fetch all entries, cache counters; returns per-label totals
+        const spec = {};
+        const info = {};
+        for (const w of labels) {
+          const kw = await this._kW(w);
+          for (const ep of eps)
+            for (const u of writers) {
+              const cid = `${w}\u0000${ep}\u0000${u}`;
+              spec[cid] = { fn: (i) => this._ut(kw, ep, u, i), cached: 0 };
+              info[cid] = { w, ep, u, kw };
+            }
+        }
+        const ends = await this._discoverEnds(spec);
+        const entryKeys = {};
+        for (const [cid, end] of Object.entries(ends))
+          for (let i = 1; i <= end; i++)
+            entryKeys[await spec[cid].fn(i)] = [cid, i];
+        const got = Object.keys(entryKeys).length
+          ? await this._mget(Object.keys(entryKeys)) : {};
+        const totals = {};
+        for (const [cid, end] of Object.entries(ends)) {
+          const { w, ep, u } = info[cid];
+          totals[w] = (totals[w] || 0) + end;
+          if (u === me && ep === top) {
+            if ((st.chains[w] || 0) < end) st.chains[w] = end;
+          } else {
+            const rk = `${ep}|${w}`;
+            st.remote[rk] = st.remote[rk] || {};
+            st.remote[rk][u] = end;
+          }
+        }
+        if (unmaskRids)
+          for (const [key, [cid, i]] of Object.entries(entryKeys)) {
+            const blob = got[key];
+            if (blob === undefined) continue;
+            const { ep, u, kw } = info[cid];
+            rids.add(hex(xor8(unb64(blob), await this._mask(kw, ep, u, i))));
+          }
+        return totals;
+      };
+
+      for (const [field, specF] of Object.entries(st.schema)) {
+        const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
+        let frontier = [[1, 0n], [1, 1n]];
+        while (frontier.length) {
+          const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
+          const totals = await walkLabels(labels, true);
+          const next = [];
+          for (const [l, i] of frontier)
+            if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
+              next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
+          frontier = next;
+        }
       }
-      void writers;
+      // tombstones: single label, all epochs and writers
+      const kT = await this._kW(TOMB);
+      const tSpec = {};
+      for (const ep of eps)
+        for (const u of writers)
+          tSpec[`${ep}\u0000${u}`] = { fn: (i) => this._ut(kT, ep, u, i),
+            cached: 0 };
+      const tEnds = await this._discoverEnds(tSpec);
+      const tKeys = {};
+      for (const [cid, end] of Object.entries(tEnds))
+        for (let i = 1; i <= end; i++)
+          tKeys[await tSpec[cid].fn(i)] = [cid, i];
+      const tGot = Object.keys(tKeys).length
+        ? await this._mget(Object.keys(tKeys)) : {};
+      for (const [key, [cid, i]] of Object.entries(tKeys)) {
+        const blob = tGot[key];
+        if (blob === undefined) continue;
+        const [ep, u] = cid.split("\u0000");
+        const rid = hex(xor8(unb64(blob), await this._mask(kT, +ep, u, +i)));
+        if (!st.tombs.rids.includes(rid)) st.tombs.rids.push(rid);
+      }
+      for (const [cid, end] of Object.entries(tEnds)) {
+        const [ep, u] = cid.split("\u0000");
+        st.tombs.counts[`${ep}|${u}`] = end;
+      }
+      // every record the entries name
+      const rkeys = [...rids].map((r) => "R:" + r);
+      for (let i = 0; i < rkeys.length; i += 64)
+        await this._mget(rkeys.slice(i, i + 64));
+      await this._save();               // counters are the query's map
     } finally {
       m.bypass = false;
     }

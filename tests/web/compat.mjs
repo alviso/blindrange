@@ -59,6 +59,19 @@ if (job.phase === "vectors") {
   const after = await o.query("amount", 0, 1048575);
   out.total_after = after.length;
 
+  {
+    // mirror + sync must see EXACTLY what direct queries see — the
+    // level-1-only sync shortcut passed every other test and returned
+    // zero rows in production
+    const mo = await Owner.accept(memoryAdapter(), "mir pass", job.invite);
+    await mo.enableMirror();
+    await mo.sync();
+    const viaMirror = await mo.query("amount", 100000, 300000);
+    out.mirror_range_rows = viaMirror.map((r) => r.row).sort((a, b) => a - b);
+    const pfx = await mo.queryPrefix("name", "sa");
+    out.mirror_prefix_rows = pfx.map((r) => r.row).sort((a, b) => a - b);
+  }
+
   if (job.gateway) {
     // Same database, but every byte through ONE node's /fwd — the path
     // an HTTPS page must take. Answers must be identical.

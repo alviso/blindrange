@@ -33,6 +33,11 @@ SCHEMA = {
 }
 
 
+def want_after_del(rows, lo, hi):
+    return sorted(r["row"] for r in rows
+                  if lo <= r["amount"] <= hi and r["row"] != 7)
+
+
 def _node_ok():
     try:
         v = subprocess.run(["node", "--version"], capture_output=True,
@@ -170,6 +175,16 @@ class TestWebClient(unittest.TestCase):
         all_rows = self.owner.query("amount", 0, 1_048_575)
         self.assertNotIn(7, [r["row"] for r in all_rows],
                          "Python still sees the row JS deleted")
+
+        # a synced mirror answers every query shape identically to the
+        # network — range AND deeper-level covers AND prefixes
+        self.assertEqual(got["mirror_range_rows"], want_after_del(
+            self.rows, 100_000, 300_000),
+            "mirror+sync range differs from direct")
+        want_p = sorted(r["row"] for r in self.rows
+                        if r["name"].startswith("sa") and r["row"] != 7)
+        self.assertEqual(got["mirror_prefix_rows"], want_p,
+                         "mirror+sync prefix differs from direct")
 
         # the /fwd gateway path returns the same truth as direct access
         want_after = sorted(r["row"] for r in self.rows
