@@ -98,7 +98,14 @@ async function render() {
     `sealed on ${db.network().length} public nodes`;
 }
 
+// One mutation at a time: a repeat click during a ~1s network write
+// double-submits. (For UPDATE-heavy apps, also give records a stable
+// logical id + a rev and dedupe on read — see the build-web guide.)
+let busy = false;
 $("add").onclick = async () => {
+  if (busy) return;
+  busy = true;
+  try {
   const text = $("text").value.trim();
   if (!text) return;
   $("text").value = "";
@@ -107,9 +114,13 @@ $("add").onclick = async () => {
   const pos = await db.nextValue("pos");
   await db.insert({ pos, text, done: false });
   render();
+  } finally { busy = false; }
 };
 
 $("list").onclick = async (e) => {
+  if (busy) return;
+  busy = true;
+  try {
   const li = e.target.closest("li");
   if (!li) return;
   // toggling = delete + reinsert (records are immutable ciphertext);
@@ -118,6 +129,7 @@ $("list").onclick = async (e) => {
   await db.insert({ pos: +li.dataset.pos, text: li.dataset.text,
                     done: li.dataset.done !== "1" });
   render();
+  } finally { busy = false; }
 };
 
 $("invite").onclick = () => {
