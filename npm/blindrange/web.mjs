@@ -594,15 +594,28 @@ export class Owner {
     if (missing1.length) await fan(R, R + PROBE_EXTRA, missing1);
 
     const unresolved = () => {
+      // A missing key is unprovable if too many top-R replicas are
+      // silent OR if ANY probed candidate is silent: under ring drift
+      // the write's acks can sit outside today's top-R. Measured live:
+      // a ledger whose every copy sat on two relay tenants read as
+      // cleanly absent during a restart wave — both silent holders
+      // were in the extras the old arithmetic ignored.
       const tolerable = Math.max(0, this.writeAcks - 1);
       return new Set(keys.filter((k) => !(k in out) &&
-        route[k].slice(0, R).filter((a) => !replied.has(a)).length > tolerable));
+        (route[k].slice(0, R).filter((a) => !replied.has(a)).length
+           > tolerable ||
+         route[k].some((a) => !replied.has(a)))));
     };
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Backoffs sized for real recoveries: a re-execing node rebinds in
+    // ~1-3s, a relay tenant re-homes in ~5-20s. Give silence a chance
+    // to become an answer before refusing.
+    const waits = [300, 1500, 4000, 8000];
+    for (let attempt = 0; attempt < waits.length + 1; attempt++) {
       const stuck = unresolved();
       if (!stuck.size) break;
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 300));
-      else {
+      if (attempt < waits.length)
+        await new Promise((r) => setTimeout(r, waits[attempt]));
+      if (attempt >= 1) {
         await this.refreshMembership();
         for (const k of stuck)
           route[k] = (await this.ring.route(k, R + PROBE_EXTRA))

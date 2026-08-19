@@ -1098,11 +1098,20 @@ class Owner:
             # production database. One dead node (the common case, and
             # test_04's) stays fully answerable; a multi-node outage is
             # refused.
+            # Amendment, measured live: the quorum above assumes the
+            # write-time ring is today's ring. Under ring drift the
+            # acks can sit on candidates OUTSIDE the current top-R — a
+            # ledger whose every copy lived on two relay tenants read
+            # as cleanly absent during a restart wave, because both
+            # silent holders were in the probe EXTRAS the arithmetic
+            # never counted. A missing key with ANY silent candidate
+            # anywhere in its probed set is therefore unprovable too.
             tolerable = max(0, self.write_acks - 1)
             return {k for k in keys
                     if k not in out
-                    and sum(1 for a in route[k][:R]
-                            if a not in replied) > tolerable}
+                    and (sum(1 for a in route[k][:R]
+                             if a not in replied) > tolerable
+                         or any(a not in replied for a in route[k]))}
 
         # Silence gets two escalating answers before it becomes a refusal.
         # First: re-ask, because one busy replica missing one 2s window
