@@ -1404,6 +1404,19 @@ export class Owner {
       }
     }
     const t0 = Date.now();
+    // Progress the app can render: per-field tree depth plus the
+    // record phase. Fields walk in parallel, so the honest number is
+    // the mean of their level fractions, not any single field's.
+    this.syncProgress = { active: true, fields: {}, records: 0,
+      pct: 0 };
+    const prog = this.syncProgress;
+    const bump = () => {
+      const fs = Object.values(prog.fields);
+      const walk = fs.length
+        ? fs.reduce((a, f) => a + (f.done ? 1 : f.lvl / f.mlvl), 0)
+          / fs.length : 0;
+      prog.pct = Math.round((walk * 0.85 + prog.records * 0.15) * 100);
+    };
     try {
       const st = this._st;
       const me = st.writer;
@@ -1501,6 +1514,7 @@ export class Owner {
       await Promise.all(Object.entries(st.schema).map(
         async ([field, specF]) => {
           const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
+          prog.fields[field] = { lvl: 0, mlvl, done: false };
           for (let round = 0; round < 4; round++) {
             const fieldChains = [];
             let frontier = [[1, 0n], [1, 1n]];
@@ -1524,6 +1538,10 @@ export class Owner {
                   next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
               frontier = next;
               parentEnds = chainEnds;
+              prog.fields[field].lvl =
+                Math.max(prog.fields[field].lvl,
+                  frontier.length ? frontier[0][0] : mlvl);
+              bump();
             }
             // ONE strict pass for the whole field: probe every chain's
             // end+1 with full integrity rules — a shared ladder at
@@ -1545,6 +1563,8 @@ export class Owner {
             }
             if (!extended) break;
           }
+          prog.fields[field].done = true;
+          bump();
         }));
       // tombstones: single label, all epochs and writers
       const kT = await this._kW(TOMB);
@@ -1576,9 +1596,15 @@ export class Owner {
       for (let i = 0; i < rkeys.length; i += 64) {
         await uiYield();
         await this._mget(rkeys.slice(i, i + 64), true);
+        prog.records = Math.min(1, (i + 64) / Math.max(1, rkeys.length));
+        bump();
       }
+      prog.records = 1;
+      bump();
       await this._save();               // counters are the query's map
-    } finally { /* walk done or failed; nothing global to restore */ }
+    } finally {
+      this.syncProgress = { active: false, pct: 100 };
+    }
     m.completeOnce = true;
     m.syncedAt = Date.now() / 1000;
     m.lastPassS = (Date.now() - t0) / 1000;
