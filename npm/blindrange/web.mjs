@@ -406,7 +406,14 @@ export class Owner {
           const r = await fetch(`${gw}/fwd`, { method: "POST",
             headers: { "Content-Type": "application/json",
                        ...(await this._sign(raw)) },
-            body: raw });
+            body: raw,
+            // a dead node behind the gateway must cost seconds, not
+            // the gateway's upstream timeout: measured, one downed
+            // relay tenant held every fan phase ~30s and turned an
+            // 18-record walk into five minutes. Timeout = silence,
+            // and silence is already handled honestly by the quorum
+            // rules — never treated as absence.
+            signal: AbortSignal.timeout(this.httpTimeoutMs ?? 8000) });
           if (!r.ok) throw new Error(`gateway HTTP ${r.status}`);
           const out = await r.json();
           if (out.status >= 400)
