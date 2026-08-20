@@ -147,6 +147,15 @@ REPAIR_SETTLE = 10.0      # don't repair while membership is still changing
 DIALBACK_EVERY = float(os.environ.get("BR_DIALBACK_EVERY", "60"))
 DIALBACK_FIRST = float(os.environ.get("BR_DIALBACK_FIRST", "4"))
 POLL_WAIT = 20.0          # relay parks a tenant's poll this long
+# A tenant used to handle each forwarded request, POST the reply, and
+# only THEN re-park its poll — so it was unreachable for a whole
+# relay round trip after every single request, and requests queued
+# behind each other. Measured from a browser through the gateway:
+# relayed nodes answered in 1.4-3.5s against ~200ms for direct ones,
+# and that gap was most of a cold client warmup. The poll loop now
+# only receives and dispatches; the work and the reply happen on these
+# workers, so the lifeline re-parks immediately.
+TENANT_WORKERS = int(os.environ.get("BR_TENANT_WORKERS", "8"))
 SEND_WAIT = 15.0          # relay waits this long for a tenant's reply
 TENANT_FRESH = 45.0       # tenant counts as connected if polled this recently
 CACHE_KB = int(os.environ.get("BR_CACHE_KB", "32000"))   # SQLite page cache
@@ -2124,60 +2133,40 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
     my_via = current_addr()
     relay, _nid = parse_via(my_via)
     stun_at = 0.0
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=TENANT_WORKERS, thread_name_prefix="tenant")
     while current_addr() == my_via:
         quic = _tenant_loop.quic
         if quic is not None and time.time() > stun_at:
-            try:
-                # advertise ICE-style CANDIDATES: the LAN address first (works
-                # for peers on the same network, and avoids needing hairpin
-                # NAT when the dialer sits behind the same router), then the
-                # STUN-observed public endpoint for everyone else
-                got = quic.stun(relay)
-                cands = []
-                lip = direct_mod.local_ip()
-                if lip:
-                    cands.append(f"{lip}:{quic.port}")
-                if got and got not in cands:
-                    cands.append(got)
-                if cands:
-                    peers.udp = ",".join(cands)
-            except Exception:
-                pass
             stun_at = time.time() + 20
+            # off the loop as well: a STUN round trip is another window
+            # in which nothing can reach this node
+            def _stun(quic=quic):
+                # advertise ICE-style CANDIDATES: the LAN address first
+                # (works for peers on the same network, and avoids
+                # needing hairpin NAT when the dialer sits behind the
+                # same router), then the STUN-observed public endpoint
+                # for everyone else
+                try:
+                    got = quic.stun(relay)
+                    cands = []
+                    lip = direct_mod.local_ip()
+                    if lip:
+                        cands.append(f"{lip}:{quic.port}")
+                    if got and got not in cands:
+                        cands.append(got)
+                    if cands:
+                        peers.udp = ",".join(cands)
+                except Exception:
+                    pass
+            pool.submit(_stun)
         try:
             body = json.dumps({"token": peers.ident.poll_token()}).encode()
             got = _post_direct(relay, "/relay/poll", body, secret,
                                timeout=POLL_WAIT + 10)
             for env in got.get("envelopes", []):
-                # One malformed envelope used to kill this thread — and
-                # this thread IS the node, as far as anyone trying to
-                # reach it can tell. The node kept gossiping (separate
-                # thread), so it stayed in every roster while answering
-                # nothing: the "half-dead node" first hypothesized from
-                # a production incident, later reported by an operator
-                # as "tenants stop reporting until a manual restart".
-                # An envelope may fail; the lifeline may not.
-                try:
-                    if env.get("method") == "GET":
-                        path, _, query = env.get("path",
-                                                 "").partition("?")
-                        code, obj = service_get(store, peers, path, query,
-                                                quic=_tenant_loop.quic)
-                    else:
-                        data = json.loads(
-                            b64decode(env.get("body_b64", "")) or b"{}")
-                        code, obj = service_post(store, peers, hub, secret,
-                                                 env.get("path", ""), data,
-                                                 quic=_tenant_loop.quic)
-                except Exception as e:
-                    code, obj = 500, {"error": f"{type(e).__name__}: "
-                                               f"{str(e)[:120]}"}
-                if env.get("id") is None:
-                    continue          # unanswerable; nothing waits forever
-                reply = {"id": env["id"], "status": code,
-                         "body_b64": b64encode(json.dumps(obj).encode()).decode()}
-                _post_direct(relay, "/relay/reply",
-                             json.dumps(reply).encode(), secret)
+                pool.submit(_serve_envelope, env, store, peers, hub,
+                            secret, relay)
         except OSError:
             time.sleep(2)                              # relay hiccup; retry
         except Exception as e:
@@ -2185,6 +2174,41 @@ def _tenant_loop(store, peers, hub, secret, current_addr):
             print(f"[tenant] poll cycle failed ({type(e).__name__}: "
                   f"{str(e)[:120]}) — retrying", flush=True)
             time.sleep(2)
+    pool.shutdown(wait=False)
+
+
+def _serve_envelope(env, store, peers, hub, secret, relay):
+    """Answer one forwarded request, off the poll loop.
+
+    One malformed envelope used to kill the poll thread — and that
+    thread IS the node, as far as anyone trying to reach it can tell.
+    The node kept gossiping (separate thread), so it stayed in every
+    roster while answering nothing: the "half-dead node" first
+    hypothesized from a production incident, later reported by an
+    operator as "tenants stop reporting until a manual restart". An
+    envelope may fail; the lifeline may not.
+    """
+    try:
+        if env.get("method") == "GET":
+            path, _, query = env.get("path", "").partition("?")
+            code, obj = service_get(store, peers, path, query,
+                                    quic=_tenant_loop.quic)
+        else:
+            data = json.loads(b64decode(env.get("body_b64", "")) or b"{}")
+            code, obj = service_post(store, peers, hub, secret,
+                                     env.get("path", ""), data,
+                                     quic=_tenant_loop.quic)
+    except Exception as e:
+        code, obj = 500, {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+    if env.get("id") is None:
+        return                    # unanswerable; nothing waits forever
+    reply = {"id": env["id"], "status": code,
+             "body_b64": b64encode(json.dumps(obj).encode()).decode()}
+    try:
+        _post_direct(relay, "/relay/reply", json.dumps(reply).encode(),
+                     secret)
+    except OSError:
+        pass                      # the caller's own timeout covers it
 
 
 _tenant_loop.quic = None
