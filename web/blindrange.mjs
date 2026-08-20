@@ -1296,6 +1296,49 @@ export class Owner {
     return m;
   }
 
+  async _staleProbe() {
+    // The cheap staleness check that makes freshness RENEWABLE: every
+    // insert writes every level of its label tree, so any write by
+    // anyone extends a level-1 chain of every field; deletes extend
+    // the tombstone chain; membership changes extend the registry and
+    // epoch chains. Probing just those boundaries — one quick round of
+    // ~40 keys — therefore detects ANY change to the ledger. Quick
+    // fan, no patience ladder: a silent replica can hide a brand-new
+    // row for one cycle (the probe-TTL bargain, disclosed), never
+    // corrupt what exists.
+    const st = this._st;
+    const me = st.writer;
+    const top = st.epoch;
+    const writers = st.writers.length ? [...st.writers] : [me];
+    const kT = await this._kW(TOMB);
+    const probes = [
+      await this._sysKey("epoch", st.epoch_len + 1),
+      await this._sysKey("registry", st.reg_len + 1),
+    ];
+    for (const ep of this._epochs())
+      for (const u of writers) {
+        const tc = st.tombs.counts[`${ep}|${u}`] || 0;
+        probes.push(await this._ut(kT, ep, u, tc + 1));
+        for (const field of Object.keys(st.schema))
+          for (const idx of ["0", "1"]) {
+            const w = `${field}|1|${idx}`;
+            const cached = (u === me && ep === top) ? (st.chains[w] || 0)
+              : ((st.remote[`${ep}|${w}`] || {})[u] || 0);
+            probes.push(await this._ut(await this._kW(w), ep, u,
+              cached + 1));
+          }
+      }
+    const m = this.mirror;
+    const wasBypass = m ? m.bypass : false;
+    if (m) m.bypass = true;   // boundary keys are absent from a fresh
+    try {                     // mirror BY DEFINITION — ask the network
+      const got = await this._mgetNetwork(probes, true);
+      return Object.keys(got).length > 0;
+    } finally {
+      if (m) m.bypass = wasBypass;
+    }
+  }
+
   async sync() {
     // A COMPLETE walk of the label tree, like the reference client's.
     // The first version ran one full-domain query per field — which
@@ -1309,6 +1352,18 @@ export class Owner {
     // child's entries partition its parent's) — cost tracks what
     // exists, not the domain size.
     const m = await this.enableMirror();
+    if (m.completeOnce) {
+      // renewal path: a complete mirror whose boundary probes all come
+      // back empty has nothing to walk — stamp the window and return.
+      // This is what keeps pages local FOREVER, not just for the 30s
+      // after the first walk: the app re-runs sync() on a timer, and
+      // each quiet pass costs one network round.
+      if (!(await this._staleProbe())) {
+        m.syncedAt = Date.now() / 1000;
+        if (m.persistMeta) m.persistMeta();
+        return 0;
+      }
+    }
     const t0 = Date.now();
     m.bypass = true;      // read the NETWORK, but store what arrives
     try {
