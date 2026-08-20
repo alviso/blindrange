@@ -24,11 +24,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@alviso/blindrange-python-darwin-arm64": "0.1.1",
-    "@alviso/blindrange-python-darwin-x64": "0.1.1",
-    "@alviso/blindrange-python-linux-x64": "0.1.1",
-    "@alviso/blindrange-python-linux-arm64": "0.1.1",
-    "@alviso/blindrange-python-win32-x64": "0.1.1"
+    "@alviso/blindrange-python-darwin-arm64": "0.3.0",
+    "@alviso/blindrange-python-darwin-x64": "0.3.0",
+    "@alviso/blindrange-python-linux-x64": "0.3.0",
+    "@alviso/blindrange-python-linux-arm64": "0.3.0",
+    "@alviso/blindrange-python-win32-x64": "0.3.0"
   },
   "keywords": [
     "encrypted",

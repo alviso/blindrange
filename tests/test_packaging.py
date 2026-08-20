@@ -25,6 +25,21 @@ class TestPyproject(unittest.TestCase):
             self.assertIn(key, proj)
         self.assertEqual(proj["name"], "blindrange")
 
+    def test_module_version_matches_pyproject(self):
+        """Two places record the version and only one gets bumped.
+
+        Caught while assembling npm platform packages: the wheel's
+        metadata said 0.7.0 while blindrange.__version__ still said
+        0.6.0, which is the number a node reports to its peers and the
+        status page prints. A published tarball would have carried the
+        disagreement permanently.
+        """
+        import blindrange
+        self.assertEqual(blindrange.__version__,
+                         self.cfg["project"]["version"],
+                         "blindrange.__version__ and pyproject.toml "
+                         "disagree about which version this is")
+
     def test_console_scripts_point_at_real_callables(self):
         import importlib
         for script, target in self.cfg["project"]["scripts"].items():
