@@ -548,11 +548,11 @@ export class Owner {
     return got;
   }
 
-  async _mget(keys) {
+  async _mget(keys, wan = false) {
     keys = [...new Set(keys)];
     if (!keys.length) { this.lastUnresolved = new Set(); return {}; }
     const m = this.mirror;
-    if (m && !m.bypass && !m.freshFor(this)) {
+    if (!wan && m && !m.freshFor(this)) {
       // Not fresh enough to prove ABSENCE locally — but a cached HIT
       // is still a hit: records and index entries are immutable, and
       // other writers' deletes surface through tombstone chains, not
@@ -571,7 +571,7 @@ export class Owner {
       if (m.persistPut) m.persistPut(Object.entries(got));
       return out;
     }
-    if (m && !m.bypass && m.freshFor(this)) {
+    if (!wan && m && m.freshFor(this)) {
       // The reference contract, now ported completely: a FRESH mirror
       // answers absence locally. Most of what a query does is prove
       // that chains did NOT grow — forwarding those misses to the
@@ -789,7 +789,7 @@ export class Owner {
   }
 
   // ----------------------------------------------------- chain discovery
-  async _discoverEnds(spec) {
+  async _discoverEnds(spec, wan = false) {
     // spec: {id: {fn: async i -> key, cached}} -> {id: end}
     const state = {};
     for (const [cid, { fn, cached }] of Object.entries(spec))
@@ -803,7 +803,8 @@ export class Owner {
       const keys = {};
       for (const [cid, p] of Object.entries(batch))
         keys[cid] = await state[cid].fn(p);
-      const got = await this._mget([...new Set(Object.values(keys))]);
+      const got = await this._mget(
+        [...new Set(Object.values(keys))], wan);
       const bad = this.lastUnresolved;
       const poisoned = Object.entries(keys)
         .filter(([, key]) => bad.has(key)).map(([cid]) => cid);
@@ -842,12 +843,13 @@ export class Owner {
       return this._st.epoch;
     const st = this._st;
     const end = (await this._discoverEnds(
-      { e: { fn: (i) => this._sysKey("epoch", i), cached: st.epoch_len } })).e;
+      { e: { fn: (i) => this._sysKey("epoch", i), cached: st.epoch_len } },
+      force)).e;
     if (end > st.epoch_len) {
       const keys = {};
       for (let i = st.epoch_len + 1; i <= end; i++)
         keys[i] = await this._sysKey("epoch", i);
-      const got = await this._mget(Object.values(keys));
+      const got = await this._mget(Object.values(keys), force);
       for (const i of Object.keys(keys).map(Number).sort((a, b) => a - b)) {
         if (!(keys[i] in got)) continue;
         const txt = await this._sysDecode(got[keys[i]]);
@@ -872,12 +874,13 @@ export class Owner {
         && this._writersCache) return this._writersCache;
     const st = this._st;
     const end = (await this._discoverEnds(
-      { r: { fn: (i) => this._sysKey("registry", i), cached: st.reg_len } })).r;
+      { r: { fn: (i) => this._sysKey("registry", i), cached: st.reg_len } },
+      force)).r;
     if (end > st.reg_len) {
       const keys = {};
       for (let i = st.reg_len + 1; i <= end; i++)
         keys[i] = await this._sysKey("registry", i);
-      const got = await this._mget(Object.values(keys));
+      const got = await this._mget(Object.values(keys), force);
       for (const k of Object.values(keys))
         if (k in got) {
           const wid = await this._sysDecode(got[k]);
@@ -980,12 +983,9 @@ export class Owner {
     // foreground marker: the background walk yields while any page
     // query runs — a browser gives one origin ~6 connections, and the
     // walk was starving every page switch behind its own fetches
-    if (!(this.mirror && this.mirror.bypass)) {
-      this._uiBusy = (this._uiBusy || 0) + 1;
-      try { return await this._queryMultiInner(predicates, _retried); }
-      finally { this._uiBusy -= 1; }
-    }
-    return this._queryMultiInner(predicates, _retried);
+    this._uiBusy = (this._uiBusy || 0) + 1;
+    try { return await this._queryMultiInner(predicates, _retried); }
+    finally { this._uiBusy -= 1; }
   }
 
   async _queryMultiInner(predicates, _retried = false) {
@@ -1328,15 +1328,8 @@ export class Owner {
               cached + 1));
           }
       }
-    const m = this.mirror;
-    const wasBypass = m ? m.bypass : false;
-    if (m) m.bypass = true;   // boundary keys are absent from a fresh
-    try {                     // mirror BY DEFINITION — ask the network
-      const got = await this._mgetNetwork(probes, true);
-      return Object.keys(got).length > 0;
-    } finally {
-      if (m) m.bypass = wasBypass;
-    }
+    const got = await this._mgetNetwork(probes, true);
+    return Object.keys(got).length > 0;
   }
 
   async sync() {
@@ -1365,7 +1358,6 @@ export class Owner {
       }
     }
     const t0 = Date.now();
-    m.bypass = true;      // read the NETWORK, but store what arrives
     try {
       const st = this._st;
       const me = st.writer;
@@ -1408,7 +1400,7 @@ export class Owner {
             }
         }
         const ends = Object.keys(spec).length
-          ? await this._discoverEnds(spec) : {};
+          ? await this._discoverEnds(spec, true) : {};
         const allSpec = Object.values(specKeys).flat();
         const specGot = allSpec.length ? await this._mgetQuick(allSpec) : {};
         for (const [cid, ks] of Object.entries(specKeys)) {
@@ -1429,7 +1421,8 @@ export class Owner {
         }
         const missing = Object.keys(entryKeys)
           .filter((k) => !(k in specGot));
-        const got = missing.length ? await this._mget(missing) : {};
+        const got = missing.length
+          ? await this._mget(missing, true) : {};
         Object.assign(got, specGot);
         const totals = {};
         const chainEnds = {};
@@ -1493,7 +1486,7 @@ export class Owner {
             for (const ch of fieldChains)
               probes[await this._ut(ch.kw, ch.ep, ch.u, ch.end + 1)] = ch;
             const got = Object.keys(probes).length
-              ? await this._mget(Object.keys(probes)) : {};
+              ? await this._mget(Object.keys(probes), true) : {};
             let extended = false;
             for (const [key, ch] of Object.entries(got.constructor === Object
                 ? Object.fromEntries(Object.entries(probes)
@@ -1514,13 +1507,13 @@ export class Owner {
         for (const u of writers)
           tSpec[`${ep}\u0000${u}`] = { fn: (i) => this._ut(kT, ep, u, i),
             cached: 0 };
-      const tEnds = await this._discoverEnds(tSpec);
+      const tEnds = await this._discoverEnds(tSpec, true);
       const tKeys = {};
       for (const [cid, end] of Object.entries(tEnds))
         for (let i = 1; i <= end; i++)
           tKeys[await tSpec[cid].fn(i)] = [cid, i];
       const tGot = Object.keys(tKeys).length
-        ? await this._mget(Object.keys(tKeys)) : {};
+        ? await this._mget(Object.keys(tKeys), true) : {};
       for (const [key, [cid, i]] of Object.entries(tKeys)) {
         const blob = tGot[key];
         if (blob === undefined) continue;
@@ -1536,12 +1529,10 @@ export class Owner {
       const rkeys = [...rids].map((r) => "R:" + r);
       for (let i = 0; i < rkeys.length; i += 64) {
         await uiYield();
-        await this._mget(rkeys.slice(i, i + 64));
+        await this._mget(rkeys.slice(i, i + 64), true);
       }
       await this._save();               // counters are the query's map
-    } finally {
-      m.bypass = false;
-    }
+    } finally { /* walk done or failed; nothing global to restore */ }
     m.completeOnce = true;
     m.syncedAt = Date.now() / 1000;
     m.lastPassS = (Date.now() - t0) / 1000;
