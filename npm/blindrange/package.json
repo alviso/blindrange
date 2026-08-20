@@ -1,6 +1,6 @@
 {
   "name": "blindrange",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Range queries over storage that cannot read your data. SQL-shaped statements over the blindrange network; runs the reference client, so there is nothing to drift.",
   "license": "MIT",
   "repository": {

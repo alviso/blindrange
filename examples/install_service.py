@@ -163,8 +163,11 @@ def main():
         description="install a blindrange node as a background service")
     ap.add_argument("--data", default="~/.blindrange/n1")
     ap.add_argument("--port", type=int, default=7501)
-    ap.add_argument("--seed", action="append",
-                    default=["seed.blindrange.dev:7501"])
+    # No default here: argparse APPENDS to a default list rather than
+    # replacing it, so `--seed my-node:7501` on a private network
+    # produced a unit that also dialled the PUBLIC seed — a contact
+    # attempt nobody asked for, in a file nobody reads twice.
+    ap.add_argument("--seed", action="append")
     ap.add_argument("--secret", default="blindrange-public")
     ap.add_argument("--max-disk", default="20GB")
     ap.add_argument("--host", default="")
@@ -195,6 +198,8 @@ def main():
         print("--target only overrides generation; use --print and install "
               "the result on the machine it is for.", file=sys.stderr)
         return 1
+    if not a.seed:
+        a.seed = ["seed.blindrange.dev:7501"]
     text = launchd_plist(a, a.python) if mac else systemd_unit(a, a.python)
     if a.show:
         print(text, end="")
