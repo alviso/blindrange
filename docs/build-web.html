@@ -121,12 +121,22 @@ so in your UI.</div>
 <h2><span class="n">5</span>What to expect, measured</h2>
 <table>
 <tr><th>operation</th><th>public demo network, via gateway</th></tr>
-<tr><td>create / first open</td><td>~3–5s (writer registration)</td></tr>
-<tr><td>insert (quorum-acked)</td><td>~0.5–2s — returns at 2 acks, third
+<tr><td>create / first open</td><td>~3.5–4.5s</td></tr>
+<tr><td>insert (quorum-acked)</td><td>~0.6–1.5s — returns at 2 acks, third
 copy lands in the background (<code>drain()</code> awaits it)</td></tr>
-<tr><td>query, first</td><td>~2–4s (network round trips)</td></tr>
-<tr><td>query, repeat</td><td>local — persistent in-browser mirror</td></tr>
+<tr><td>query, first, no mirror</td><td>~8s. Not the data — round trips.
+Every phase of a query waits for the one before it, and a gateway hop
+costs 0.2–1.3s each way</td></tr>
+<tr><td>query, repeat, no mirror</td><td>~2s (cached chain counters)</td></tr>
+<tr><td><code>sync()</code>, complete local mirror</td><td>~8s for a small
+ledger, ~20s for a few hundred records</td></tr>
+<tr><td>query, mirrored</td><td><b>2–9ms</b> — local, and it stays local
+while you keep the mirror fresh</td></tr>
 </table>
+<p>Read that table as one instruction: <b>call <code>sync()</code> and
+answer from the mirror.</b> The network path is honest and slow; the
+mirrored path is three milliseconds. Everything between those two rows is
+the reason the mirror exists.</p>
 <p>The gateway adds one hop: browsers refuse plain-HTTP from HTTPS pages,
 so requests travel through a fronted node's <code>/fwd</code>. The
 gateway sees which nodes you talk to — nodes always could; it reads

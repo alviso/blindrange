@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solo apps — real software with no infrastructure</title>
+<meta name="description" content="Applications with no server, no account and no hosting bill — one file in your browser, data on a network that cannot read it. Multi-user anyway. Open one and use it.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="canonical" href="https://blindrange.dev/solo">
+<meta property="og:title" content="Solo apps — real software with no infrastructure">
+<meta property="og:description" content="No server, no account, no hosting bill. One file in your browser, data on storage that cannot read it — and still multi-user. Open one and use it.">
+<meta property="og:image" content="https://blindrange.dev/header.png">
+<meta property="og:url" content="https://blindrange.dev/solo">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#d7dce4;
+          --dim:#8b93a1; --acc:#5cc8ff; --warn:#e0b060; --ok:#7fd18c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 90px; }
+  .back { font-size:13px; color:var(--dim); }
+  .back a { color:var(--dim); }
+  h1 { font-size:36px; letter-spacing:-1px; margin:22px 0 8px; }
+  h1 span { color:var(--acc); }
+  .tag { font-size:19px; color:var(--dim); margin-bottom:30px; }
+  .tag b { color:var(--txt); font-weight:normal; }
+  p { margin:0 0 14px; }
+  a { color:var(--acc); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code { color:var(--warn); }
+  h2.sec { font-size:22px; margin:40px 0 14px; letter-spacing:-.4px; }
+  .app { background:var(--panel); border:1px solid var(--line);
+         border-radius:12px; padding:22px 24px; margin:18px 0;
+         display:flex; gap:20px; align-items:flex-start; }
+  .app img { width:64px; height:64px; border-radius:14px; flex:none;
+             margin-top:4px; }
+  .app h3 { font-size:22px; margin:0 0 2px; }
+  .what { color:var(--dim); font-size:14px; margin-bottom:12px; }
+  .open { display:inline-block; margin:6px 12px 4px 0; padding:9px 18px;
+          border:1px solid var(--acc); border-radius:8px; color:var(--acc);
+          font-size:14px; }
+  .open:hover { background:var(--acc); color:var(--bg);
+                text-decoration:none; }
+  .open.ghost { border-color:var(--line); color:var(--dim); }
+  .open.ghost:hover { background:var(--line); color:var(--txt); }
+  .stats { display:flex; flex-wrap:wrap; gap:8px 18px; font-size:13px;
+           color:var(--dim); margin-top:14px; }
+  .stats b { color:var(--ok); font-weight:normal; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px;
+          margin:20px 0 8px; }
+  .cell { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:16px 18px; font-size:14px;
+          color:var(--dim); }
+  .cell b { color:var(--txt); font-weight:normal; display:block;
+            margin-bottom:4px; }
+  .note { background:var(--panel); border:1px solid var(--line);
+          border-left:3px solid var(--acc); border-radius:8px;
+          padding:13px 15px; font-size:14px; color:var(--dim);
+          margin:26px 0 0; }
+  .note.warn { border-left-color:var(--warn); }
+  .note b { color:var(--txt); font-weight:normal; }
+  .soon { opacity:.62; }
+  .soon .app h3 { color:var(--dim); }
+  .foot { margin-top:56px; padding-top:20px; border-top:1px solid var(--line);
+          color:var(--dim); font-size:13px; }
+  @media (max-width:560px) { .app { flex-direction:column; }
+    .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="back">← <a href="/">blindrange</a></div>
+
+<h1>Solo <span>apps</span></h1>
+<div class="tag">Real software with <b>no infrastructure behind it</b> —
+no server, no account, no hosting bill, nothing to keep paying for. And
+still multi-user, because the shared part is the storage, not a
+backend.</div>
+
+<p>A Solo app is one HTML file. It runs in your browser, derives its own
+keys from your passphrase, and reads and writes an encrypted database
+held by a public network of nodes that cannot read any of it. There is
+no API server in the middle. There is no company operating your account.
+Close the tab and nothing is running anywhere on your behalf.</p>
+
+<p>The interesting part is what survives that deletion. Most "no backend"
+apps are single-player: your data lives in your browser, and sharing it
+means adding a server back. Solo apps keep the multi-user half —
+<b>several people, several devices, one shared ledger</b> — because
+membership is a key, not a login, and the database is a network rather
+than a machine.</p>
+
+<h2 class="sec">Open one and use it</h2>
+
+<div class="app">
+  <img src="/invoiceflow-icon.svg" alt="InvoiceFlow Solo icon"
+       width="64" height="64">
+  <div>
+    <h3>InvoiceFlow Solo</h3>
+    <div class="what">Invoicing for one person or a small company —
+    customers, items, invoices, PDFs, dashboard, backup.</div>
+    <p>The third rebuild of the same product, with one variable moved
+    each time: React + FastAPI + MongoDB, then the same app on blind
+    storage, then this — <b>no server at all</b>. Invoice numbers are
+    claimed on the network so two of your devices cannot mint the same
+    one. "PDF" is a print stylesheet, because a page holding master keys
+    runs nobody else's code.</p>
+    <a class="open" href="https://alviso.github.io/invoiceflow-solo/loader.html#fc71aa22571579352e4e8c7d9bd124cb14004ed3b31ffdb67a7111a381d9b81b">Open
+    InvoiceFlow Solo →</a>
+    <a class="open ghost"
+       href="https://github.com/alviso/invoiceflow-solo">source</a>
+    <div class="stats">
+      <span>backend: <b>none</b></span>
+      <span>pages, warmed: <b>2–9ms</b></span>
+      <span>returning to a warm ledger: <b>&lt;1s</b></span>
+      <span>first warmup: <b>~30s</b></span>
+    </div>
+  </div>
+</div>
+
+<div class="note"><b>Using it for real books?</b> This runs on the
+<i>public demo network</i> — volunteer nodes, no uptime promise, and the
+honest place for a trial rather than your accounts. The same file points
+at your own nodes by changing one line. Everything the network can
+observe is written down on <a href="/audit">the leakage page</a>; nothing
+there is a value, a name or a date, and none of it is a reason to skip
+reading it.</div>
+
+<h2 class="sec">How a Solo app can have no server and still be shared</h2>
+
+<div class="grid">
+  <div class="cell"><b>Your keys, in the page</b>A passphrase unlocks a
+  master key that never leaves the browser. Records are sealed before
+  they touch the wire, and every index key is a pseudorandom token
+  derived from that master.</div>
+  <div class="cell"><b>Membership is an invite, not a login</b>Sharing a
+  ledger means handing someone an invite string. There is no account to
+  create, no password reset, and no administrator who could be
+  compelled — because there is nobody in the middle at all.</div>
+  <div class="cell"><b>The network is the database</b>Nodes store
+  ciphertext under keys they cannot interpret. Range queries and prefix
+  search still work, over an index built from the same blind
+  tokens.</div>
+  <div class="cell"><b>Local-first, so it feels like nothing</b>The app
+  keeps an encrypted mirror in your browser. After the first warmup,
+  pages answer in single-digit milliseconds and stay that way.</div>
+</div>
+
+<p>Multi-user is the part people expect to be missing, so it is worth
+being precise about what works and what it costs. Two people holding
+invites to the same ledger both read and write it. Writes carry the
+writer's identity, so concurrent edits merge by rule rather than by
+last-write-wins. Sequence numbers — invoice numbers, order numbers — are
+arbitrated by the network, so two devices offline at the same time still
+cannot collide. What you do <i>not</i> get is a server enforcing
+permissions: anyone with the invite has the ledger. Read-only sharing and
+per-field grants do not exist yet.</p>
+
+<h2 class="sec">Where the application itself lives</h2>
+
+<p>A file served from a web host is a file that host can change. So the
+app is also <b>stored in the database it runs on</b>: a
+content-addressed copy sits on the network, and an ~80-line loader
+fetches it, verifies the hash in your browser, and only then runs it.
+The URL contains the hash, which makes the address the integrity check.
+Nobody can swap the app under its users — including us.</p>
+
+<p class="note warn"><b>Being honest about the trade.</b> Lose both your
+passphrase and your invite and the data is gone: the property that locks
+a storage provider out is the same property that locks you out. There is
+no reset link, because there is nobody to send it. Keep the recovery kit
+the app can export.</p>
+
+<h2 class="sec">More Solo apps</h2>
+
+<div class="soon">
+<div class="app">
+  <img src="/favicon.svg" alt="" width="64" height="64">
+  <div>
+    <h3>Yours, possibly</h3>
+    <div class="what">The pattern generalises to anything a small team
+    keeps in a spreadsheet and would rather not park on someone else's
+    server.</div>
+    <p>Time tracking, client CRM, expenses, inventory, case notes,
+    reading lists. If it is records with dates, amounts and names, and
+    the sharing is "a handful of people I trust", it fits. Start from
+    <a href="/build-web">the browser guide</a> — it is the same
+    vendored client this page's app uses.</p>
+    <a class="open ghost" href="/build-web">Build one →</a>
+  </div>
+</div>
+</div>
+
+<div class="note"><b>Why this is not just "serverless".</b> Serverless
+still means a provider running functions against a database they can
+read, bill and revoke. Here the storage cannot read the data, the app is
+not hosted anywhere in particular, and no account exists to be closed.
+The bill for keeping a Solo app alive, once it is written, is zero — that
+is the claim, and <a href="/apps">the apps page</a> shows what it took to
+earn it.</div>
+
+<div class="foot">
+<a href="/">blindrange.dev</a> ·
+<a href="/apps">built on blindrange</a> ·
+<a href="/build-web">the browser guide</a> ·
+<a href="/audit">what leaks</a> ·
+<a href="/demos">demos</a> ·
+<a href="https://status.blindrange.dev/">live network</a> ·
+<a href="https://github.com/alviso/blindrange">source</a>
+</div>
+
+</div>
+</body>
+</html>

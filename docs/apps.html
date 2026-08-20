@@ -110,11 +110,20 @@ it cost.</b></div>
     in your browser, and only then runs it — nobody can swap the app
     under its users, which is the defense web3 dapp frontends never
     had.</p>
+    <p>It is also multi-user, which is the half people assume a
+    no-backend app has to give up: an invite shares the ledger, writes
+    carry their writer's identity and merge by rule, and invoice numbers
+    are arbitrated by the network so two of your devices cannot mint the
+    same one. What it does not have is a server enforcing permissions —
+    anyone holding the invite holds the ledger.</p>
     <div class="stats">
       <span>backend: <b>none</b></span>
-      <span>deploy: <b>cp index.html anywhere</b></span>
+      <span>pages, warmed: <b>2–9ms</b></span>
+      <span>return to a warm ledger: <b>&lt;1s</b></span>
+      <span>first warmup: <b>~30s</b> (was 5–14 min)</span>
       <span>app integrity: <b>hash-verified in-browser</b></span>
-      <span><a href="https://github.com/alviso/invoiceflow-solo">source</a></span>
+      <span><a href="/solo">try it</a> ·
+        <a href="https://github.com/alviso/invoiceflow-solo">source</a></span>
     </div>
   </div>
 </div>
