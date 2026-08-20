@@ -1403,19 +1403,21 @@ export class Owner {
         return 0;
       }
     }
+    const entryWan = m.completeOnce;   // resume-friendly first walk
     const t0 = Date.now();
     // Progress the app can render: per-field tree depth plus the
     // record phase. Fields walk in parallel, so the honest number is
     // the mean of their level fractions, not any single field's.
-    this.syncProgress = { active: true, fields: {}, records: 0,
-      pct: 0 };
+    this.syncProgress = { active: true, fields: {}, tombs: 0,
+      records: 0, pct: 0 };
     const prog = this.syncProgress;
     const bump = () => {
       const fs = Object.values(prog.fields);
       const walk = fs.length
         ? fs.reduce((a, f) => a + (f.done ? 1 : f.lvl / f.mlvl), 0)
           / fs.length : 0;
-      prog.pct = Math.round((walk * 0.85 + prog.records * 0.15) * 100);
+      prog.pct = Math.round((walk * 0.8 + prog.tombs * 0.05
+        + prog.records * 0.15) * 100);
     };
     try {
       const st = this._st;
@@ -1481,7 +1483,7 @@ export class Owner {
         const missing = Object.keys(entryKeys)
           .filter((k) => !(k in specGot));
         const got = missing.length
-          ? await this._mget(missing, true) : {};
+          ? await this._mget(missing, entryWan) : {};
         Object.assign(got, specGot);
         const totals = {};
         const chainEnds = {};
@@ -1579,7 +1581,7 @@ export class Owner {
         for (let i = 1; i <= end; i++)
           tKeys[await tSpec[cid].fn(i)] = [cid, i];
       const tGot = Object.keys(tKeys).length
-        ? await this._mget(Object.keys(tKeys), true) : {};
+        ? await this._mget(Object.keys(tKeys), entryWan) : {};
       for (const [key, [cid, i]] of Object.entries(tKeys)) {
         const blob = tGot[key];
         if (blob === undefined) continue;
@@ -1591,11 +1593,13 @@ export class Owner {
         const [ep, u] = cid.split("\u0000");
         st.tombs.counts[`${ep}|${u}`] = end;
       }
+      prog.tombs = 1;
+      bump();
       // every record the entries name
       const rkeys = [...rids].map((r) => "R:" + r);
       for (let i = 0; i < rkeys.length; i += 64) {
         await uiYield();
-        await this._mget(rkeys.slice(i, i + 64), true);
+        await this._mget(rkeys.slice(i, i + 64), entryWan);
         prog.records = Math.min(1, (i + 64) / Math.max(1, rkeys.length));
         bump();
       }
