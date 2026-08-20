@@ -617,14 +617,33 @@ export class Owner {
         for (const a of route[k].slice(from, to))
           (byNode[a] = byNode[a] || []).push(k);
       }
-      await Promise.all(Object.entries(byNode).map(async ([a, ks]) => {
+      // Two exits before the slowest node answers, neither of which
+      // costs integrity:
+      //  - every key found: nothing absent, so nobody's silence is
+      //    evidence of anything — stop waiting (stragglers still land
+      //    in `out`/`replied` for later accounting)
+      //  - quick mode: a soft deadline; a key a slow node exclusively
+      //    holds reads as missing for ONE pass and the strict boundary
+      //    check catches it. Measured: relay tenants long-poll at
+      //    ~2-4s, and waiting out two fan phases made every sync batch
+      //    6+ seconds.
+      let early;
+      const done = new Promise((r) => { early = r; });
+      const allFound = () => subset.every((k) => k in out);
+      const jobs = Object.entries(byNode).map(async ([a, ks]) => {
         try {
           const r = await this._post(a, "/mget", { keys: ks });
           replied.add(a);
           for (const [k, v] of Object.entries(r.values || {}))
             if (!(k in out)) out[k] = v;
+          if (allFound()) early();
         } catch { /* silent node: quorum accounting handles it */ }
-      }));
+      });
+      const races = [Promise.all(jobs), done];
+      if (quick)
+        races.push(new Promise((r) =>
+          setTimeout(r, this.quickFanMs ?? 1500)));
+      await Promise.race(races);
     };
 
     await fan(0, R, keys);
