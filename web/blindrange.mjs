@@ -323,6 +323,7 @@ export class Owner {
     const st = Owner._newState(hex(randomBytes(32)), schema, bootstrap);
     st.secret = networkSecret;
     const o = await Owner._init(adapter, passphrase, st, gateway);
+    o._requireQuorumMembership("join the network");
     await o._registerWriter();
     await o._save();
     return o;
@@ -335,6 +336,7 @@ export class Owner {
     const st = Owner._newState(d.master, d.schema, bootstrap || d.bootstrap);
     st.secret = d.secret || "";
     const o = await Owner._init(adapter, passphrase, st, gateway);
+    o._requireQuorumMembership("join the network");
     await o._registerWriter();
     await o._save();
     return o;
@@ -366,6 +368,22 @@ export class Owner {
     o.mirror = null;                       // enableMirror() turns on
     await o.refreshMembership();
     return o;
+  }
+
+  _requireQuorumMembership(doing) {
+    // Membership is data too, and it can be PARTIAL: a bootstrap that
+    // lands mid-restart-wave can see one node, route every key to it,
+    // and honestly conclude a full ledger is empty (observed live —
+    // walk "complete", zero records, every integrity rule satisfied
+    // within the wrong worldview). Fewer nodes than a write's replica
+    // set can never prove absence of anything.
+    const n = this.network().length;
+    const R = this.ring ? this.ring.replicas : 0;
+    if (n < R)
+      throw new Error(
+        `cannot ${doing}: only ${n} node(s) visible, writes carry ` +
+        `${R} replicas — the network view is partial right now; ` +
+        `try again in a minute`);
   }
 
   invite() {
@@ -1371,6 +1389,8 @@ export class Owner {
     // child's entries partition its parent's) — cost tracks what
     // exists, not the domain size.
     const m = await this.enableMirror();
+    await this.refreshMembership();
+    this._requireQuorumMembership("complete a mirror");
     if (m.completeOnce) {
       // renewal path: a complete mirror whose boundary probes all come
       // back empty has nothing to walk — stamp the window and return.
