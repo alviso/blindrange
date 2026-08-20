@@ -147,6 +147,29 @@ class TestWebClient(unittest.TestCase):
         self.assertEqual([tuple((int(l), int(i))) for l, i in got["cover"]],
                          dyadic_cover(100, 200, 11, 8))
 
+    def test_03_mirror_matches_direct_through_deletions(self):
+        """The derived-tree sync reconstructs the label tree from the
+        RECORDS instead of walking every level, which is only sound if
+        deleted records — present in the chains, unreadable as rows —
+        cannot shift what a query sees. Delete a spread of rows, write
+        more afterwards so live and dead entries interleave, then demand
+        a mirrored client and a direct one agree on every query shape."""
+        after_rows = [{"amount": 42_000 + i, "name": "sand" + str(i),
+                       "row": 20_000 + i} for i in range(6)]
+        got = _run_js({"phase": "mirrorstress",
+                       "invite": self.owner.invite(),
+                       "delete_rows": [3, 11, 12, 29, 44],
+                       "after_rows": after_rows})
+        self.assertEqual(got["deleted"], 5, "setup did not delete 5 rows")
+        for shape, r in got["parity"].items():
+            self.assertTrue(
+                r["same"],
+                f"mirror disagrees with direct on the {shape} query: "
+                f"direct={r['direct']} mirror={r['mirror']}")
+        # and the deletions really are invisible to both
+        self.assertNotIn(11, got["parity"]["wide"]["mirror"],
+                         "a deleted row came back through the mirror")
+
     def test_02_python_writes_js_reads_and_back(self):
         new_rows = [{"amount": 42_000 + i, "name": "webz" + str(i),
                      "row": 10_000 + i} for i in range(8)]

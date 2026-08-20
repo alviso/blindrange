@@ -176,7 +176,8 @@ export function failureGroup(addr, udp = "") {
 export class Ring {
   // Async factory: hashes need WebCrypto. Placement must match the
   // Python Ring exactly or this client and every repairing node fight.
-  static async build(addrs, { vnodes = 64, replicas = 3, groups = null } = {}) {
+  static async build(addrs, { vnodes = 64, replicas = RING_REPLICAS,
+                              groups = null } = {}) {
     const r = new Ring();
     r.addrs = [...new Set(addrs)].sort();
     if (!r.addrs.length) throw new Error("empty ring");
@@ -302,6 +303,12 @@ async function openState(passphrase, blob) {
 const TOMB = "@tomb";
 const PEER_LIVE_S = 40;
 const PROBE_EXTRA = 3;
+// The replication factor the ring is BUILT for. Ring.build clamps its
+// own `replicas` to however many nodes it can see, which is right for
+// placement and useless as a health check: a client seeing one node of
+// seven clamps to 1 and every "is my view big enough" test passes.
+// Membership checks compare against this instead.
+const RING_REPLICAS = 3;
 const KEY_BITS = 20;
 const SYS_REFRESH_S = 5;
 
@@ -378,7 +385,12 @@ export class Owner {
     // within the wrong worldview). Fewer nodes than a write's replica
     // set can never prove absence of anything.
     const n = this.network().length;
-    const R = this.ring ? this.ring.replicas : 0;
+    // Compare against the replication factor the ring is built for, and
+    // against the widest view this client has ever had — never against
+    // ring.replicas, which shrinks to match a partial view and made
+    // this check a no-op exactly when it mattered. A genuinely small
+    // network (maxNodes < RING_REPLICAS) is left alone.
+    const R = Math.min(this._st.maxNodes || n, RING_REPLICAS);
     if (n < R)
       throw new Error(
         `cannot ${doing}: only ${n} node(s) visible, writes carry ` +
@@ -497,7 +509,10 @@ export class Owner {
         .filter(Boolean), ...contacts];
     const found = {}, udp = {}, src = {};
     let answers = 0;
-    for (const addr of contacts) {
+    const asked = new Set();
+    const ask = async (addr) => {
+      if (asked.has(addr)) return;
+      asked.add(addr);
       try {
         const peers = (await this._getJson(addr, "/peers")).peers;
         for (const [nid, e] of Object.entries(peers)) {
@@ -508,11 +523,33 @@ export class Owner {
           }
         }
         answers += 1;
-        if (answers >= 2) break;
-      } catch { continue; }
+      } catch { /* unreachable contact: try the next one */ }
+    };
+    for (const addr of contacts) {
+      await ask(addr);
+      if (answers >= 2 && Object.keys(found).length >= RING_REPLICAS) break;
+    }
+    // Transitive pull. One hop is not discovery: a peer list is only as
+    // complete as the node answering it, and a client that believes a
+    // half-gossiped answer routes every key into the wrong third of the
+    // ring and reads a full ledger as empty. Ask whoever we just
+    // learned about until the view stops growing.
+    for (let hop = 0; hop < 2 &&
+         Object.keys(found).length < RING_REPLICAS; hop++) {
+      const before = Object.keys(found).length;
+      for (const a of Object.values({ ...found })) await ask(a);
+      if (Object.keys(found).length === before) break;
     }
     if (!Object.keys(found).length)
       throw new Error(`no live blindrange node reachable (tried ${contacts})`);
+    // Remember the widest view ever seen: it is the only evidence a
+    // client has for telling "this network is small" apart from "I can
+    // currently see almost none of it".
+    const seen = Object.keys(found).length;
+    if (seen > (this._st.maxNodes || 0)) {
+      this._st.maxNodes = seen;
+      this._save().catch(() => {});
+    }
     this._addrOf = found;
     this._udpOf = udp;
     this._membSrc = src;
@@ -906,6 +943,7 @@ export class Owner {
         }
       }
       st.epoch_len = end;
+      this._probed = new Map();   // counters described the old epoch
       await this._save();
     }
     this._epochChecked = Date.now() / 1000;
@@ -931,6 +969,7 @@ export class Owner {
           if (!st.writers.includes(wid)) st.writers.push(wid);
         }
       st.reg_len = end;
+      this._probed = new Map();   // a new writer means new chains
       await this._save();
     }
     this._writersCache = st.writers;
@@ -1089,11 +1128,19 @@ export class Owner {
       if (ch.kind === "lab")
         for (let i = 1; i <= ch.cached; i++)
           enumMap[await ch.fn(i)] = [cid, i];
-      // a chain probed within the TTL is trusted not to have grown —
+      // A chain probed within the TTL is trusted not to have grown —
       // the same bargain SYS_REFRESH_S makes for system chains: a
       // stale window costs seeing another writer's newest rows a few
-      // seconds late, never a wrong answer about existing rows
-      if (ch.kind === "sys" ||
+      // seconds late, never a wrong answer about existing rows.
+      //
+      // EXCEPT on the retry after the system chains moved. That retry
+      // exists because the writer list or epoch just changed, which is
+      // the one moment the cached counters mean nothing — and the TTL
+      // was suppressing precisely the probes it re-runs to fix them.
+      // Measured: a client whose registry grew mid-query answered a
+      // full-domain query with zero rows, every chain "unprobed and
+      // therefore length 0", no error raised.
+      if (_retried || ch.kind === "sys" ||
           nowMs - (this._probed.get(cid) || 0) >= probeTtlMs)
         probeMap[await ch.fn(ch.cached + 1)] = cid;
     }
@@ -1408,16 +1455,12 @@ export class Owner {
     // Progress the app can render: per-field tree depth plus the
     // record phase. Fields walk in parallel, so the honest number is
     // the mean of their level fractions, not any single field's.
-    this.syncProgress = { active: true, fields: {}, tombs: 0,
-      records: 0, pct: 0 };
+    this.syncProgress = { active: true, level1: 0, tombs: 0, records: 0,
+      verify: 0, pct: 0 };
     const prog = this.syncProgress;
     const bump = () => {
-      const fs = Object.values(prog.fields);
-      const walk = fs.length
-        ? fs.reduce((a, f) => a + (f.done ? 1 : f.lvl / f.mlvl), 0)
-          / fs.length : 0;
-      prog.pct = Math.round((walk * 0.8 + prog.tombs * 0.05
-        + prog.records * 0.15) * 100);
+      prog.pct = Math.round((prog.level1 * 0.25 + prog.tombs * 0.05
+        + prog.records * 0.2 + prog.verify * 0.5) * 100);
     };
     try {
       const st = this._st;
@@ -1511,100 +1554,261 @@ export class Owner {
         return { totals, chainEnds, chainList };
       };
 
-      // all fields walk concurrently: the walk is round-trip bound
-      // (measured: sequential fields cost minutes through a gateway)
-      await Promise.all(Object.entries(st.schema).map(
-        async ([field, specF]) => {
-          const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
-          prog.fields[field] = { lvl: 0, mlvl, done: false };
-          for (let round = 0; round < 4; round++) {
-            const fieldChains = [];
-            let frontier = [[1, 0n], [1, 1n]];
-            let parentEnds = null;
-            while (frontier.length) {
-              const labels = frontier.map(([l, i]) => `${field}|${l}|${i}`);
-              const boundFor = parentEnds === null ? null
-                : (w, ep, u) => {
-                    const parts = w.split("|");
-                    const parent = `${parts[0]}|${+parts[1] - 1}|` +
-                      (BigInt(parts[2]) / 2n);
-                    return parentEnds[`${parent}\u0000${ep}\u0000${u}`]
-                      || 0;
-                  };
-              const { totals, chainEnds, chainList } =
-                await walkLabels(labels, true, boundFor);
-              fieldChains.push(...chainList);
-              const next = [];
-              for (const [l, i] of frontier)
-                if (l < mlvl && (totals[`${field}|${l}|${i}`] || 0) > 0)
-                  next.push([l + 1, i * 2n], [l + 1, i * 2n + 1n]);
-              frontier = next;
-              parentEnds = chainEnds;
-              prog.fields[field].lvl =
-                Math.max(prog.fields[field].lvl,
-                  frontier.length ? frontier[0][0] : mlvl);
-              bump();
+      // ---------------------------------------------------------------
+      // Derive the tree instead of walking it.
+      //
+      // Measured on the public network, the old descent cost 236 network
+      // round trips at a 2.3s median to move 6k keys: the price was the
+      // DEPENDENCY CHAIN, not the data. Each level had to come back
+      // before the next could even be addressed.
+      //
+      // The tree is not independent data, though. insertMany() appends a
+      // record to EVERY level of every field it carries, in one write,
+      // in write order; deleteMany() never touches a label chain (it
+      // appends a tombstone and drops the record blob). So the entries
+      // under any deeper label are exactly the records whose value falls
+      // in that label — which the records themselves tell us. Level 1
+      // names every record, the records carry the values, and the rest
+      // of the tree is arithmetic.
+      //
+      // Derivation predicts the KEY SET only. Values are always taken
+      // from the network and stored as received, so the mirror ends up
+      // byte-identical to what the old walk produced: a mispredicted
+      // key costs a fallback, never a wrong answer.
+      // ---------------------------------------------------------------
+      const setEnd = (w, ep, u, end) => {
+        if (u === me && ep === top) {
+          if ((st.chains[w] || 0) < end) st.chains[w] = end;
+        } else {
+          const rk = `${ep}|${w}`;
+          st.remote[rk] = st.remote[rk] || {};
+          st.remote[rk][u] = end;
+        }
+      };
+      // Wide, chunked, concurrent — the whole point of the rewrite is
+      // that these keys have no ordering dependency between them.
+      const wide = async (keys, wan, chunk = 512, conc = 4) => {
+        const out = {};
+        const parts = [];
+        for (let k = 0; k < keys.length; k += chunk)
+          parts.push(keys.slice(k, k + chunk));
+        for (let k = 0; k < parts.length; k += conc) {
+          await uiYield();
+          const got = await Promise.all(parts.slice(k, k + conc)
+            .map((c) => this._mget(c, wan)));
+          for (const g of got) Object.assign(out, g);
+        }
+        return out;
+      };
+
+      // ---- level 1: two labels per field, and it names every record
+      const l1Spec = {};
+      const l1Info = {};
+      for (const field of Object.keys(st.schema))
+        for (const half of ["0", "1"]) {
+          const w = `${field}|1|${half}`;
+          const kw = await this._kW(w);
+          for (const ep of eps)
+            for (const u of writers) {
+              const cid = `${w}\u0000${ep}\u0000${u}`;
+              l1Spec[cid] = { fn: (i2) => this._ut(kw, ep, u, i2), cached: 0 };
+              l1Info[cid] = { w, ep, u, kw };
             }
-            // ONE strict pass for the whole field: probe every chain's
-            // end+1 with full integrity rules — a shared ladder at
-            // worst, instead of one per level
-            const probes = {};
-            for (const ch of fieldChains)
-              probes[await this._ut(ch.kw, ch.ep, ch.u, ch.end + 1)] = ch;
-            const got = Object.keys(probes).length
-              ? await this._mget(Object.keys(probes), true) : {};
-            let extended = false;
-            for (const [key, ch] of Object.entries(got.constructor === Object
-                ? Object.fromEntries(Object.entries(probes)
-                    .filter(([k]) => k in got)) : {})) {
-              // the quick pass under-read this chain: record the entry
-              // and re-walk the field so deeper levels catch up
-              rids.add(hex(xor8(unb64(got[key]),
-                await this._mask(ch.kw, ch.ep, ch.u, ch.end + 1))));
-              extended = true;
-            }
-            if (!extended) break;
-          }
-          prog.fields[field].done = true;
-          bump();
-        }));
-      // tombstones: single label, all epochs and writers
+        }
+      const l1Ends = await this._discoverEnds(l1Spec, true);
+      const l1Keys = {};
+      for (const [cid, e2] of Object.entries(l1Ends))
+        for (let i2 = 1; i2 <= e2; i2++)
+          l1Keys[await l1Spec[cid].fn(i2)] = [cid, i2];
+      const l1Got = await wide(Object.keys(l1Keys), entryWan);
+      // rid -> the (epoch, writer) that wrote it: one record is written
+      // by one writer in one epoch, so level 1 settles this for the
+      // whole tree
+      const home = new Map();
+      for (const [key, [cid, i2]] of Object.entries(l1Keys)) {
+        const blob = l1Got[key];
+        if (blob === undefined) continue;
+        const { ep, u, kw } = l1Info[cid];
+        const rid = hex(xor8(unb64(blob), await this._mask(kw, ep, u, i2)));
+        rids.add(rid);
+        home.set(rid, { ep, u });
+      }
+      for (const [cid, e2] of Object.entries(l1Ends)) {
+        const { w, ep, u } = l1Info[cid];
+        setEnd(w, ep, u, e2);
+      }
+      prog.level1 = 1;
+      bump();
+
+      // ---- tombstones
       const kT = await this._kW(TOMB);
       const tSpec = {};
       for (const ep of eps)
         for (const u of writers)
-          tSpec[`${ep}\u0000${u}`] = { fn: (i) => this._ut(kT, ep, u, i),
+          tSpec[`${ep}\u0000${u}`] = { fn: (i2) => this._ut(kT, ep, u, i2),
             cached: 0 };
       const tEnds = await this._discoverEnds(tSpec, true);
       const tKeys = {};
-      for (const [cid, end] of Object.entries(tEnds))
-        for (let i = 1; i <= end; i++)
-          tKeys[await tSpec[cid].fn(i)] = [cid, i];
+      for (const [cid, e2] of Object.entries(tEnds))
+        for (let i2 = 1; i2 <= e2; i2++)
+          tKeys[await tSpec[cid].fn(i2)] = [cid, i2];
       const tGot = Object.keys(tKeys).length
-        ? await this._mget(Object.keys(tKeys), entryWan) : {};
-      for (const [key, [cid, i]] of Object.entries(tKeys)) {
+        ? await wide(Object.keys(tKeys), entryWan) : {};
+      for (const [key, [cid, i2]] of Object.entries(tKeys)) {
         const blob = tGot[key];
         if (blob === undefined) continue;
         const [ep, u] = cid.split("\u0000");
-        const rid = hex(xor8(unb64(blob), await this._mask(kT, +ep, u, +i)));
+        const rid = hex(xor8(unb64(blob), await this._mask(kT, +ep, u, +i2)));
         if (!st.tombs.rids.includes(rid)) st.tombs.rids.push(rid);
       }
-      for (const [cid, end] of Object.entries(tEnds)) {
+      for (const [cid, e2] of Object.entries(tEnds)) {
         const [ep, u] = cid.split("\u0000");
-        st.tombs.counts[`${ep}|${u}`] = end;
+        st.tombs.counts[`${ep}|${u}`] = e2;
       }
       prog.tombs = 1;
       bump();
-      // every record the entries name
+
+      // ---- the records themselves: the input to the derivation
       const rkeys = [...rids].map((r) => "R:" + r);
-      for (let i = 0; i < rkeys.length; i += 64) {
-        await uiYield();
-        await this._mget(rkeys.slice(i, i + 64), entryWan);
-        prog.records = Math.min(1, (i + 64) / Math.max(1, rkeys.length));
-        bump();
+      const recGot = await wide(rkeys, entryWan);
+      // A record that is merely UNREACHABLE must never be mistaken for
+      // one that was deleted: the first would silently shrink the
+      // derived tree, and a mirror is supposed to be complete or
+      // honest about not being.
+      this._refuseUnresolved(rkeys, "records");
+      const recs = new Map();
+      for (const r of rids) {
+        const blob = recGot["R:" + r];
+        if (blob === undefined) continue;      // provably absent = deleted
+        const raw = unb64(blob);
+        try {
+          recs.set(r, JSON.parse(td.decode(
+            await aesOpen(this._dataKey, raw.slice(0, 12), raw.slice(12)))));
+        } catch { /* unreadable: treated like a deleted record below */ }
       }
       prog.records = 1;
       bump();
+
+      // ---- derive every chain below level 1
+      const derived = new Map();
+      const unknown = {};        // (ep,u) -> rids we could not read
+      for (const rid of rids) {
+        const h = home.get(rid);
+        if (!h) continue;
+        const rec = recs.get(rid);
+        if (rec === undefined) {
+          const hk = `${h.ep}\u0000${h.u}`;
+          unknown[hk] = (unknown[hk] || 0) + 1;
+          continue;
+        }
+        for (const [field, specF] of Object.entries(st.schema)) {
+          if (!(field in rec)) continue;
+          const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
+          const v = this._encode(field, rec[field]);
+          for (const [lvl, idx] of levelsFor(v, specF.bits, mlvl)) {
+            if (lvl < 2) continue;
+            const w = `${field}|${lvl}|${idx}`;
+            const cid = `${w}\u0000${h.ep}\u0000${h.u}`;
+            let d = derived.get(cid);
+            if (!d) {
+              d = { w, ep: h.ep, u: h.u, kw: await this._kW(w), len: 0,
+                    field };
+              derived.set(cid, d);
+            }
+            d.len += 1;
+          }
+        }
+      }
+
+      // ---- verify: fetch every predicted key, plus a probe range past
+      // each chain's end. A deleted record still occupies its slots, so
+      // a chain can be LONGER than predicted — never shorter — and the
+      // probe range (sized by how many records we could not read) finds
+      // the true end in the same round instead of another descent.
+      const fallback = new Set();
+      for (let pass = 0; pass < 3; pass++) {
+        const entryKeys = [];
+        const probeMap = {};
+        for (const [cid, d] of derived) {
+          if (fallback.has(d.field)) continue;
+          if (d.verified) continue;
+          d.keys = [];
+          for (let i2 = 1; i2 <= d.len; i2++)
+            d.keys.push(await this._ut(d.kw, d.ep, d.u, i2));
+          entryKeys.push(...d.keys);
+          const slack = Math.min(32,
+            (unknown[`${d.ep}\u0000${d.u}`] || 0)) + 1;
+          d.probe = [];
+          for (let i2 = d.len + 1; i2 <= d.len + slack; i2++) {
+            const k = await this._ut(d.kw, d.ep, d.u, i2);
+            d.probe.push(k);
+            probeMap[k] = cid;
+          }
+        }
+        if (!entryKeys.length && !Object.keys(probeMap).length) break;
+        const [eGot, pGot] = await Promise.all([
+          wide(entryKeys, entryWan),
+          wide(Object.keys(probeMap), true),
+        ]);
+        prog.verify = Math.min(1, (pass + 1) / 2);
+        bump();
+        let grew = false;
+        for (const [cid, d] of derived) {
+          if (fallback.has(d.field) || d.verified) continue;
+          const holed = (d.keys || []).some((k) => !(k in eGot));
+          if (holed) {
+            // predicted an entry the network does not have: something
+            // about this field's history is not what the derivation
+            // assumes, so earn it the slow way rather than guess
+            fallback.add(d.field);
+            continue;
+          }
+          let extra = 0;
+          while (extra < d.probe.length && d.probe[extra] in pGot) extra += 1;
+          d.len += extra;
+          if (extra && extra === d.probe.length) grew = true;  // range used up
+          else d.verified = true;
+        }
+        if (!grew) break;
+      }
+      for (const [, d] of derived)
+        if (!fallback.has(d.field)) setEnd(d.w, d.ep, d.u, d.len);
+      prog.verify = 1;
+      bump();
+
+      // ---- anything the derivation could not vouch for walks the old
+      // way; correctness never depends on the shortcut being right
+      if (fallback.size) {
+        console.warn("sync: derivation fell back for", [...fallback]);
+        await Promise.all([...fallback].map(async (field) => {
+          const specF = st.schema[field];
+          const mlvl = maxLevel(specF.bits, specF.leaf_width ?? 1);
+          let frontier = [[1, 0n], [1, 1n]];
+          let parentEnds = null;
+          while (frontier.length) {
+            const labels = frontier.map(([l, i2]) => `${field}|${l}|${i2}`);
+            const boundFor = parentEnds === null ? null
+              : (w, ep, u) => {
+                  const parts = w.split("|");
+                  const parent = `${parts[0]}|${+parts[1] - 1}|` +
+                    (BigInt(parts[2]) / 2n);
+                  return parentEnds[`${parent}\u0000${ep}\u0000${u}`] || 0;
+                };
+            const { totals, chainEnds } =
+              await walkLabels(labels, true, boundFor);
+            const next = [];
+            for (const [l, i2] of frontier)
+              if (l < mlvl && (totals[`${field}|${l}|${i2}`] || 0) > 0)
+                next.push([l + 1, i2 * 2n], [l + 1, i2 * 2n + 1n]);
+            frontier = next;
+            parentEnds = chainEnds;
+          }
+        }));
+        // the fallback may have surfaced records the derivation missed
+        const late = [...rids].map((r) => "R:" + r)
+          .filter((k) => !(k in recGot));
+        if (late.length) await wide(late, entryWan);
+      }
       await this._save();               // counters are the query's map
     } finally {
       this.syncProgress = { active: false, pct: 100 };

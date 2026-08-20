@@ -82,4 +82,55 @@ if (job.phase === "vectors") {
   }
 }
 
+else if (job.phase === "mirrorstress") {
+  // The derived-tree sync predicts the key set from the RECORDS, so
+  // its hazard is records that exist in a label chain but can no
+  // longer be read: deletions. Delete several, insert after deleting
+  // (so live and dead entries interleave at every level), then demand
+  // that a mirrored client agrees with a direct one on every query
+  // shape — including a narrow deep-level range and a prefix.
+  const w = await Owner.accept(memoryAdapter(), "stress pass", job.invite);
+  const all = await w.query("amount", 0, 1048575);
+  const victims = all.filter((r) => job.delete_rows.includes(r.row));
+  out.deleted = 0;
+  for (const v of victims) out.deleted += await w.delete(v._rid);
+  await w.insertMany(job.after_rows);
+
+  const direct = await Owner.accept(memoryAdapter(), "direct pass",
+    job.invite);
+  const mir = await Owner.accept(memoryAdapter(), "mirror pass",
+    job.invite);
+  await mir.enableMirror();
+  await mir.sync();
+  const shapes = {
+    wide: (o) => o.query("amount", 0, 1048575),
+    mid: (o) => o.query("amount", 100000, 300000),
+    narrow: (o) => o.query("amount", 42000, 42007),
+    prefix: (o) => o.queryPrefix("name", "sa"),
+  };
+  // Control and subject must be looking at the SAME network, or the
+  // comparison measures node discovery instead of the mirror.
+  for (const o of [direct, mir]) {
+    for (let i = 0; i < 40 && o.network().length < 3; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      await o.refreshMembership();
+    }
+  }
+  out.parity = {};
+  for (const [nm, fn] of Object.entries(shapes)) {
+    const d = (await fn(direct)).map((r) => r.row).sort((a, b) => a - b);
+    const m2 = (await fn(mir)).map((r) => r.row).sort((a, b) => a - b);
+    out.parity[nm] = { direct: d, mirror: m2,
+      same: JSON.stringify(d) === JSON.stringify(m2) };
+  }
+  // a second sync must be a cheap no-op, not a re-walk that changes
+  // the answers
+  await mir.sync();
+  const again = (await mir.query("amount", 0, 1048575))
+    .map((r) => r.row).sort((a, b) => a - b);
+  out.parity.after_resync = { direct: out.parity.wide.direct,
+    mirror: again,
+    same: JSON.stringify(out.parity.wide.direct) === JSON.stringify(again) };
+}
+
 process.stdout.write(JSON.stringify(out));
