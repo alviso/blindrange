@@ -922,6 +922,17 @@ export class Owner {
     return [st.epoch];
   }
 
+  async _refreshSystem(force = false) {
+    // Epoch and registry are independent chains, and every cold path
+    // (first query, first insert, join) galloped them one after the
+    // other: measured on the public network, a cold full-domain query
+    // over SIX rows cost 14 sequential round trips and ~10s, almost
+    // none of it the data. Discovering both at once collapses the
+    // gallops into shared rounds.
+    await Promise.all([this._refreshEpoch(force),
+                       this._refreshWriters(force)]);
+  }
+
   async _refreshEpoch(force = false) {
     const now = Date.now() / 1000;
     if (!force && now - (this._epochChecked || 0) < SYS_REFRESH_S)
@@ -1088,6 +1099,12 @@ export class Owner {
 
   async _queryMultiInner(predicates, _retried = false) {
     const st = this._st;
+    // A never-refreshed client knows no epoch and no writers, so its
+    // first query was guaranteed to see the system chains "grow",
+    // throw the whole pass away and run it again. Learn the worldview
+    // first instead: one batched discovery beats a wasted query pass.
+    if (!_retried && !st.epoch_len && !st.reg_len)
+      await this._refreshSystem(true);
     const me = st.writer;
     const top = st.epoch;
     const writers = st.writers.length ? [...st.writers] : [me];
@@ -1169,8 +1186,7 @@ export class Owner {
       .filter(([k]) => k in got).map(([, cid]) => cid));
     if ([...grown].some((cid) => chains[cid].kind === "sys")) {
       if (_retried) throw new Error("system chains unstable across retries");
-      await this._refreshEpoch(true);
-      await this._refreshWriters(true);
+      await this._refreshSystem(true);
       return this.queryMulti(predicates, true);
     }
 
@@ -1481,8 +1497,9 @@ export class Owner {
       const st = this._st;
       const me = st.writer;
       const top = st.epoch;
-      const writers = await this._refreshWriters(true);
-      await this._refreshEpoch(true);
+      await this._refreshSystem(true);
+      const writers = this._st.writers.length
+        ? [...this._st.writers] : [this._st.writer];
       const eps = this._epochs();
       const rids = new Set();
 
