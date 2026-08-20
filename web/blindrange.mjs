@@ -344,7 +344,11 @@ export class Owner {
     st.secret = d.secret || "";
     const o = await Owner._init(adapter, passphrase, st, gateway);
     o._requireQuorumMembership("join the network");
-    await o._registerWriter();
+    // NOT registered here. A registry slot is a promise that this
+    // writer has chains worth scanning, and every reader pays for it
+    // on every chain operation forever. Joining to read is the common
+    // case — a demo ledger reached nine writers, seven of which never
+    // wrote a byte — so enrollment waits for the first actual write.
     await o._save();
     return o;
   }
@@ -977,6 +981,15 @@ export class Owner {
     return st.writers;
   }
 
+  async _ensureRegistered() {
+    // Enroll as a writer at the moment we first write something keyed
+    // by our writer id (label chains, tombstones). Sequence claims do
+    // not qualify: they live under master-derived system keys and
+    // leave no per-writer chain for anyone to scan.
+    if (!this._st.writers.includes(this._st.writer))
+      await this._registerWriter();
+  }
+
   async _registerWriter() {
     const st = this._st;
     const wid = st.writer;
@@ -1001,6 +1014,7 @@ export class Owner {
 
   // -------------------------------------------------------------- writes
   async insertMany(records) {
+    await this._ensureRegistered();
     const E = await this._refreshEpoch();
     const st = this._st;
     const puts = [];
@@ -1033,6 +1047,7 @@ export class Owner {
   async insert(record) { return this.insertMany([record]); }
 
   async deleteMany(rids) {
+    await this._ensureRegistered();   // tombstone chains are per-writer
     const E = await this._refreshEpoch();
     const st = this._st;
     const me = st.writer;

@@ -121,6 +121,42 @@ class TestLocality(MirrorCase):
         got = {r["n"] for r in o.query("amount", 0, 4095)}
         self.assertEqual(got, {2}, "a mirrored read resurrected a delete")
 
+    def test_sync_after_deletes_matches_the_network(self):
+        """sync() derives the label tree from the RECORDS rather than
+        descending it, which is only sound if records that are gone —
+        still holding their slots in every chain, unreadable as rows —
+        cannot shift what the mirror sees. Delete a spread of rows,
+        write more afterwards so live and dead entries interleave, then
+        sync from scratch and demand the mirror agree with the network
+        on every query shape."""
+        o = self.owner("delsync", mirror=False)
+        rows = [{"amount": i * 7, "n": i} for i in range(40)]
+        o.insert_many(rows)
+        o.drain()
+        victims = [r["_rid"] for r in o.query("amount", 0, 4095)
+                   if r["n"] in (3, 11, 12, 29)]
+        self.assertEqual(len(victims), 4, "setup did not find 4 victims")
+        o.delete_many(victims)
+        o.insert_many([{"amount": 300 + i, "n": 100 + i} for i in range(5)])
+        o.drain()
+
+        want = {}
+        for name, (lo, hi) in {"wide": (0, 4095), "mid": (100, 300),
+                               "narrow": (297, 305)}.items():
+            want[name] = sorted(r["n"] for r in o.query("amount", lo, hi))
+
+        m = Owner.accept(f"{self.tmp}/delsync-mirror.brdb", "pw2",
+                         o.invite())
+        m.enable_mirror(sync_every=3600)
+        m.sync()
+        for name, (lo, hi) in {"wide": (0, 4095), "mid": (100, 300),
+                               "narrow": (297, 305)}.items():
+            got = sorted(r["n"] for r in m.query("amount", lo, hi))
+            self.assertEqual(got, want[name],
+                             f"mirror disagrees with the network on the "
+                             f"{name} range after deletions")
+        self.assertNotIn(11, want["wide"], "a deleted row is still live")
+
 
 class TestFreshnessContract(MirrorCase):
     def test_stale_mirror_falls_back_to_the_network(self):

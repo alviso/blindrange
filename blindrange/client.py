@@ -81,6 +81,12 @@ from .ring import Ring, failure_group
 # whatever slow node remains — the opposite of what you want under load.
 PEER_LIVE_S = float(os.environ.get("BR_PEER_LIVE_S", "40"))
 TOMB = "@tomb"                     # reserved label for tombstone chains
+# The replication factor the ring is BUILT for. Ring clamps its own
+# `replicas` to however many nodes it can see, which is right for
+# placement and useless as a health check: a client seeing one node of
+# seven clamps to 1, and every "is my view wide enough" test passes.
+# Membership checks compare against this instead.
+RING_REPLICAS = 3
 
 
 class Owner:
@@ -122,6 +128,7 @@ class Owner:
         return {"v": 4, "master": master_hex, "writer": os.urandom(8).hex(),
                 "schema": schema, "epoch": 0, "epoch_len": 0, "sealed_max": -1,
                 "chains": {}, "remote": {}, "writers": [], "reg_len": 0,
+                "max_nodes": 0,
                 "tombs": {"counts": {}, "rids": []},
                 "secret": "", "bootstrap": list(bootstrap)}
 
@@ -133,6 +140,7 @@ class Owner:
         state = cls._new_state(os.urandom(32).hex(), schema, bootstrap)
         state["secret"] = network_secret
         owner = cls(state_path, passphrase, state)
+        owner._require_quorum_membership("create a ledger")
         owner._register_writer()
         owner._save()
         return owner
@@ -155,7 +163,13 @@ class Owner:
                                bootstrap or d["bootstrap"])
         state["secret"] = d.get("secret", "")
         owner = cls(state_path, passphrase, state)
-        owner._register_writer()
+        owner._require_quorum_membership("join the network")
+        # NOT registered here. A registry slot is a promise that this
+        # writer has chains worth scanning, and every reader pays for it
+        # on every chain operation forever. Joining to read is the
+        # common case — a demo ledger reached nine writers, seven of
+        # which never wrote a byte — so enrollment waits for the first
+        # actual write. See _ensure_registered().
         owner._save()
         return owner
 
@@ -395,32 +409,69 @@ class Owner:
         udp = {}
         src = {}
         answers = 0
-        for addr in contacts:
+        asked = set()
+
+        def ask(addr):
+            nonlocal answers
+            if addr in asked:
+                return
+            asked.add(addr)
             try:
                 peers = self._get(addr, "/peers")["peers"]
-                for nid, e in peers.items():
-                    if e.get("age", 1e9) <= PEER_LIVE_S and e.get("addr"):
-                        found[nid] = e["addr"]
-                        src.setdefault(
-                            e["addr"], (addr, e.get("age"), time.time()))
-                        # .get everywhere: a roster ghost (a lingering
-                        # not-answering node) carries whatever fields it
-                        # was remembered with, and one absent field
-                        # crashed a four-hour scrub three hours in.
-                        if e.get("udp"):
-                            udp[nid] = e["udp"]
-                answers += 1
-                if answers >= 2:        # merge two views; one may be stale
-                    break
             except OSError:
-                continue
+                return
+            for nid, e in peers.items():
+                if e.get("age", 1e9) <= PEER_LIVE_S and e.get("addr"):
+                    found[nid] = e["addr"]
+                    src.setdefault(
+                        e["addr"], (addr, e.get("age"), time.time()))
+                    # .get everywhere: a roster ghost (a lingering
+                    # not-answering node) carries whatever fields it
+                    # was remembered with, and one absent field
+                    # crashed a four-hour scrub three hours in.
+                    if e.get("udp"):
+                        udp[nid] = e["udp"]
+            answers += 1
+
+        for addr in contacts:
+            ask(addr)
+            if answers >= 2 and len(found) >= RING_REPLICAS:
+                break               # merged two views; one may be stale
+        # Transitive pull. One hop is not discovery: a peer list is only
+        # as complete as the node answering it, and a client that
+        # believes a half-gossiped answer routes every key into the
+        # wrong third of the ring and reads a full ledger as empty.
+        # Keep asking whoever we just learned about until it stops
+        # growing.
+        for _hop in range(2):
+            if len(found) >= RING_REPLICAS:
+                break
+            before = len(found)
+            for a in list(found.values()):
+                # Direct peers only. A relay tenant's peer list is no
+                # better than its relay's, costs a relay round trip to
+                # fetch, and its self-reported UDP candidate can be
+                # narrower than the one its relay observed — adopting
+                # that lost a punched path for five minutes (the
+                # no-retry window) and the direct path silently stopped
+                # being used at all.
+                if not a.startswith("via:"):
+                    ask(a)
+            if len(found) == before:
+                break
         if not found:
             raise ConnectionError("no live blindrange node reachable "
                                   f"(tried {contacts})")
         self._addr_of = found
         self._udp_of = udp
         self._memb_src = src
-        new_ring = Ring(sorted(found), replicas=3,
+        # Remember the widest view ever seen: it is the only evidence a
+        # client has for telling "this network is small" apart from "I
+        # can currently see almost none of it".
+        if len(found) > self._st.get("max_nodes", 0):
+            self._st["max_nodes"] = len(found)
+            self._save()
+        new_ring = Ring(sorted(found), replicas=RING_REPLICAS,
                         groups={nid: failure_group(a, udp.get(nid, ""))
                                 for nid, a in found.items()})
         if new_ring != self.ring:
@@ -429,6 +480,28 @@ class Owner:
 
     def _addr(self, node_id):
         return self._addr_of.get(node_id)
+
+    def _require_quorum_membership(self, doing):
+        """Refuse to act on a view too narrow to route correctly.
+
+        Membership is data too, and it can be PARTIAL: a client that
+        lands mid-restart-wave can see one node, route every key to it,
+        and honestly conclude a full ledger is empty — every integrity
+        rule satisfied inside the wrong worldview. Observed in the
+        browser port, which is why this exists here too. Compares
+        against the factor the ring is BUILT for, never ring.replicas
+        (which shrinks to match a partial view, making the check a
+        no-op exactly when it matters), and against the widest view
+        this client has ever had, so a genuinely small network is left
+        alone.
+        """
+        n = len(getattr(self, "_addr_of", {}) or {})
+        want = min(self._st.get("max_nodes", n), RING_REPLICAS)
+        if n < want:
+            raise ConnectionError(
+                f"cannot {doing}: only {n} node(s) visible, writes carry "
+                f"{RING_REPLICAS} replicas — the network view is partial "
+                f"right now; try again in a minute")
 
     # ------------------------------------------------------------ crypto
     def _k_w(self, w):
@@ -752,14 +825,14 @@ class Owner:
         if m is None:
             return
         t_pass = time.time()
+        self.refresh_membership()
+        self._require_quorum_membership("complete a mirror")
         writers = self._refresh_writers(force=True)
         self._refresh_epoch(force=True)
         for E in self._epochs():
-            entries, keys = self._walk_epoch(E, writers)
-            if keys:
-                got = self._mget(keys)
-                m.put_many(list(got.items()))
-            rids = {r for lst in entries.values() for r in lst}
+            rids, kv = self._derive_epoch(E, writers)
+            if kv:
+                m.put_many(list(kv.items()))
             blob_keys = ["R:" + r for r in rids]
             if blob_keys:
                 have = m.get_many(blob_keys)
@@ -769,6 +842,186 @@ class Owner:
                     m.put_many(list(got.items()))
         self._refresh_tombs(writers)
         m.mark_synced(duration_s=time.time() - t_pass)
+
+    def _derive_epoch(self, E, writers):
+        """Reconstruct epoch E's label tree instead of descending it.
+
+        Measured on the public network before this existed: 236 network
+        round trips at a ~2.3s median to move 6k keys. The cost was the
+        DEPENDENCY CHAIN — each level had to come back before the next
+        could be addressed — not the data.
+
+        The tree is not independent data, though. insert_many() appends
+        a record to EVERY level of every field it carries, in one write,
+        in write order; delete_many() never touches a label chain (it
+        appends a tombstone and drops the record blob). So the entries
+        under any deeper label are exactly the records whose value falls
+        in that label — which the records themselves tell us. Level 1
+        names every record, the records carry the values, and the rest
+        of the tree is arithmetic.
+
+        Derivation predicts the KEY SET only. Values always come from
+        the network and are stored as received, so the mirror ends up
+        byte-identical to what the descent produced: a mispredicted key
+        costs a fallback to the old walk, never a wrong answer.
+
+        Returns (rids, kv) — the record ids the entries name, and every
+        index key/value the caller should mirror.
+        """
+        me, top = self._st["writer"], self._st["epoch"]
+
+        def set_end(w, u, end):
+            if u == me and E == top:
+                if self._st["chains"].get(w, 0) < end:
+                    self._st["chains"][w] = end
+            else:
+                self._st["remote"].setdefault(f"{E}|{w}", {})[u] = end
+
+        def refuse_if_unresolved(keys, got, what):
+            bad = getattr(self, "last_unresolved", ()) or ()
+            lost = [k for k in keys if k not in got and k in bad]
+            if lost:
+                raise ConnectionError(
+                    f"sync cannot proceed: {len(lost)} {what} unreachable, "
+                    f"not absent — concluding from silence once served 6 of "
+                    f"12 rows as the whole truth")
+
+        # ---- level 1: two labels per field, and it names every record
+        info, spec_map = {}, {}
+        for field in self._st["schema"]:
+            for half in (0, 1):
+                w = f"{field}|1|{half}"
+                k_w = self._k_w(w)
+                for u in writers:
+                    cid = (w, u)
+                    info[cid] = (w, u, k_w)
+                    spec_map[cid] = ((lambda i, k=k_w, u=u:
+                                      self._ut(k, E, u, i)), 0)
+        ends = self._discover_ends(spec_map) if spec_map else {}
+        ut_map = {}
+        for cid, c in ends.items():
+            w, u, k_w = info[cid]
+            for i in range(1, c + 1):
+                ut_map[self._ut(k_w, E, u, i)] = (cid, i)
+        kv = self._mget(list(ut_map)) if ut_map else {}
+        refuse_if_unresolved(list(ut_map), kv, "level-1 entrie(s)")
+        home = {}
+        for ut, (cid, i) in ut_map.items():
+            blob = kv.get(ut)
+            if blob is None:
+                continue
+            w, u, k_w = info[cid]
+            rid = bytes(x ^ y for x, y in
+                        zip(b64decode(blob), self._mask(k_w, E, u, i))).hex()
+            home[rid] = u
+        for cid, c in ends.items():
+            w, u, _ = info[cid]
+            set_end(w, u, c)
+
+        # ---- the records themselves: the input to the derivation. One
+        # that is merely UNREACHABLE must never be mistaken for one that
+        # was deleted; the first would silently shrink the derived tree.
+        blob_keys = ["R:" + r for r in home]
+        recs_raw = self._mget(blob_keys) if blob_keys else {}
+        refuse_if_unresolved(blob_keys, recs_raw, "record(s)")
+        recs = {}
+        for rid in home:
+            blob = recs_raw.get("R:" + rid)
+            if blob is None:
+                continue            # provably absent = deleted
+            try:
+                raw = b64decode(blob)
+                recs[rid] = json.loads(
+                    self._aes.decrypt(raw[:12], raw[12:], None))
+            except Exception:
+                pass                # unreadable: treated like a deletion
+
+        # ---- derive every chain below level 1
+        derived, unknown = {}, {}
+        for rid, u in home.items():
+            rec = recs.get(rid)
+            if rec is None:
+                unknown[u] = unknown.get(u, 0) + 1
+                continue
+            for field, spec in self._st["schema"].items():
+                if field not in rec:
+                    continue
+                mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
+                v = self._encode(field, rec[field])
+                for lvl, idx in levels_for(v, spec["bits"], mlvl):
+                    if lvl < 2:
+                        continue
+                    cid = (f"{field}|{lvl}|{idx}", u)
+                    d = derived.get(cid)
+                    if d is None:
+                        d = derived[cid] = {"len": 0, "field": field,
+                                            "k_w": self._k_w(cid[0]),
+                                            "done": False}
+                    d["len"] += 1
+
+        # ---- verify: fetch every predicted key, plus a probe range past
+        # each chain's end. A deleted record still occupies its slots, so
+        # a chain can be LONGER than predicted — never shorter — and the
+        # probe range (sized by how many records we could not read) finds
+        # the true end in the same round instead of another descent.
+        fallback = set()
+        for _pass in range(3):
+            entry_keys, probes = [], {}
+            for cid, d in derived.items():
+                if d["done"] or d["field"] in fallback:
+                    continue
+                w, u = cid
+                d["keys"] = [self._ut(d["k_w"], E, u, i)
+                             for i in range(1, d["len"] + 1)]
+                entry_keys.extend(d["keys"])
+                slack = min(32, unknown.get(u, 0)) + 1
+                d["probe"] = [self._ut(d["k_w"], E, u, i)
+                              for i in range(d["len"] + 1,
+                                             d["len"] + 1 + slack)]
+                for k in d["probe"]:
+                    probes[k] = cid
+            if not entry_keys and not probes:
+                break
+            got = self._mget(entry_keys + list(probes)) if (
+                entry_keys or probes) else {}
+            refuse_if_unresolved(entry_keys, got, "index entrie(s)")
+            kv.update({k: v for k, v in got.items() if v is not None})
+            grew = False
+            for cid, d in derived.items():
+                if d["done"] or d["field"] in fallback:
+                    continue
+                if any(k not in got for k in d["keys"]):
+                    # predicted an entry the network does not have:
+                    # something about this field's history is not what
+                    # the derivation assumes, so earn it the slow way
+                    fallback.add(d["field"])
+                    continue
+                extra = 0
+                while extra < len(d["probe"]) and d["probe"][extra] in got:
+                    extra += 1
+                d["len"] += extra
+                if extra and extra == len(d["probe"]):
+                    grew = True                 # probe range used up
+                else:
+                    d["done"] = True
+            if not grew:
+                break
+        for (w, u), d in derived.items():
+            if d["field"] not in fallback:
+                set_end(w, u, d["len"])
+
+        rids = set(home)
+        # ---- anything the derivation could not vouch for walks the old
+        # way; correctness never depends on the shortcut being right
+        if fallback:
+            print(f"sync: derivation fell back for {sorted(fallback)}",
+                  flush=True)
+            entries, keys = self._walk_epoch(E, writers, fields=fallback)
+            if keys:
+                kv.update(self._mget(keys))
+            for lst in entries.values():
+                rids.update(lst)
+        return rids, kv
 
     def _sync_loop(self, every):
         while not self._sync_stop.is_set():
@@ -1407,6 +1660,14 @@ class Owner:
             self._save()
         return self._st["writers"]
 
+    def _ensure_registered(self):
+        """Enroll as a writer, at the moment we first write something
+        keyed by our writer id (label chains, tombstones, compaction).
+        Sequence claims do not qualify: they live under master-derived
+        system keys and leave no per-writer chain to scan."""
+        if self._st["writer"] not in self._st["writers"]:
+            self._register_writer()
+
     def _register_writer(self):
         wid = self._st["writer"]
         self._refresh_writers()
@@ -1469,6 +1730,7 @@ class Owner:
 
     # ------------------------------------------------------------- insert
     def insert_many(self, records):
+        self._ensure_registered()
         E = self._refresh_epoch()
         puts = []
         chains = self._st["chains"]        # own chains only; others never touched
@@ -1504,6 +1766,7 @@ class Owner:
     def delete_many(self, rids):
         """Tombstone record ids (the "_rid" of query results) and best-effort
         remove their ciphertexts. Index entries vanish at the next compact()."""
+        self._ensure_registered()      # tombstone chains are per-writer
         E = self._refresh_epoch()
         me = self._st["writer"]
         k_t = self._k_w(TOMB)
@@ -2006,12 +2269,19 @@ class Owner:
 
 
     # --------------------------------------------------------- compaction
-    def _walk_epoch(self, E, writers):
+    def _walk_epoch(self, E, writers, fields=None):
         """One full pass over epoch E's label tree: gallop every reachable
         chain, fetch entries, unmask. Returns (entries, old_keys) where
-        entries = {label: [rid_hex, ...]} and old_keys are the index keys."""
+        entries = {label: [rid_hex, ...]} and old_keys are the index keys.
+
+        compact() needs this descent — it must see the real keys to
+        delete them. sync() derives the tree instead and only calls back
+        here, scoped to `fields`, for whatever the derivation could not
+        vouch for."""
         entries, old_keys = {}, []
         for field, spec in self._st["schema"].items():
+            if fields is not None and field not in fields:
+                continue
             mlvl = max_level(spec["bits"], spec.get("leaf_width", 1))
             frontier = [(1, 0), (1, 1)]
             while frontier:
@@ -2063,6 +2333,7 @@ class Owner:
         ever invisible. One compactor at a time: the open marker is an
         insert-if-absent slot, and losing that race aborts cleanly."""
         import time as _time
+        self._ensure_registered()   # compaction rewrites chains as `me`
         E = self._refresh_epoch(force=True)
         writers = self._refresh_writers(force=True)
         me = self._st["writer"]
