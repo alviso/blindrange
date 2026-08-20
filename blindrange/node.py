@@ -103,6 +103,15 @@ _repair_fail = {}                  # addr -> (consecutive failures, last log)
 # nothing" produced identical logs — which is exactly the state the network
 # was in while a node sat 900k keys behind.
 REPAIR_LOG_EVERY = float(os.environ.get("BR_REPAIR_LOG_EVERY", "60"))
+# Live traffic outranks maintenance. A repair sweep sharing the process
+# with client reads showed up as 2-4s mgets on busy tenants — the scan,
+# serialization and push threads all contend for the interpreter. The
+# sweep now waits for a quiet gap (REPAIR_QUIET seconds since the last
+# client op, nothing in flight), but never longer than REPAIR_MAX_DEFER
+# per round: under permanent load durability still advances, just at a
+# gentler cadence. 0 disables the yield entirely.
+REPAIR_QUIET = float(os.environ.get("BR_REPAIR_QUIET", "1.0"))
+REPAIR_MAX_DEFER = float(os.environ.get("BR_REPAIR_MAX_DEFER", "30"))
 # Peers are pushed to concurrently. Serially, a round took ~20s against a
 # 5s interval — measured on the public network, where posting a catch-up
 # batch to three peers meant three sequential relay round trips and the
@@ -1062,7 +1071,12 @@ def post_any(addr, path, payload: bytes, secret: str, timeout=5):
 
 def service_post(store, peers, hub, secret, path, data, quic=None,
                  client_ip=None):
-    if path in DATA_PATHS:
+    # Node-to-node repair pushes carry a node_token; client operations
+    # never do. Repair traffic must not count as "live work", or every
+    # node's sweep would make its peers defer their own sweeps and the
+    # fleet would throttle itself at idle.
+    internal = isinstance(data, dict) and "node_token" in data
+    if path in DATA_PATHS and not internal:
         with _op():
             return _service_post(store, peers, hub, secret, path, data,
                                  quic, client_ip)
@@ -1652,7 +1666,7 @@ def _new_repair_stat():
     died on KeyError the moment reconciliation tried to record anything.
     """
     return {"scanned": 0, "sent": Counter(), "rounds": 0,
-            "reconciled": 0, "since": time.time()}
+            "reconciled": 0, "yielded": 0.0, "since": time.time()}
 
 
 def _reconcile(addr, nid, ring, store, peers, secret, stat,
@@ -1847,6 +1861,18 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                 hours = REPAIR_CATCHUP_H if catching_up else REPAIR_SWEEP_H
                 rounds = max(1.0, hours * 3600 / max(0.1, REPAIR_EVERY))
                 size = int(min(REPAIR_BATCH_MAX, max(200, mine / rounds)))
+            if REPAIR_QUIET > 0:
+                deadline = time.time() + REPAIR_MAX_DEFER
+                waited = 0.0
+                while time.time() < deadline:
+                    with _OP_LOCK:
+                        busy = (_INFLIGHT[0] > 0 or
+                                time.time() - _LAST_OP[0] < REPAIR_QUIET)
+                    if not busy:
+                        break
+                    time.sleep(0.25)
+                    waited += 0.25
+                stat["yielded"] += waited
             batch = store.batch_after(cursor, size)
             if not batch:                       # wrapped: start the next sweep
                 cursor = ""
@@ -1903,7 +1929,9 @@ def _repair_loop(store: Store, peers: Peers, secret: str, hub=None,
                       f"· scanned {stat['scanned'] / el:,.0f} keys/s over "
                       f"{stat['rounds']} rounds · sent {per} · "
                       f"{stat['reconciled'] / el:,.0f}/s of that reconciled"
-                      f" · holding {mine:,} keys",
+                      + (f" · yielded {stat['yielded']:,.0f}s to live traffic"
+                         if stat["yielded"] >= 1 else "")
+                      + f" · holding {mine:,} keys",
                       file=sys.stderr, flush=True)
                 stat = _new_repair_stat()
         except Exception as e:
